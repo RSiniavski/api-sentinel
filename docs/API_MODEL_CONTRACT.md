@@ -1,10 +1,10 @@
 # API Sentinel — API Model Contract
 
-**Status:** Design proposal only. This document does not describe implemented code.
+**Status:** Approved API Model contract. The OpenAPI Parser and API Model are implemented; the Normalizer is not yet implemented.
 
 ## 1. Model overview
 
-The API Model is the typed, deterministic boundary between a future OpenAPI Normalizer and the future Deterministic Test Generator. The current Parser remains unchanged: `parse_openapi_document(content: str, filename: str) -> dict[str, Any]` returns a parsed and validated dictionary. No API Model or Normalizer currently exists.
+The API Model is the typed, deterministic boundary between the OpenAPI Parser and a future Normalizer and Deterministic Test Generator. The Parser interface remains `parse_openapi_document(content: str, filename: str) -> dict[str, Any]` and returns a parsed and validated dictionary. The API Model is implemented using Pydantic v2; the Normalizer has not yet been implemented.
 
 The Normalizer will accept that validated dictionary and return a `NormalizationResult`, whose `api` field contains the model below and whose `diagnostics` field reports parameter overrides. The model is not a replacement for the source document and does not perform parsing, specification validation, network access, or HTTP execution. It preserves the source information needed for test generation, especially full JSON-compatible Schema Objects and their reference edges.
 
@@ -14,15 +14,17 @@ The API Model is intentionally not a byte-for-byte copy of the source document. 
 
 ## 2. Current repository facts
 
-- The public Parser interface is `parse_openapi_document(content, filename) -> dict[str, Any]`.
-- The Parser accepts JSON and YAML, imposes a 5 MiB content limit, rejects unsupported extensions and YAML aliases, and uses a safe YAML loader.
-- The validator supports OpenAPI 3.0.x and 3.1.x, filters external `$ref` values, and calls `openapi-spec-validator`.
-- The Parser returns the validated dictionary. It does not extract endpoints, build a component registry for consumers, or produce model entities.
-- `requirements.txt` pins `pydantic-settings==2.16.2`, but does not directly pin `pydantic`. Pydantic is present transitively through FastAPI, pydantic-settings, and the OpenAPI validator. The inspected local environment had Pydantic 2.14.2. For a model package that imports Pydantic directly, declare and pin Pydantic directly when implementation is approved.
-- `openapi-spec-validator==0.9.0` provides specification validation, not API model extraction. `PyYAML==6.0.3` provides YAML parsing. FastAPI and HTTPX are not needed by the model itself.
-- Current tests exercise Parser behavior and the health endpoints, not a Normalizer or API Model. The previous full test run had 47 passing tests; that result does not validate this unimplemented design.
+- The implemented Parser exposes `parse_openapi_document(content, filename) -> dict[str, Any]`.
+- The Parser accepts JSON and YAML, imposes a 5 MiB content limit, rejects unsupported extensions and YAML aliases, uses a safe YAML loader, and validates supported OpenAPI 3.0.x and 3.1.x documents.
+- The shared `uri_references.py` helper validates local `$ref` URI syntax. The Parser's OpenAPI validator uses that helper and performs OpenAPI specification validation with `openapi-spec-validator`, which may resolve local references internally. The API Model validates `LocalReference.uri` with the shared helper and retains references as reference edges without expanding or inlining them.
+- The Parser returns the validated dictionary. It does not extract endpoints, build a component registry for consumers, or produce model entities. The Normalizer has not been implemented.
+- The API Model is implemented in `models.py` using Pydantic v2. Its model configuration is strict, forbids extra fields, and is frozen as a shallow mutation guard. Schema preservation and reference behavior follow this contract.
 
-See [the architecture proposal](API_MODEL_NORMALIZER_PROPOSAL.md), [the Parser](../backend/app/services/openapi/parser.py), [the validator](../backend/app/services/openapi/validator.py), [the requirements](../requirements.txt), and [the Parser tests](../tests/test_openapi_parser.py).
+- `requirements.txt` directly pins `pydantic==2.14.2`; `pydantic-settings==2.16.2` remains pinned separately.
+- `openapi-spec-validator==0.9.0` provides OpenAPI specification validation, not model extraction. `PyYAML==6.0.3` provides YAML parsing. FastAPI and HTTPX are not needed by the API Model itself.
+- Tests cover Parser behavior, API Model behavior, and health endpoints. The latest verified full run was **77 passed, 2 warnings**; the warnings are Pydantic notices for the contract-required `schema` fields on `Parameter` and `MediaType`.
+
+See [the architecture proposal](API_MODEL_NORMALIZER_PROPOSAL.md), [the Parser](../backend/app/services/openapi/parser.py), [the validator](../backend/app/services/openapi/validator.py), [the shared URI validation module](../backend/app/services/openapi/uri_references.py), [the API Model](../backend/app/services/openapi/models.py), [the requirements](../requirements.txt), [the Parser tests](../tests/test_openapi_parser.py), [the API Model tests](../tests/test_api_model.py), and [the health tests](../tests/test_health.py).
 
 ## 3. Design rules
 
