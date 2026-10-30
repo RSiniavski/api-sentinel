@@ -164,6 +164,42 @@ def test_generic_reference_has_no_parameter_scope() -> None:
         LocalReference(uri="#/components/parameters/Id", source_scope="path")  # type: ignore[call-arg]
 
 
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "#/components/schemas/User",
+        "#/components/schemas/A~1B",
+        "#UserSchema",
+        "#",
+        "#/components/schemas/%E2%9C%93",
+    ],
+)
+def test_local_reference_accepts_valid_local_uri_fragments(uri: str) -> None:
+    assert LocalReference(uri=uri).uri == uri
+
+
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "https://example.com/schema.json",
+        "schemas/common.yaml",
+        "/schemas/common.yaml",
+        "components/schemas/User",
+        "#bad%ZZ",
+        "#bad%",
+        "#%FF",
+        "#/components/schemas/bad~2escape",
+        "#9InvalidAnchor",
+        "#bad anchor",
+        "#bad[character]",
+        "#caf\u00e9",
+    ],
+)
+def test_local_reference_rejects_external_or_malformed_uri_fragments(uri: str) -> None:
+    with pytest.raises(ValidationError, match="valid local URI fragment reference"):
+        LocalReference(uri=uri)
+
+
 @pytest.mark.parametrize("scope", ["path", "operation", "component"])
 def test_parameter_reference_preserves_each_allowed_scope(scope: str) -> None:
     reference = ParameterReference(

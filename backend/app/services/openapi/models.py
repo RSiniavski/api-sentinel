@@ -8,6 +8,8 @@ from typing import Literal, TypeAlias
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from typing_extensions import TypeAliasType
 
+from app.services.openapi.uri_references import _is_valid_local_reference
+
 NoneType = type(None)
 JsonScalar: TypeAlias = NoneType | bool | int | float | str
 JsonValue = TypeAliasType(
@@ -31,6 +33,14 @@ class LocalReference(Model):
     uri: str
     summary: str | None = None
     description: str | None = None
+
+    @field_validator("uri")
+    @classmethod
+    def validate_local_uri(cls, value: str) -> str:
+        """Accept only syntactically valid local URI fragment references."""
+        if not _is_valid_local_reference(value):
+            raise ValueError("uri must be a valid local URI fragment reference")
+        return value
 
 
 class ParameterReference(Model):
