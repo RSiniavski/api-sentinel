@@ -75,8 +75,13 @@ class LocalReference(Model):
     uri: str
     summary: str | None = None
     description: str | None = None
-    # Set only when this edge occurs in an endpoint parameter declaration.
-    source_scope: ParameterScope | None = None
+
+
+class ParameterReference(Model):
+    """A parameter reference edge plus parameter-only declaration metadata."""
+
+    reference: LocalReference
+    source_scope: ParameterScope
 
 
 class Schema(Model):
@@ -192,7 +197,7 @@ class Response(Model):
     extensions: dict[str, JsonValue] = Field(default_factory=dict)
 
 
-ParameterEntry: TypeAlias = Parameter | LocalReference
+ParameterEntry: TypeAlias = Parameter | ParameterReference
 RequestBodyEntry: TypeAlias = RequestBody | LocalReference
 ResponseEntry: TypeAlias = Response | LocalReference
 SecuritySchemeEntry: TypeAlias = SecurityScheme | LocalReference
@@ -267,7 +272,7 @@ class NormalizationResult(Model):
 
 - `JsonValue` contains only JSON scalar/list/object values. It excludes YAML-specific Python values such as dates, sets, and custom tagged objects; the Parser’s safe-loader and validator remain responsible for the accepted document.
 - `SchemaSource` is `bool | JsonObject`: OpenAPI 3.1 allows boolean schemas; OpenAPI 3.0 does not. Validation by the Parser determines whether a particular document/version permits the value.
-- `ParameterEntry` is used both in `Components.parameters` and `Endpoint.parameters`; either may retain a parsed `Parameter` or a local `LocalReference` edge.
+- `ParameterEntry` is used both in `Components.parameters` and `Endpoint.parameters`; either may retain a parsed `Parameter` or a local `ParameterReference` edge. Other reference-bearing entries use generic `LocalReference` without parameter scope metadata.
 - `ParameterLocation` and `ParameterScope` are shared aliases used by model fields and diagnostics so their values stay consistent.
 - The recursive `JsonValue` alias does not recursively instantiate Pydantic `Schema` objects. This keeps schema source data finite and preserves reference cycles as strings.
 
@@ -431,7 +436,7 @@ Do not store actual bearer tokens, API keys, OAuth client secrets, passwords, or
 | Field | Type | Required/default | Meaning and preservation |
 |---|---|---|---|
 | `schemas` | `dict[str, Schema]` | `{}` | Named schemas; each retains its original raw schema value. |
-| `parameters` | `dict[str, ParameterEntry]` | `{}` | Reusable parameter definitions or references. |
+| `parameters` | `dict[str, ParameterEntry]` | `{}` | Reusable parameter definitions or parameter references, with component scope recorded on reference edges. |
 | `request_bodies` | `dict[str, RequestBodyEntry]` | `{}` | Reusable request bodies or references. |
 | `responses` | `dict[str, ResponseEntry]` | `{}` | Reusable responses or references. |
 | `security_schemes` | `dict[str, SecuritySchemeEntry]` | `{}` | Reusable schemes or references. |
@@ -446,9 +451,11 @@ This keeps the MVP typed around concepts the first Generator needs while prevent
 | `Schema.raw` | `bool \| JsonObject` | Required | Entire original schema node. Preserves `$ref`, `$ref` siblings, `allOf`, `oneOf`, `anyOf`, `not`, `nullable`, `type`, null unions, required names, read/write flags, constraints, custom dialect keywords, and unknown/vendor keywords. |
 | `Schema.reference` | `LocalReference \| None` | Derived property | Typed view of a top-level `$ref` only; does not duplicate serialized state or resolve it. Composition references remain in `raw`. |
 | `LocalReference.uri` | `str` | Required | Exact local URI reference string; no target content is embedded. |
-| `LocalReference.source_scope` | `ParameterScope \| None` | `None` | Set to `path` or `operation` when the reference is an endpoint parameter declaration; otherwise unused. |
 | `LocalReference.summary` | `str \| None` | `None` | Reference Object override or schema sibling annotation when present. |
 | `LocalReference.description` | `str \| None` | `None` | Reference Object override or schema sibling annotation when present. |
+| `ParameterReference.reference` | `LocalReference` | Required | Generic local reference data, nested to keep parameter metadata out of all other reference types. |
+| `ParameterReference` | Model | — | Parameter-only wrapper around a reference edge; used only by `ParameterEntry`. |
+| `ParameterReference.source_scope` | `ParameterScope` | Required | Declaration scope: `path`, `operation`, or `component`. |
 
 ### Normalization result and override diagnostics
 
@@ -515,11 +522,11 @@ Never represent `None` and `()` as the same state.
 
 ### Parameters
 
-`Endpoint.parameters` is the effective set for the operation, after combining Path Item and operation declarations by `(name, location)`. It is typed as `tuple[ParameterEntry, ...]`, so an effective entry can be a concrete `Parameter` or a local `LocalReference`. Inline `Parameter` entries and parameter-reference entries both carry declaration scope: `Parameter.source_scope` is required, and `LocalReference.source_scope` is set for parameter edges.
+`Endpoint.parameters` is the effective set for the operation, after combining Path Item and operation declarations by `(name, location)`. It is typed as `tuple[ParameterEntry, ...]`, so an effective entry can be a concrete `Parameter` or a `ParameterReference`. Inline `Parameter` entries and parameter-reference entries both carry declaration scope: `Parameter.source_scope` and `ParameterReference.source_scope` are required. Generic `LocalReference` remains free of parameter-specific metadata and is used for request bodies, responses, security schemes, examples, headers, links, and other reference-bearing objects.
 
 To determine a referenced parameter's merge identity, the Normalizer performs an explicit, non-expanding lookup in `Components.parameters` to inspect the target Parameter's `name` and location. The endpoint entry remains the original reference edge if it wins; lookup is only for identity and merge rules, not inlining. A reference chain may be followed for identity with cycle detection, but the reference URI is retained as the effective entry. If a reference target cannot be inspected safely, normalization fails with a clear error instead of keeping an ambiguous duplicate or silently discarding it.
 
-Merge rule: process path-level declarations first, then operation-level declarations. A same-identity operation entry replaces the effective path entry, whether either side is inline or referenced. If a reference wins, retain that `LocalReference`; if an inline entry wins, retain that `Parameter`. Unmatched entries from both scopes remain. Preserve deterministic declaration order: retain the path slot when replaced, then append operation-only entries in operation declaration order.
+Merge rule: process path-level declarations first, then operation-level declarations. A same-identity operation entry replaces the effective path entry, whether either side is inline or referenced. If a reference wins, retain that `ParameterReference`; if an inline entry wins, retain that `Parameter`. Unmatched entries from both scopes remain. Preserve deterministic declaration order: retain the path slot when replaced, then append operation-only entries in operation declaration order.
 
 For each replacement, return a `ParameterOverrideDiagnostic` in a separate `NormalizationResult`, not inside `ApiModel`. It records endpoint path, parameter name and location, original scope (`path`), overriding scope (`operation`), and the original/overriding reference URI where either entry is a reference. Diagnostics describe normalization decisions; they are not API semantics. The Generator consumes `result.api`; UI/logging can present `result.diagnostics`.
 
@@ -627,8 +634,8 @@ api = ApiModel(
             path="/pets/{pet_id}",
             operation_id="getPet",
             parameters=(
-                LocalReference(
-                    uri="#/components/parameters/PetId",
+                ParameterReference(
+                    reference=LocalReference(uri="#/components/parameters/PetId"),
                     source_scope="path",
                 ),
                 Parameter(
@@ -709,7 +716,7 @@ The model has not expanded `Pet` into the response schema. The `pet_schema` look
 
 ### Parameter override example
 
-If the Path Item declares `LocalReference(uri="#/components/parameters/PetId", source_scope="path")` and the operation declares an inline `Parameter(name="pet_id", location="path", source_scope="operation", ...)`, the Normalizer inspects the referenced component only to learn its `(name, location)` identity. The effective `Endpoint.parameters` entry is the operation Parameter; the reference is not inlined or kept as a second conflicting effective parameter. The Normalizer returns a separate diagnostic:
+If the Path Item declares `ParameterReference(reference=LocalReference(uri="#/components/parameters/PetId"), source_scope="path")` and the operation declares an inline `Parameter(name="pet_id", location="path", source_scope="operation", ...)`, the Normalizer inspects the referenced component only to learn its `(name, location)` identity. The effective `Endpoint.parameters` entry is the operation Parameter; the reference is not inlined or kept as a second conflicting effective parameter. The Normalizer returns a separate diagnostic:
 
 ```python
 ParameterOverrideDiagnostic(
@@ -751,7 +758,7 @@ The error identifies `unsupported_path_item_reference` at `/paths/~1pets/$ref`. 
 - OpenAPI version retained on the API model.
 - Full raw schema preservation, including unknown keywords, composition, references, and 3.0/3.1 dialect details.
 - Local component registry and local reference edges.
-- Effective endpoint `ParameterEntry` values, preserving local references, with `source_scope`, deterministic path/operation override behavior, and separate override diagnostics in `NormalizationResult`.
+- Effective endpoint `ParameterEntry` values, preserving parameter reference edges and their declaration `source_scope`, with deterministic path/operation override behavior and separate override diagnostics in `NormalizationResult`.
 - Clear rejection of Path Item `$ref` under `paths` with a normalization error; do not partially emit endpoints from it.
 - Request body requiredness and all request media types.
 - Response map keyed by original status strings and all response media types.
