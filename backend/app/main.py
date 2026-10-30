@@ -1,23 +1,15 @@
+
 from fastapi import FastAPI
 
+from app.config import get_settings
+from app.api.routes.health import router as health_router
+
+settings = get_settings()
+
 app = FastAPI(
-    title="API Sentinel",
+    title=settings.app_name,
     description="Intelligent API Testing & Monitoring",
-    version="0.1.0",
+    version=settings.app_version,
 )
 
-
-@app.get("/")
-async def root():
-    return {
-        "name": "API Sentinel",
-        "version": "0.1.0",
-        "status": "running",
-    }
-
-
-@app.get("/health")
-async def health_check():
-    return {
-        "status": "healthy",
-    }
+app.include_router(health_router)
