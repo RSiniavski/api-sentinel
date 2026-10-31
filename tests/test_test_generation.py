@@ -2154,3 +2154,283 @@ def test_wrong_type_cases_are_deterministic_and_diagnose_schemas_without_type() 
     assert [case.affected_property for case in wrong_cases] == ["/first"]
     assert len({case.case_id for case in wrong_cases}) == len(wrong_cases)
     assert any(item.code == "wrong_type_schema_missing_type" for item in first.diagnostics)
+
+
+def test_string_length_cases_violate_min_and_max_independently() -> None:
+    endpoint = make_endpoint(
+        "/string-length-both",
+        "post",
+        request_body=RequestBody(
+            required=True,
+            content={
+                "application/json": MediaType(
+                    schema=Schema(
+                        raw={
+                            "type": "object",
+                            "required": ["text", "keep"],
+                            "properties": {
+                                "text": {
+                                    "type": "string",
+                                    "minLength": 3,
+                                    "maxLength": 10,
+                                },
+                                "keep": {"type": "integer"},
+                            },
+                        }
+                    )
+                )
+            },
+        ),
+    )
+
+    suite = generate_test_suite(make_result(endpoint))
+    positive = suite.cases[0]
+    cases = {case.violated_constraint: case for case in suite.cases if case.violated_constraint in {"minLength", "maxLength"}}
+
+    assert positive.request_body.value == {"text": "sentinel", "keep": 0}
+    assert set(cases) == {"minLength", "maxLength"}
+    short = cases["minLength"].request_body.value
+    long = cases["maxLength"].request_body.value
+    assert short == {"text": "xx", "keep": 0}
+    assert len(short["text"]) < 3
+    assert len(short["text"]) <= 10
+    assert long == {"text": "x" * 11, "keep": 0}
+    assert len(long["text"]) > 10
+    assert len(long["text"]) >= 3
+    for constraint, case in cases.items():
+        assert case.category == "negative"
+        assert case.expected_outcome == "request_rejection_status_unspecified"
+        assert case.affected_property == "/text"
+        assert case.provenance[-3:] == (
+            "/paths/~1string-length-both/post/requestBody/content/application~1json/schema/properties/text",
+            f"/paths/~1string-length-both/post/requestBody/content/application~1json/schema/properties/text/{constraint}",
+            f"violated_constraint:{constraint}:/text",
+        )
+
+
+def test_string_length_cases_support_multiple_and_nested_properties_without_mutation() -> None:
+    endpoint = make_endpoint(
+        "/string-length-nested",
+        "post",
+        request_body=RequestBody(
+            required=True,
+            content={
+                "application/json": MediaType(
+                    schema=Schema(
+                        raw={
+                            "type": "object",
+                            "required": ["outer", "keep"],
+                            "properties": {
+                                "outer": {
+                                    "type": "object",
+                                    "required": ["label"],
+                                    "properties": {
+                                        "label": {"type": "string", "minLength": 2},
+                                        "optional": {"type": "string", "maxLength": 3},
+                                    },
+                                },
+                                "keep": {"type": "string", "maxLength": 4},
+                            },
+                        }
+                    )
+                )
+            },
+        ),
+    )
+    result = make_result(endpoint)
+    before = result.model_dump_json()
+
+    first = generate_test_suite(result)
+    second = generate_test_suite(result)
+    cases = [case for case in first.cases if case.violated_constraint in {"minLength", "maxLength"}]
+
+    assert first.model_dump_json() == second.model_dump_json()
+    assert result.model_dump_json() == before
+    assert [(case.affected_property, case.violated_constraint) for case in cases] == [
+        ("/keep", "maxLength"),
+        ("/outer/label", "minLength"),
+    ]
+    assert [case.request_body.value for case in cases] == [
+        {"outer": {"label": "sentinel"}, "keep": "x" * 5},
+        {"outer": {"label": "x"}, "keep": "sent"},
+    ]
+    assert len({case.case_id for case in cases}) == len(cases)
+    assert all(case.security == first.cases[0].security for case in cases)
+    assert all(case.response_expectations == first.cases[0].response_expectations for case in cases)
+
+
+def test_string_length_generation_skips_properties_absent_from_positive_body() -> None:
+    endpoint = make_endpoint(
+        "/string-length-optional",
+        "post",
+        request_body=RequestBody(
+            required=True,
+            content={
+                "application/json": MediaType(
+                    schema=Schema(
+                        raw={
+                            "type": "object",
+                            "properties": {
+                                "optional": {"type": "string", "minLength": 2},
+                            },
+                        }
+                    )
+                )
+            },
+        ),
+    )
+
+    suite = generate_test_suite(make_result(endpoint))
+
+    assert suite.cases[0].request_body.value == {}
+    assert not any(case.violated_constraint in {"minLength", "maxLength"} for case in suite.cases)
+    assert not any(item.code.startswith("string_boundary_") for item in suite.diagnostics)
+
+
+@pytest.mark.parametrize(
+    ("version", "property_schema"),
+    [
+        ("3.0.3", {"type": "string", "nullable": True, "minLength": 2, "maxLength": 3}),
+        ("3.1.1", {"type": ["string", "null"], "minLength": 2, "maxLength": 3}),
+    ],
+)
+def test_string_length_generation_supports_nullable_string_schemas(
+    version: str, property_schema: dict[str, object]
+) -> None:
+    endpoint = make_endpoint(
+        "/string-length-nullable",
+        "post",
+        request_body=RequestBody(
+            required=True,
+            content={
+                "application/json": MediaType(
+                    schema=Schema(
+                        raw={
+                            "type": "object",
+                            "required": ["text"],
+                            "properties": {"text": property_schema},
+                        }
+                    )
+                )
+            },
+        ),
+    )
+
+    suite = generate_test_suite(make_result(endpoint, version=version))
+    cases = {case.violated_constraint: case for case in suite.cases if case.violated_constraint in {"minLength", "maxLength"}}
+
+    assert cases["minLength"].request_body.value == {"text": "x"}
+    assert cases["maxLength"].request_body.value == {"text": "x" * 4}
+
+
+@pytest.mark.parametrize(
+    ("restricted", "expected_constraint"),
+    [
+        ({"enum": ["ab", "valid"]}, "minLength"),
+        ({"const": "valid"}, None),
+    ],
+)
+def test_string_length_candidates_respect_const_and_enum(
+    restricted: dict[str, object], expected_constraint: str | None
+) -> None:
+    endpoint = make_endpoint(
+        "/string-length-restricted",
+        "post",
+        request_body=RequestBody(
+            required=True,
+            content={
+                "application/json": MediaType(
+                    schema=Schema(
+                        raw={
+                            "type": "object",
+                            "required": ["text"],
+                            "properties": {
+                                "text": {
+                                    "type": "string",
+                                    "minLength": 3,
+                                    "maxLength": 6,
+                                    **restricted,
+                                }
+                            },
+                        }
+                    )
+                )
+            },
+        ),
+    )
+
+    suite = generate_test_suite(make_result(endpoint))
+    string_cases = [case for case in suite.cases if case.violated_constraint in {"minLength", "maxLength"}]
+
+    if expected_constraint is None:
+        assert string_cases == []
+        assert {item.code for item in suite.diagnostics} >= {"string_boundary_no_safe_candidate"}
+    else:
+        assert len(string_cases) == 1
+        assert string_cases[0].violated_constraint == expected_constraint
+        assert string_cases[0].request_body.value == {"text": "ab"}
+        assert any(
+            item.code == "string_boundary_no_safe_candidate"
+            and item.source_pointer.endswith("/maxLength")
+            for item in suite.diagnostics
+        )
+
+
+def test_string_length_zero_minimum_and_missing_type_are_diagnosed() -> None:
+    endpoint = make_endpoint(
+        "/string-length-unsupported",
+        "post",
+        request_body=RequestBody(
+            required=True,
+            content={
+                "application/json": MediaType(
+                    schema=Schema(
+                        raw={
+                            "type": "object",
+                            "required": ["zero", "untyped"],
+                            "properties": {
+                                "zero": {"type": "string", "minLength": 0},
+                                "untyped": {"default": "okay", "minLength": 2},
+                            },
+                        }
+                    )
+                )
+            },
+        ),
+    )
+
+    suite = generate_test_suite(make_result(endpoint))
+
+    assert not any(case.violated_constraint in {"minLength", "maxLength"} for case in suite.cases)
+    assert {item.code for item in suite.diagnostics} >= {
+        "string_boundary_no_safe_candidate",
+        "string_boundary_type_missing",
+    }
+
+
+def test_contradictory_string_length_interval_has_no_positive_or_negative_case() -> None:
+    endpoint = make_endpoint(
+        "/string-length-impossible",
+        "post",
+        request_body=RequestBody(
+            required=True,
+            content={
+                "application/json": MediaType(
+                    schema=Schema(
+                        raw={
+                            "type": "object",
+                            "required": ["text"],
+                            "properties": {
+                                "text": {"type": "string", "minLength": 5, "maxLength": 3}
+                            },
+                        }
+                    )
+                )
+            },
+        ),
+    )
+
+    suite = generate_test_suite(make_result(endpoint))
+
+    assert suite.cases == ()
+    assert suite.diagnostics[0].code == "no_positive_schema_value"

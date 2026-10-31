@@ -91,6 +91,11 @@ def generate_test_suite(result: NormalizationResult) -> GeneratedTestSuite:
             )
             cases.extend(wrong_type_cases)
             diagnostics.extend(wrong_type_diagnostics)
+            string_cases, string_diagnostics = _string_boundary_negative_cases(
+                endpoint, positive, result.api.openapi_version
+            )
+            cases.extend(string_cases)
+            diagnostics.extend(string_diagnostics)
         except _UnsupportedOperation as issue:
             diagnostics.append(
                 GenerationDiagnostic(
@@ -369,6 +374,206 @@ def _json_value_type(value: Any) -> str:
     if isinstance(value, list):
         return "array"
     return "object"
+
+
+def _string_boundary_negative_cases(
+    endpoint: Endpoint, positive: GeneratedTestCase, version: str
+) -> tuple[tuple[GeneratedTestCase, ...], tuple[GenerationDiagnostic, ...]]:
+    """Generate safe minLength and maxLength violations for present properties."""
+    request_body = endpoint.request_body
+    if not isinstance(request_body, RequestBody) or positive.request_body is None:
+        return (), ()
+    if set(request_body.content) != {"application/json"}:
+        return (), ()
+    media = request_body.content["application/json"]
+    if media.schema is None or not isinstance(media.schema.raw, dict):
+        return (), ()
+
+    root_pointer = _child(
+        _endpoint_pointer(endpoint), "requestBody", "content", "application/json", "schema"
+    )
+    targets: list[tuple[tuple[str, ...], str, str, str]] = []
+    diagnostics: list[GenerationDiagnostic] = []
+
+    def visit(schema: Any, value: Any, path: tuple[str, ...], pointer: str) -> None:
+        if not isinstance(schema, dict) or not isinstance(value, dict):
+            return
+        properties = schema.get("properties")
+        if not isinstance(properties, dict):
+            return
+        for name in sorted(properties):
+            if name not in value:
+                continue
+            child_schema = properties[name]
+            child_pointer = _child(pointer, "properties", name)
+            child_path = (*path, name)
+            if not isinstance(child_schema, dict):
+                continue
+
+            constraints = tuple(
+                key for key in ("minLength", "maxLength") if key in child_schema
+            )
+            if constraints:
+                if "type" not in child_schema:
+                    for constraint in constraints:
+                        diagnostics.append(
+                            _string_boundary_diagnostic(
+                                endpoint,
+                                "string_boundary_type_missing",
+                                "The property schema has no declared type; no string-length case was generated.",
+                                _child(child_pointer, constraint),
+                            )
+                        )
+                else:
+                    try:
+                        _check_schema(child_schema, version, child_pointer, "request", 0)
+                        allowed_types = _types(
+                            child_schema["type"], version, _child(child_pointer, "type")
+                        )
+                    except _UnsupportedOperation as issue:
+                        for _constraint in constraints:
+                            diagnostics.append(
+                                _string_boundary_diagnostic(
+                                    endpoint,
+                                    "string_boundary_unsupported_schema",
+                                    str(issue),
+                                    issue.pointer,
+                                    issue.reference_uri,
+                                )
+                            )
+                    else:
+                        if "string" not in allowed_types:
+                            for constraint in constraints:
+                                diagnostics.append(
+                                    _string_boundary_diagnostic(
+                                        endpoint,
+                                        "string_boundary_non_string_type",
+                                        "String-length constraints do not apply to this property's declared type.",
+                                        _child(child_pointer, constraint),
+                                    )
+                                )
+                        else:
+                            for constraint in constraints:
+                                candidate = _string_boundary_candidate(
+                                    child_schema, constraint, version
+                                )
+                                if candidate is None:
+                                    diagnostics.append(
+                                        _string_boundary_diagnostic(
+                                            endpoint,
+                                            "string_boundary_no_safe_candidate",
+                                            f"No deterministic value safely violates '{constraint}' while satisfying the other supported constraints.",
+                                            _child(child_pointer, constraint),
+                                        )
+                                    )
+                                else:
+                                    targets.append(
+                                        (child_path, constraint, candidate, child_pointer)
+                                    )
+
+            visit(child_schema, value[name], child_path, child_pointer)
+
+    visit(media.schema.raw, positive.request_body.value, (), root_pointer)
+
+    cases: list[GeneratedTestCase] = []
+    for path, constraint, candidate, schema_pointer in targets:
+        generated_value = deepcopy(positive.request_body.value)
+        parent = generated_value
+        for name in path[:-1]:
+            parent = parent[name]
+        parent[path[-1]] = candidate
+
+        property_pointer = _json_pointer(path)
+        constraint_pointer = _child(schema_pointer, constraint)
+        cases.append(
+            GeneratedTestCase(
+                case_id=build_case_id(
+                    "negative",
+                    endpoint.path,
+                    endpoint.method,
+                    f"string-boundary:{property_pointer}:{constraint}:{len(candidate)}",
+                ),
+                category="negative",
+                path=positive.path,
+                method=positive.method,
+                parameters=deepcopy(positive.parameters),
+                request_body=GeneratedBody(
+                    media_type="application/json", value=generated_value
+                ),
+                security=deepcopy(positive.security),
+                response_expectations=deepcopy(positive.response_expectations),
+                provenance=(
+                    *positive.provenance,
+                    schema_pointer,
+                    constraint_pointer,
+                    f"violated_constraint:{constraint}:{property_pointer}",
+                ),
+                expected_outcome="request_rejection_status_unspecified",
+                violated_constraint=constraint,
+                affected_property=property_pointer,
+            )
+        )
+
+    return tuple(cases), tuple(diagnostics)
+
+
+def _string_boundary_candidate(
+    schema: dict[str, Any], constraint: str, version: str
+) -> str | None:
+    """Return the first deterministic string violating one length bound only."""
+    if constraint == "minLength":
+        boundary = schema[constraint]
+        if boundary == 0:
+            return None
+        candidate_length = boundary - 1
+    elif constraint == "maxLength":
+        boundary = schema[constraint]
+        candidate_length = boundary + 1
+    else:
+        return None
+
+    if "const" in schema:
+        candidates = [schema["const"]]
+    elif "enum" in schema:
+        candidates = schema["enum"]
+    else:
+        if candidate_length > _MAX_COLLECTION_SIZE:
+            return None
+        candidates = ["x" * candidate_length]
+
+    other_constraints_schema = {
+        key: value for key, value in schema.items() if key != constraint
+    }
+    for candidate in candidates:
+        if not isinstance(candidate, str):
+            continue
+        if constraint == "minLength" and len(candidate) >= boundary:
+            continue
+        if constraint == "maxLength" and len(candidate) <= boundary:
+            continue
+        try:
+            if _matches(other_constraints_schema, candidate, version, "request", 0):
+                return candidate
+        except _UnsupportedOperation:
+            continue
+    return None
+
+
+def _string_boundary_diagnostic(
+    endpoint: Endpoint,
+    code: str,
+    message: str,
+    pointer: str,
+    reference_uri: str | None = None,
+) -> GenerationDiagnostic:
+    return GenerationDiagnostic(
+        code=code,
+        message=message,
+        endpoint_path=endpoint.path,
+        endpoint_method=endpoint.method,
+        source_pointer=pointer,
+        reference_uri=reference_uri,
+    )
 
 
 def _numeric_boundary_negative_cases(
