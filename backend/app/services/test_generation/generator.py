@@ -86,6 +86,11 @@ def generate_test_suite(result: NormalizationResult) -> GeneratedTestSuite:
             )
             cases.extend(numeric_cases)
             diagnostics.extend(numeric_diagnostics)
+            wrong_type_cases, wrong_type_diagnostics = _wrong_type_negative_cases(
+                endpoint, positive, result.api.openapi_version
+            )
+            cases.extend(wrong_type_cases)
+            diagnostics.extend(wrong_type_diagnostics)
         except _UnsupportedOperation as issue:
             diagnostics.append(
                 GenerationDiagnostic(
@@ -203,6 +208,167 @@ def _required_property_negative_cases(
             )
         )
     return tuple(cases), tuple(diagnostics)
+
+
+def _wrong_type_negative_cases(
+    endpoint: Endpoint, positive: GeneratedTestCase, version: str
+) -> tuple[tuple[GeneratedTestCase, ...], tuple[GenerationDiagnostic, ...]]:
+    """Replace one present body property with a deterministic incompatible type."""
+    request_body = endpoint.request_body
+    if not isinstance(request_body, RequestBody) or positive.request_body is None:
+        return (), ()
+    if set(request_body.content) != {"application/json"}:
+        return (), ()
+    media = request_body.content["application/json"]
+    if media.schema is None or not isinstance(media.schema.raw, dict):
+        return (), ()
+
+    root_pointer = _child(
+        _endpoint_pointer(endpoint), "requestBody", "content", "application/json", "schema"
+    )
+    raw_schema = media.schema.raw
+    body_value = positive.request_body.value
+    targets: list[tuple[tuple[str, ...], tuple[str, ...], Any, str]] = []
+    diagnostics: list[GenerationDiagnostic] = []
+
+    def visit(schema: Any, value: Any, path: tuple[str, ...], pointer: str) -> None:
+        if not isinstance(schema, dict) or not isinstance(value, dict):
+            return
+        properties = schema.get("properties")
+        if not isinstance(properties, dict):
+            return
+        for name in sorted(properties):
+            if name not in value:
+                continue
+            child_schema = properties[name]
+            child_pointer = _child(pointer, "properties", name)
+            child_path = (*path, name)
+            if not isinstance(child_schema, dict):
+                continue
+
+            if "type" not in child_schema:
+                diagnostics.append(
+                    GenerationDiagnostic(
+                        code="wrong_type_schema_missing_type",
+                        message=(
+                            "The property schema does not declare a type; no safe "
+                            "wrong-type case was generated."
+                        ),
+                        endpoint_path=endpoint.path,
+                        endpoint_method=endpoint.method,
+                        source_pointer=child_pointer,
+                        reference_uri=None,
+                    )
+                )
+            else:
+                try:
+                    allowed_types = _types(
+                        child_schema["type"], version, _child(child_pointer, "type")
+                    )
+                except _UnsupportedOperation as issue:
+                    diagnostics.append(
+                        GenerationDiagnostic(
+                            code="wrong_type_unsupported_schema",
+                            message=str(issue),
+                            endpoint_path=endpoint.path,
+                            endpoint_method=endpoint.method,
+                            source_pointer=issue.pointer,
+                            reference_uri=issue.reference_uri,
+                        )
+                    )
+                else:
+                    candidate = _wrong_type_candidate(allowed_types)
+                    if candidate is None:
+                        diagnostics.append(
+                            GenerationDiagnostic(
+                                code="wrong_type_unsupported_schema",
+                                message=(
+                                    "No deterministic incompatible JSON type candidate "
+                                    "is available for this property schema."
+                                ),
+                                endpoint_path=endpoint.path,
+                                endpoint_method=endpoint.method,
+                                source_pointer=_child(child_pointer, "type"),
+                                reference_uri=None,
+                            )
+                        )
+                    else:
+                        candidate_type = _json_value_type(candidate)
+                        if candidate_type not in allowed_types:
+                            targets.append(
+                                (child_path, allowed_types, candidate, child_pointer)
+                            )
+
+            visit(child_schema, value[name], child_path, child_pointer)
+
+    visit(raw_schema, body_value, (), root_pointer)
+
+    cases: list[GeneratedTestCase] = []
+    for path, _, candidate, schema_pointer in targets:
+        generated_value = deepcopy(body_value)
+        parent = generated_value
+        for name in path[:-1]:
+            parent = parent[name]
+        parent[path[-1]] = candidate
+
+        property_pointer = _json_pointer(path)
+        type_pointer = _child(schema_pointer, "type")
+        cases.append(
+            GeneratedTestCase(
+                case_id=build_case_id(
+                    "negative", endpoint.path, endpoint.method, f"wrong-type:{property_pointer}"
+                ),
+                category="negative",
+                path=positive.path,
+                method=positive.method,
+                parameters=deepcopy(positive.parameters),
+                request_body=GeneratedBody(
+                    media_type="application/json", value=generated_value
+                ),
+                security=deepcopy(positive.security),
+                response_expectations=deepcopy(positive.response_expectations),
+                provenance=(
+                    *positive.provenance,
+                    schema_pointer,
+                    type_pointer,
+                    f"violated_constraint:type:{property_pointer}",
+                ),
+                expected_outcome="request_rejection_status_unspecified",
+                violated_constraint="type",
+                affected_property=property_pointer,
+            )
+        )
+
+    return tuple(cases), tuple(diagnostics)
+
+
+def _wrong_type_candidate(allowed_types: tuple[str, ...]) -> Any | None:
+    """Return a stable JSON value outside a supported declared type set."""
+    base_type = next((item for item in allowed_types if item != "null"), None)
+    if base_type == "string":
+        return 0
+    if base_type in {"integer", "number", "boolean", "array", "object"}:
+        return "wrong-type"
+    if base_type is None and allowed_types == ("null",):
+        return "wrong-type"
+    return None
+
+
+def _json_value_type(value: Any) -> str:
+    """Return the JSON type for a deterministic candidate value."""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int):
+        return "integer"
+    if isinstance(value, float):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, list):
+        return "array"
+    return "object"
 
 
 def _numeric_boundary_negative_cases(

@@ -533,14 +533,15 @@ def test_generates_required_json_object_properties_and_omits_optional_and_read_o
 
     suite = generate_test_suite(make_result(endpoint))
 
-    assert len(suite.cases) == 3
+    assert sum(case.category == "positive" for case in suite.cases) == 1
     positive = suite.cases[0]
     body = positive.request_body
     assert body == GeneratedBody(
         media_type="application/json",
         value={"name": "sentinel", "secret": "sentinel"},
     )
-    negatives = suite.cases[1:]
+    negatives = [case for case in suite.cases if case.violated_constraint == "required_property"]
+    assert len(negatives) == 2
     assert {case.affected_property for case in negatives} == {"/name", "/secret"}
     assert all(case.violated_constraint == "required_property" for case in negatives)
     assert all(
@@ -598,8 +599,9 @@ def test_one_required_property_produces_one_explicit_negative_case() -> None:
 
     suite = generate_test_suite(result)
 
-    assert len(suite.cases) == 2
-    positive, negative = suite.cases
+    assert len(suite.cases) == 3
+    positive = next(case for case in suite.cases if case.category == "positive")
+    negative = next(case for case in suite.cases if case.violated_constraint == "required_property")
     assert positive.category == "positive"
     assert positive.case_id == build_case_id("positive", "/one-required", "post", "baseline")
     assert positive.request_body == GeneratedBody(
@@ -650,10 +652,14 @@ def test_multiple_required_properties_each_omit_only_the_target_and_skip_read_on
 
     suite = generate_test_suite(make_result(endpoint))
 
-    assert len(suite.cases) == 3
+    assert len(suite.cases) == 5
     positive = suite.cases[0]
     assert positive.request_body.value == {"alpha": "sentinel", "beta": 0}
-    negatives = {case.affected_property: case for case in suite.cases[1:]}
+    negatives = {
+        case.affected_property: case
+        for case in suite.cases
+        if case.violated_constraint == "required_property"
+    }
     assert set(negatives) == {"/alpha", "/beta"}
     assert negatives["/alpha"].request_body.value == {"beta": 0}
     assert negatives["/beta"].request_body.value == {"alpha": "sentinel"}
@@ -697,8 +703,12 @@ def test_nested_required_property_is_omitted_and_pointer_is_preserved() -> None:
 
     suite = generate_test_suite(make_result(endpoint))
 
-    assert len(suite.cases) == 3
-    negatives = {case.affected_property: case for case in suite.cases[1:]}
+    assert len(suite.cases) == 5
+    negatives = {
+        case.affected_property: case
+        for case in suite.cases
+        if case.violated_constraint == "required_property"
+    }
     assert negatives["/address"].request_body.value == {}
     negative = negatives["/address/postal~1code~0"]
     assert negative.request_body.value == {"address": {}}
@@ -748,9 +758,12 @@ def test_negative_cases_are_deterministic_unique_and_do_not_mutate_input() -> No
 
     assert first.model_dump_json() == second.model_dump_json()
     assert result.model_dump_json() == before
-    assert len(first.cases) == 4
-    assert len({case.case_id for case in first.cases}) == 4
-    negative = next(case for case in first.cases if case.affected_property == "/name")
+    assert len(first.cases) == 7
+    assert len({case.case_id for case in first.cases}) == len(first.cases)
+    negative = next(
+        case for case in first.cases
+        if case.violated_constraint == "required_property" and case.affected_property == "/name"
+    )
     generated_values = negative.request_body.value
     assert generated_values is not schema_raw["example"]
     generated_values["meta"]["values"].append(2)
@@ -812,8 +825,9 @@ def test_required_name_without_property_schema_is_diagnostic_not_negative_case()
 
     suite = generate_test_suite(make_result(endpoint))
 
-    assert len(suite.cases) == 2
-    positive, negative = suite.cases
+    assert len(suite.cases) == 3
+    positive = next(case for case in suite.cases if case.category == "positive")
+    negative = next(case for case in suite.cases if case.violated_constraint == "required_property")
     assert positive.category == "positive"
     assert positive.request_body.value == {
         "known": "sentinel",
@@ -859,13 +873,15 @@ def test_missing_declared_4xx_is_explicit_without_inventing_a_status() -> None:
 
     suite = generate_test_suite(make_result(endpoint))
 
-    assert len(suite.cases) == 2
-    negative = suite.cases[1]
+    assert len(suite.cases) == 3
+    negative = next(case for case in suite.cases if case.violated_constraint == "required_property")
     assert negative.expected_outcome == "request_rejection_status_unspecified"
     assert negative.response_expectations[0].status_key == "200"
-    assert len(suite.diagnostics) == 1
-    assert suite.diagnostics[0].code == "negative_response_contract_unavailable"
-    assert "no HTTP status is inferred" in suite.diagnostics[0].message
+    response_diagnostic = next(
+        item for item in suite.diagnostics
+        if item.code == "negative_response_contract_unavailable"
+    )
+    assert "no HTTP status is inferred" in response_diagnostic.message
 
 
 def test_json_null_body_is_present_only_when_schema_allows_null() -> None:
@@ -1931,3 +1947,210 @@ def test_numeric_boundary_cases_are_ordered_stable_and_do_not_mutate_input() -> 
         {"second": 11, "first": 2},
     ]
     assert len({case.case_id for case in first.cases}) == len(first.cases)
+
+
+@pytest.mark.parametrize(
+    ("property_type", "positive_value", "wrong_value"),
+    [
+        ("string", "sentinel", 0),
+        ("integer", 0, "wrong-type"),
+        ("number", 0, "wrong-type"),
+        ("boolean", False, "wrong-type"),
+        ("array", [], "wrong-type"),
+        ("object", {}, "wrong-type"),
+    ],
+)
+def test_wrong_type_negative_cases_cover_supported_json_types(
+    property_type: str, positive_value: object, wrong_value: object
+) -> None:
+    endpoint = make_endpoint(
+        "/wrong-type-basic",
+        "post",
+        request_body=RequestBody(
+            required=True,
+            content={
+                "application/json": MediaType(
+                    schema=Schema(
+                        raw={
+                            "type": "object",
+                            "required": ["value"],
+                            "properties": {"value": {"type": property_type}},
+                        }
+                    )
+                )
+            },
+        ),
+    )
+
+    suite = generate_test_suite(make_result(endpoint))
+    positive = next(case for case in suite.cases if case.category == "positive")
+    wrong_type = next(case for case in suite.cases if case.violated_constraint == "type")
+
+    assert positive.request_body.value == {"value": positive_value}
+    assert wrong_type.request_body.value == {"value": wrong_value}
+    assert wrong_type.category == "negative"
+    assert wrong_type.expected_outcome == "request_rejection_status_unspecified"
+    assert wrong_type.violated_constraint == "type"
+    assert wrong_type.affected_property == "/value"
+    assert wrong_type.provenance[-3:] == (
+        "/paths/~1wrong-type-basic/post/requestBody/content/application~1json/schema/properties/value",
+        "/paths/~1wrong-type-basic/post/requestBody/content/application~1json/schema/properties/value/type",
+        "violated_constraint:type:/value",
+    )
+
+
+def test_wrong_type_cases_preserve_other_values_and_generate_one_case_per_property() -> None:
+    endpoint = make_endpoint(
+        "/wrong-type-many",
+        "post",
+        request_body=RequestBody(
+            required=True,
+            content={
+                "application/json": MediaType(
+                    schema=Schema(
+                        raw={
+                            "type": "object",
+                            "required": ["title", "count", "active"],
+                            "properties": {
+                                "title": {"type": "string"},
+                                "count": {"type": "integer"},
+                                "active": {"type": "boolean"},
+                            },
+                        }
+                    )
+                )
+            },
+        ),
+    )
+
+    suite = generate_test_suite(make_result(endpoint))
+    positive = suite.cases[0]
+    wrong_cases = [case for case in suite.cases if case.violated_constraint == "type"]
+
+    assert [case.affected_property for case in wrong_cases] == ["/active", "/count", "/title"]
+    assert [case.request_body.value for case in wrong_cases] == [
+        {"title": "sentinel", "count": 0, "active": "wrong-type"},
+        {"title": "sentinel", "count": "wrong-type", "active": False},
+        {"title": 0, "count": 0, "active": False},
+    ]
+    assert all(case.case_id for case in wrong_cases)
+    assert len({case.case_id for case in wrong_cases}) == len(wrong_cases)
+    assert all(case.parameters == positive.parameters for case in wrong_cases)
+    assert all(case.security == positive.security for case in wrong_cases)
+    assert all(case.response_expectations == positive.response_expectations for case in wrong_cases)
+
+
+def test_wrong_type_cases_support_nested_properties_and_skip_absent_properties() -> None:
+    endpoint = make_endpoint(
+        "/wrong-type-nested",
+        "post",
+        request_body=RequestBody(
+            required=True,
+            content={
+                "application/json": MediaType(
+                    schema=Schema(
+                        raw={
+                            "type": "object",
+                            "required": ["outer"],
+                            "properties": {
+                                "outer": {
+                                    "type": "object",
+                                    "required": ["label"],
+                                    "properties": {
+                                        "label": {"type": "string"},
+                                        "optional": {"type": "integer"},
+                                    },
+                                }
+                            },
+                        }
+                    )
+                )
+            },
+        ),
+    )
+
+    suite = generate_test_suite(make_result(endpoint))
+    positive = suite.cases[0]
+    wrong_cases = [case for case in suite.cases if case.violated_constraint == "type"]
+
+    assert positive.request_body.value == {"outer": {"label": "sentinel"}}
+    assert [case.affected_property for case in wrong_cases] == ["/outer", "/outer/label"]
+    assert wrong_cases[0].request_body.value == {"outer": "wrong-type"}
+    assert wrong_cases[1].request_body.value == {"outer": {"label": 0}}
+
+
+@pytest.mark.parametrize(
+    ("version", "declared_type", "wrong_value"),
+    [
+        ("3.0.3", "string", 0),
+        ("3.1.1", ["string", "null"], 0),
+        ("3.1.1", ["integer", "null"], "wrong-type"),
+        ("3.1.1", ["null"], "wrong-type"),
+    ],
+)
+def test_wrong_type_candidates_respect_nullable_and_type_union_semantics(
+    version: str, declared_type: str | list[str], wrong_value: object
+) -> None:
+    property_schema: dict[str, object] = {"type": declared_type}
+    if version.startswith("3.0."):
+        property_schema["nullable"] = True
+    endpoint = make_endpoint(
+        "/wrong-type-nullable",
+        "post",
+        request_body=RequestBody(
+            required=True,
+            content={
+                "application/json": MediaType(
+                    schema=Schema(
+                        raw={
+                            "type": "object",
+                            "required": ["value"],
+                            "properties": {"value": property_schema},
+                        }
+                    )
+                )
+            },
+        ),
+    )
+
+    suite = generate_test_suite(make_result(endpoint, version=version))
+    wrong_type = next(case for case in suite.cases if case.violated_constraint == "type")
+
+    assert wrong_type.request_body.value["value"] == wrong_value
+    assert wrong_type.affected_property == "/value"
+
+
+def test_wrong_type_cases_are_deterministic_and_diagnose_schemas_without_type() -> None:
+    endpoint = make_endpoint(
+        "/wrong-type-deterministic",
+        "post",
+        request_body=RequestBody(
+            required=True,
+            content={
+                "application/json": MediaType(
+                    schema=Schema(
+                        raw={
+                            "type": "object",
+                            "required": ["first", "untyped"],
+                            "properties": {
+                                "first": {"type": "integer"},
+                                "untyped": {"default": "kept"},
+                            },
+                        }
+                    )
+                )
+            },
+        ),
+    )
+    result = make_result(endpoint)
+    before = result.model_dump_json()
+
+    first = generate_test_suite(result)
+    second = generate_test_suite(result)
+    wrong_cases = [case for case in first.cases if case.violated_constraint == "type"]
+
+    assert first.model_dump_json() == second.model_dump_json()
+    assert result.model_dump_json() == before
+    assert [case.affected_property for case in wrong_cases] == ["/first"]
+    assert len({case.case_id for case in wrong_cases}) == len(wrong_cases)
+    assert any(item.code == "wrong_type_schema_missing_type" for item in first.diagnostics)
