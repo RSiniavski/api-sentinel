@@ -278,6 +278,120 @@ def test_repeated_generation_is_equivalent_and_does_not_mutate_input() -> None:
     assert result.model_dump_json() == before
 
 
+def test_response_schema_output_is_isolated_from_input_in_both_directions() -> None:
+    input_schema = Schema(
+        raw={"type": "object", "properties": {"id": {"type": "integer"}}}
+    )
+    endpoint = make_endpoint(
+        "/schema-isolation",
+        responses={
+            "200": Response(
+                description="OK",
+                content={"application/json": MediaType(schema=input_schema)},
+            )
+        },
+    )
+    result = make_result(endpoint)
+
+    suite = generate_test_suite(result)
+    output_schema = suite.cases[0].response_expectations[0].schemas_by_media_type[
+        "application/json"
+    ]
+    assert output_schema is not input_schema
+    assert output_schema.raw is not input_schema.raw
+    assert output_schema.raw["properties"] is not input_schema.raw["properties"]
+
+    output_schema.raw["properties"]["id"]["type"] = "string"
+    assert input_schema.raw["properties"]["id"]["type"] == "integer"
+
+    input_schema.raw["properties"]["id"]["type"] = "number"
+    assert output_schema.raw["properties"]["id"]["type"] == "string"
+
+
+def test_security_output_is_isolated_from_input_in_both_directions() -> None:
+    requirement = SecurityRequirement(schemes={"oauth": ("read",)})
+    endpoint = Endpoint(
+        path="/security-isolation",
+        method="get",
+        responses={"200": Response(description="OK")},
+    )
+    result = NormalizationResult(
+        api=ApiModel(
+            openapi_version="3.1.1",
+            info=ApiInfo(title="Generated API", version="1.0"),
+            security=(requirement,),
+            endpoints=(endpoint,),
+        )
+    )
+
+    suite = generate_test_suite(result)
+    output_requirement = suite.cases[0].security[0]
+    assert output_requirement is not requirement
+    assert output_requirement.schemes is not requirement.schemes
+
+    output_requirement.schemes["oauth"] = ("write",)
+    assert requirement.schemes["oauth"] == ("read",)
+
+    requirement.schemes["oauth"] = ("admin",)
+    assert output_requirement.schemes["oauth"] == ("write",)
+
+
+def test_generated_body_json_is_isolated_from_input_in_both_directions() -> None:
+    schema = Schema(
+        raw={
+            "type": "object",
+            "example": {"nested": {"values": ["from-input"]}},
+        }
+    )
+    endpoint = make_endpoint(
+        "/body-isolation",
+        "post",
+        request_body=RequestBody(
+            required=True,
+            content={"application/json": MediaType(schema=schema)},
+        ),
+    )
+    result = make_result(endpoint)
+
+    suite = generate_test_suite(result)
+    output_value = suite.cases[0].request_body.value
+    input_value = schema.raw["example"]
+    assert output_value == input_value
+    assert output_value is not input_value
+    assert output_value["nested"] is not input_value["nested"]
+    assert output_value["nested"]["values"] is not input_value["nested"]["values"]
+
+    output_value["nested"]["values"].append("from-output")
+    assert input_value["nested"]["values"] == ["from-input"]
+
+    input_value["nested"]["values"].append("later-input")
+    assert output_value["nested"]["values"] == ["from-input", "from-output"]
+
+
+def test_generated_parameter_values_are_primitive_in_supported_subset() -> None:
+    result = make_result(
+        make_endpoint(
+            "/parameter-isolation",
+            parameters=(
+                Parameter(
+                    name="q",
+                    location="query",
+                    required=True,
+                    schema=Schema(raw={"type": "string", "example": "input-value"}),
+                    source_scope="operation",
+                ),
+            ),
+        )
+    )
+
+    suite = generate_test_suite(result)
+
+    # The current supported parameter subset only generates primitive values,
+    # so there is no mutable parameter payload to share with the input model.
+    assert suite.cases[0].parameters[0].value == "input-value"
+    assert not isinstance(suite.cases[0].parameters[0].value, (dict, list))
+
+
 def test_generation_rejects_values_other_than_normalization_result() -> None:
     with pytest.raises(TypeError, match="NormalizationResult"):
         generate_test_suite({})  # type: ignore[arg-type]

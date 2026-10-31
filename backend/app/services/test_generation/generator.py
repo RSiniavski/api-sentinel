@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 import math
 from decimal import Decimal, InvalidOperation
 from hashlib import sha256
@@ -141,7 +142,7 @@ def _generate_endpoint(endpoint: Endpoint, api: ApiModel) -> GeneratedTestCase:
                 GeneratedParameterValue(
                     name=entry.name,
                     location=entry.location,
-                    value=value,
+                    value=deepcopy(value),
                     provenance=tuple(dict.fromkeys((pointer, schema_pointer, candidate_pointer))),
                 )
             )
@@ -160,7 +161,7 @@ def _generate_endpoint(endpoint: Endpoint, api: ApiModel) -> GeneratedTestCase:
         method=endpoint.method,
         parameters=tuple(parameters),
         request_body=body,
-        security=security,
+        security=deepcopy(security),
         response_expectations=expectations,
         provenance=(root, *body_provenance),
     )
@@ -214,7 +215,7 @@ def _generate_body(
         direction="request",
     )
     return (
-        GeneratedBody(media_type="application/json", value=value),
+        GeneratedBody(media_type="application/json", value=deepcopy(value)),
         tuple(dict.fromkeys((pointer, schema_pointer, candidate_pointer))),
     )
 
@@ -241,7 +242,7 @@ def _response_expectations(
                 status_key=status,
                 media_types=media_types,
                 schemas_by_media_type={
-                    media_type: response.content[media_type].schema
+                    media_type: deepcopy(response.content[media_type].schema)
                     for media_type in media_types
                 },
                 response_reference_uri=None,
