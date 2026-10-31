@@ -96,6 +96,8 @@ def generate_test_suite(result: NormalizationResult) -> GeneratedTestSuite:
             )
             cases.extend(string_cases)
             diagnostics.extend(string_diagnostics)
+            parameter_cases = _required_parameter_negative_cases(endpoint, positive)
+            cases.extend(parameter_cases)
         except _UnsupportedOperation as issue:
             diagnostics.append(
                 GenerationDiagnostic(
@@ -115,6 +117,59 @@ def generate_test_suite(result: NormalizationResult) -> GeneratedTestSuite:
         cases=tuple(cases),
         diagnostics=tuple(diagnostics),
     )
+
+
+def _required_parameter_negative_cases(
+    endpoint: Endpoint, positive: GeneratedTestCase
+) -> tuple[GeneratedTestCase, ...]:
+    """Omit each generated required non-path parameter once, in declaration order."""
+    root = _endpoint_pointer(endpoint)
+    cases: list[GeneratedTestCase] = []
+    for index, entry in enumerate(endpoint.parameters):
+        if (
+            not isinstance(entry, Parameter)
+            or not entry.required
+            or entry.location not in {"query", "header", "cookie"}
+        ):
+            continue
+
+        # Only omit a parameter that was represented in the positive baseline.
+        # Matching both fields preserves distinct parameters sharing a name.
+        matches = [
+            value
+            for value in positive.parameters
+            if value.name == entry.name and value.location == entry.location
+        ]
+        if len(matches) != 1:
+            continue
+
+        pointer = _child(root, "parameters", str(index))
+        remaining = tuple(
+            deepcopy(value)
+            for value in positive.parameters
+            if value is not matches[0]
+        )
+        variant = f"required-parameter:{entry.location}:{len(entry.name)}:{entry.name}"
+        cases.append(
+            GeneratedTestCase(
+                case_id=build_case_id("negative", endpoint.path, endpoint.method, variant),
+                category="negative",
+                path=positive.path,
+                method=positive.method,
+                parameters=remaining,
+                request_body=deepcopy(positive.request_body),
+                security=deepcopy(positive.security),
+                response_expectations=deepcopy(positive.response_expectations),
+                provenance=(
+                    *positive.provenance,
+                    pointer,
+                    f"violated_constraint:required_parameter:{entry.location}:{entry.name}",
+                ),
+                expected_outcome="request_rejection_status_unspecified",
+                violated_constraint="required_parameter",
+            )
+        )
+    return tuple(cases)
 
 
 def _required_property_negative_cases(

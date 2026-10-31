@@ -474,7 +474,7 @@ def test_generates_one_positive_get_case_with_logical_values_for_all_parameter_l
 
     suite = generate_test_suite(make_result(endpoint))
 
-    assert len(suite.cases) == 1
+    assert len(suite.cases) == 4
     case = suite.cases[0]
     assert case.path == "/items/{item_id}"
     assert [(item.name, item.location, item.value) for item in case.parameters] == [
@@ -486,6 +486,184 @@ def test_generates_one_positive_get_case_with_logical_values_for_all_parameter_l
     assert all(item.provenance for item in case.parameters)
     assert "optional" not in {item.name for item in case.parameters}
     assert suite.diagnostics == ()
+    parameter_negatives = [
+        case for case in suite.cases if case.violated_constraint == "required_parameter"
+    ]
+    assert [case.provenance[-2] for case in parameter_negatives] == [
+        "/paths/~1items~1{item_id}/get/parameters/1",
+        "/paths/~1items~1{item_id}/get/parameters/2",
+        "/paths/~1items~1{item_id}/get/parameters/3",
+    ]
+    assert [
+        tuple((value.name, value.location) for value in case.parameters)
+        for case in parameter_negatives
+    ] == [
+        (("item_id", "path"), ("X-Enabled", "header"), ("session", "cookie")),
+        (("item_id", "path"), ("q", "query"), ("session", "cookie")),
+        (("item_id", "path"), ("q", "query"), ("X-Enabled", "header")),
+    ]
+
+
+@pytest.mark.parametrize("location", ["query", "header", "cookie"])
+def test_required_non_path_parameter_generates_one_omission_case(location: str) -> None:
+    parameter = Parameter(
+        name="required-value",
+        location=location,  # type: ignore[arg-type]
+        required=True,
+        schema=Schema(raw={"type": "string", "example": "kept"}),
+        source_scope="operation",
+    )
+    endpoint = make_endpoint("/required-parameter", parameters=(parameter,))
+
+    suite = generate_test_suite(make_result(endpoint))
+
+    positive, negative = suite.cases
+    assert positive.parameters == (
+        GeneratedParameterValue(
+            name="required-value",
+            location=location,  # type: ignore[arg-type]
+            value="kept",
+            provenance=(
+                f"/paths/~1required-parameter/get/parameters/0",
+                f"/paths/~1required-parameter/get/parameters/0/schema",
+                f"/paths/~1required-parameter/get/parameters/0/schema/example",
+            ),
+        ),
+    )
+    assert negative.parameters == ()
+    assert negative.violated_constraint == "required_parameter"
+    assert negative.expected_outcome == "request_rejection_status_unspecified"
+    assert negative.affected_property is None
+    assert negative.provenance[-2:] == (
+        "/paths/~1required-parameter/get/parameters/0",
+        f"violated_constraint:required_parameter:{location}:required-value",
+    )
+    assert negative.case_id == build_case_id(
+        "negative", endpoint.path, endpoint.method,
+        f"required-parameter:{location}:14:required-value",
+    )
+
+
+def test_required_parameter_cases_remove_one_parameter_preserve_metadata_and_order() -> None:
+    endpoint = Endpoint(
+        path="/parameter-omissions",
+        method="post",
+        parameters=(
+            Parameter(
+                name="first",
+                location="query",
+                required=True,
+                schema=Schema(raw={"type": "string", "example": "one"}),
+                source_scope="operation",
+            ),
+            Parameter(
+                name="skip",
+                location="query",
+                required=False,
+                schema=Schema(raw={"type": "string", "example": "optional"}),
+                source_scope="operation",
+            ),
+            Parameter(
+                name="path-id",
+                location="path",
+                required=True,
+                schema=Schema(raw={"type": "integer", "example": 7}),
+                source_scope="path",
+            ),
+            Parameter(
+                name="same-name",
+                location="header",
+                required=True,
+                schema=Schema(raw={"type": "boolean", "example": True}),
+                source_scope="operation",
+            ),
+            Parameter(
+                name="same-name",
+                location="cookie",
+                required=True,
+                schema=Schema(raw={"type": "string", "example": "cookie"}),
+                source_scope="operation",
+            ),
+        ),
+        request_body=RequestBody(
+            required=True,
+            content={
+                "application/json": MediaType(
+                    schema=Schema(raw={"type": "object", "properties": {"ok": {"type": "boolean"}}})
+                )
+            },
+        ),
+        security=(SecurityRequirement(schemes={"apiKey": ()}),),
+        responses={"400": Response(description="Invalid request")},
+    )
+    result = make_result(endpoint)
+    original = result.model_dump_json()
+
+    first_suite = generate_test_suite(result)
+    second_suite = generate_test_suite(result)
+    positive = first_suite.cases[0]
+    negatives = [
+        case for case in first_suite.cases if case.violated_constraint == "required_parameter"
+    ]
+
+    assert first_suite.model_dump_json() == second_suite.model_dump_json()
+    assert len(negatives) == 3
+    assert [case.provenance[-2] for case in negatives] == [
+        "/paths/~1parameter-omissions/post/parameters/0",
+        "/paths/~1parameter-omissions/post/parameters/3",
+        "/paths/~1parameter-omissions/post/parameters/4",
+    ]
+    assert [
+        tuple((p.name, p.location, p.value) for p in case.parameters)
+        for case in negatives
+    ] == [
+        (("path-id", "path", 7), ("same-name", "header", True), ("same-name", "cookie", "cookie")),
+        (("first", "query", "one"), ("path-id", "path", 7), ("same-name", "cookie", "cookie")),
+        (("first", "query", "one"), ("path-id", "path", 7), ("same-name", "header", True)),
+    ]
+    omitted_parameters = (
+        ("query", "first"),
+        ("header", "same-name"),
+        ("cookie", "same-name"),
+    )
+    for case, omitted in zip(
+        negatives,
+        omitted_parameters,
+        strict=True,
+    ):
+        assert len(case.parameters) == len(positive.parameters) - 1
+        target_location, target_name = omitted
+        expected_remaining = tuple(
+            (value.name, value.location, value.value)
+            for value in positive.parameters
+            if (value.name, value.location) != (target_name, target_location)
+        )
+        assert tuple(
+            (p.name, p.location, p.value) for p in case.parameters
+        ) == expected_remaining
+        assert case.request_body == positive.request_body
+        assert case.security == positive.security
+        assert case.response_expectations == positive.response_expectations
+        assert case.path == positive.path
+        assert case.method == positive.method
+        assert case.category == "negative"
+        assert case.violated_constraint == "required_parameter"
+        assert case.expected_outcome == "request_rejection_status_unspecified"
+        assert case.affected_property is None
+        assert case.case_id != positive.case_id
+        assert case.case_id == build_case_id(
+            "negative",
+            endpoint.path,
+            endpoint.method,
+            f"required-parameter:{target_location}:{len(target_name)}:{target_name}",
+        )
+        assert all(
+            (value.name, value.location) != (target_name, target_location)
+            for value in case.parameters
+        )
+    assert len({case.case_id for case in negatives}) == 3
+    assert first_suite.diagnostics == ()
+    assert result.model_dump_json() == original
 
 
 def test_generates_distinct_cases_for_different_methods_and_paths() -> None:
@@ -599,9 +777,12 @@ def test_one_required_property_produces_one_explicit_negative_case() -> None:
 
     suite = generate_test_suite(result)
 
-    assert len(suite.cases) == 3
+    assert len(suite.cases) == 4
     positive = next(case for case in suite.cases if case.category == "positive")
     negative = next(case for case in suite.cases if case.violated_constraint == "required_property")
+    parameter_negative = next(
+        case for case in suite.cases if case.violated_constraint == "required_parameter"
+    )
     assert positive.category == "positive"
     assert positive.case_id == build_case_id("positive", "/one-required", "post", "baseline")
     assert positive.request_body == GeneratedBody(
@@ -621,6 +802,8 @@ def test_one_required_property_produces_one_explicit_negative_case() -> None:
         "/paths/~1one-required/post/requestBody/content/application~1json/schema/properties/name",
         "violated_constraint:required_property:/name",
     )
+    assert parameter_negative.parameters == ()
+    assert parameter_negative.provenance[-2] == "/paths/~1one-required/post/parameters/0"
     assert suite.diagnostics == ()
 
 
