@@ -66,7 +66,7 @@ def build_case_id(category: str, endpoint_path: str, method: str, variant_id: st
 
 
 def generate_test_suite(result: NormalizationResult) -> GeneratedTestSuite:
-    """Generate one positive baseline per supported normalized operation."""
+    """Generate deterministic positive baselines and supported negative cases."""
     if not isinstance(result, NormalizationResult):
         raise TypeError("result must be a NormalizationResult")
 
@@ -74,7 +74,13 @@ def generate_test_suite(result: NormalizationResult) -> GeneratedTestSuite:
     diagnostics: list[GenerationDiagnostic] = []
     for endpoint in result.api.endpoints:
         try:
-            cases.append(_generate_endpoint(endpoint, result.api))
+            positive = _generate_endpoint(endpoint, result.api)
+            cases.append(positive)
+            negative_cases, negative_diagnostics = _required_property_negative_cases(
+                endpoint, positive
+            )
+            cases.extend(negative_cases)
+            diagnostics.extend(negative_diagnostics)
         except _UnsupportedOperation as issue:
             diagnostics.append(
                 GenerationDiagnostic(
@@ -93,6 +99,140 @@ def generate_test_suite(result: NormalizationResult) -> GeneratedTestSuite:
         openapi_version=result.api.openapi_version,
         cases=tuple(cases),
         diagnostics=tuple(diagnostics),
+    )
+
+
+def _required_property_negative_cases(
+    endpoint: Endpoint, positive: GeneratedTestCase
+) -> tuple[tuple[GeneratedTestCase, ...], tuple[GenerationDiagnostic, ...]]:
+    """Omit each required writable object property from its positive body."""
+    request_body = endpoint.request_body
+    if not isinstance(request_body, RequestBody):
+        return (), ()
+    if set(request_body.content) != {"application/json"}:
+        return (), ()
+    media = request_body.content["application/json"]
+    if media.schema is None or not isinstance(media.schema.raw, dict):
+        return (), ()
+    if positive.request_body is None or not isinstance(positive.request_body.value, dict):
+        return (), ()
+
+    raw_schema = media.schema.raw
+    schema_pointer = _child(
+        _endpoint_pointer(endpoint),
+        "requestBody",
+        "content",
+        "application/json",
+        "schema",
+    )
+    property_paths = _required_writable_property_paths(
+        raw_schema, positive.request_body.value, schema_pointer=schema_pointer
+    )
+    if not property_paths:
+        return (), ()
+
+    root = _endpoint_pointer(endpoint)
+    cases: list[GeneratedTestCase] = []
+    for property_path, property_schema_pointer in property_paths:
+        body_value = deepcopy(positive.request_body.value)
+        target = body_value
+        for name in property_path[:-1]:
+            target = target[name]
+        del target[property_path[-1]]
+
+        property_reference = _json_pointer(property_path)
+        cases.append(
+            GeneratedTestCase(
+                case_id=build_case_id(
+                    "negative",
+                    endpoint.path,
+                    endpoint.method,
+                    f"required-property:{property_reference}",
+                ),
+                category="negative",
+                path=positive.path,
+                method=positive.method,
+                parameters=positive.parameters,
+                request_body=GeneratedBody(
+                    media_type="application/json", value=body_value
+                ),
+                security=deepcopy(positive.security),
+                response_expectations=deepcopy(positive.response_expectations),
+                provenance=(
+                    *positive.provenance,
+                    property_schema_pointer,
+                    f"violated_constraint:required_property:{property_reference}",
+                ),
+                expected_outcome="request_rejection_status_unspecified",
+                violated_constraint="required_property",
+                affected_property=property_reference,
+            )
+        )
+
+    diagnostics: tuple[GenerationDiagnostic, ...] = ()
+    if not any(_declares_client_error(status) for status in endpoint.responses):
+        diagnostics = (
+            GenerationDiagnostic(
+                code="negative_response_contract_unavailable",
+                message=(
+                    "The request is expected to be rejected, but the operation "
+                    "declares no 4xx response; no HTTP status is inferred."
+                ),
+                endpoint_path=endpoint.path,
+                endpoint_method=endpoint.method,
+                source_pointer=_child(root, "responses"),
+                reference_uri=None,
+            ),
+        )
+    return tuple(cases), diagnostics
+
+
+def _required_writable_property_paths(
+    schema: Any,
+    value: dict[str, Any],
+    path: tuple[str, ...] = (),
+    *,
+    schema_pointer: str,
+) -> tuple[tuple[tuple[str, ...], str], ...]:
+    """Return required writable object-property paths in stable order."""
+    if not isinstance(schema, dict):
+        return ()
+    properties = schema.get("properties", {})
+    if not isinstance(properties, dict):
+        return ()
+
+    found: list[tuple[tuple[str, ...], str]] = []
+    for name in sorted(set(schema.get("required", []))):
+        child_schema = properties[name]
+        if isinstance(child_schema, dict) and child_schema.get("readOnly") is True:
+            continue
+        if name not in value:
+            continue
+        property_path = (*path, name)
+        property_schema_pointer = _child(schema_pointer, "properties", name)
+        found.append((property_path, property_schema_pointer))
+        child_value = value[name]
+        if isinstance(child_schema, dict) and isinstance(child_value, dict):
+            found.extend(
+                _required_writable_property_paths(
+                    child_schema,
+                    child_value,
+                    property_path,
+                    schema_pointer=property_schema_pointer,
+                )
+            )
+    return tuple(found)
+
+
+def _json_pointer(path: tuple[str, ...]) -> str:
+    """Format a property path as a JSON Pointer relative to the body value."""
+    return "/" + "/".join(name.replace("~", "~0").replace("/", "~1") for name in path)
+
+
+def _declares_client_error(status: str) -> bool:
+    """Whether an operation declares an exact or ranged 4xx response."""
+    return status == "4XX" or (
+        len(status) == 3 and status[0] == "4" and status[1:].isdigit()
     )
 
 

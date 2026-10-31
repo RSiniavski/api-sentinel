@@ -63,6 +63,14 @@ class GeneratedTestCase(GeneratedModel):
     security: tuple[SecurityRequirement, ...] | None
     response_expectations: tuple[ResponseExpectation, ...]
     provenance: tuple[str, ...]
+    expected_outcome: Literal[
+        "response_contract_unasserted", "request_rejection_status_unspecified"
+    ] = (
+        "response_contract_unasserted"
+    )
+    violated_constraint: str | None = None
+    # JSON Pointer relative to the request body, for negative property cases.
+    affected_property: str | None = None
 
 
 class GeneratedTestSuite(GeneratedModel):

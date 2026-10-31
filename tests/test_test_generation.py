@@ -189,6 +189,10 @@ def test_generated_models_reject_unexpected_fields_and_invalid_types() -> None:
         GeneratedParameterValue(
             name="q", location="matrix", value="x", provenance=()  # type: ignore[arg-type]
         )
+    with pytest.raises(ValidationError):
+        GeneratedTestCase.model_validate(
+            {**case.model_dump(), "expected_outcome": "assume_success"}
+        )
 
 
 def test_generated_models_are_frozen() -> None:
@@ -199,6 +203,7 @@ def test_generated_models_are_frozen() -> None:
         (expectation, "status_key", "500"),
         (diagnostic, "code", "changed"),
         (case, "path", "/changed"),
+        (case, "expected_outcome", "request_rejection_status_unspecified"),
         (suite, "api_title", "Changed API"),
     ):
         with pytest.raises(ValidationError, match="frozen_instance"):
@@ -516,6 +521,10 @@ def test_generates_required_json_object_properties_and_omits_optional_and_read_o
     endpoint = make_endpoint(
         "/items",
         "post",
+        responses={
+            "200": Response(description="OK"),
+            "400": Response(description="Invalid request"),
+        },
         request_body=RequestBody(
             required=True,
             content={"application/json": MediaType(schema=schema)},
@@ -524,13 +533,292 @@ def test_generates_required_json_object_properties_and_omits_optional_and_read_o
 
     suite = generate_test_suite(make_result(endpoint))
 
-    assert len(suite.cases) == 1
-    body = suite.cases[0].request_body
+    assert len(suite.cases) == 3
+    positive = suite.cases[0]
+    body = positive.request_body
     assert body == GeneratedBody(
         media_type="application/json",
         value={"name": "sentinel", "secret": "sentinel"},
     )
+    negatives = suite.cases[1:]
+    assert {case.affected_property for case in negatives} == {"/name", "/secret"}
+    assert all(case.violated_constraint == "required_property" for case in negatives)
+    assert all(
+        case.expected_outcome == "request_rejection_status_unspecified"
+        for case in negatives
+    )
+    assert all(case.response_expectations == positive.response_expectations for case in negatives)
     assert suite.diagnostics == ()
+
+
+def test_one_required_property_produces_one_explicit_negative_case() -> None:
+    security = SecurityRequirement(schemes={"oauth": ("items:write",)})
+    endpoint = Endpoint(
+        path="/one-required",
+        method="post",
+        parameters=(
+            Parameter(
+                name="trace",
+                location="query",
+                required=True,
+                schema=Schema(raw={"type": "string", "example": "trace-1"}),
+                source_scope="operation",
+            ),
+        ),
+        request_body=RequestBody(
+            required=True,
+            content={
+                "application/json": MediaType(
+                    schema=Schema(
+                        raw={
+                            "type": "object",
+                            "required": ["name"],
+                            "properties": {
+                                "name": {"type": "string"},
+                                "optional": {"type": "boolean"},
+                            },
+                        }
+                    )
+                )
+            },
+        ),
+        responses={
+            "201": Response(description="Created"),
+            "400": Response(description="Invalid request"),
+        },
+        security=(security,),
+    )
+    result = NormalizationResult(
+        api=ApiModel(
+            openapi_version="3.1.1",
+            info=ApiInfo(title="Generated API", version="1.0"),
+            endpoints=(endpoint,),
+        )
+    )
+
+    suite = generate_test_suite(result)
+
+    assert len(suite.cases) == 2
+    positive, negative = suite.cases
+    assert positive.category == "positive"
+    assert positive.case_id == build_case_id("positive", "/one-required", "post", "baseline")
+    assert positive.request_body == GeneratedBody(
+        media_type="application/json", value={"name": "sentinel"}
+    )
+    assert negative.category == "negative"
+    assert negative.request_body == GeneratedBody(media_type="application/json", value={})
+    assert negative.violated_constraint == "required_property"
+    assert negative.affected_property == "/name"
+    assert negative.expected_outcome == "request_rejection_status_unspecified"
+    assert negative.parameters == positive.parameters
+    assert negative.security == positive.security
+    assert negative.parameters[0].value == "trace-1"
+    assert negative.security[0] is not security
+    assert negative.response_expectations == positive.response_expectations
+    assert negative.provenance[-2:] == (
+        "/paths/~1one-required/post/requestBody/content/application~1json/schema/properties/name",
+        "violated_constraint:required_property:/name",
+    )
+    assert suite.diagnostics == ()
+
+
+def test_multiple_required_properties_each_omit_only_the_target_and_skip_read_only() -> None:
+    endpoint = make_endpoint(
+        "/multiple-required",
+        "post",
+        responses={"400": Response(description="Invalid request")},
+        request_body=RequestBody(
+            required=True,
+            content={
+                "application/json": MediaType(
+                    schema=Schema(
+                        raw={
+                            "type": "object",
+                            "required": ["alpha", "beta", "server_id"],
+                            "properties": {
+                                "alpha": {"type": "string"},
+                                "beta": {"type": "integer"},
+                                "server_id": {"type": "string", "readOnly": True},
+                                "optional": {"type": "boolean"},
+                            },
+                        }
+                    )
+                )
+            },
+        ),
+    )
+
+    suite = generate_test_suite(make_result(endpoint))
+
+    assert len(suite.cases) == 3
+    positive = suite.cases[0]
+    assert positive.request_body.value == {"alpha": "sentinel", "beta": 0}
+    negatives = {case.affected_property: case for case in suite.cases[1:]}
+    assert set(negatives) == {"/alpha", "/beta"}
+    assert negatives["/alpha"].request_body.value == {"beta": 0}
+    assert negatives["/beta"].request_body.value == {"alpha": "sentinel"}
+    for target, case in negatives.items():
+        body = case.request_body.value
+        assert target.removeprefix("/") not in body
+        assert {"alpha", "beta"} - {target.removeprefix("/")} <= set(body)
+        assert case.violated_constraint == "required_property"
+        assert case.expected_outcome == "request_rejection_status_unspecified"
+    assert suite.diagnostics == ()
+
+
+def test_nested_required_property_is_omitted_and_pointer_is_preserved() -> None:
+    endpoint = make_endpoint(
+        "/nested-required",
+        "post",
+        responses={"422": Response(description="Invalid request")},
+        request_body=RequestBody(
+            required=True,
+            content={
+                "application/json": MediaType(
+                    schema=Schema(
+                        raw={
+                            "type": "object",
+                            "required": ["address"],
+                            "properties": {
+                                "address": {
+                                    "type": "object",
+                                    "required": ["postal/code~"],
+                                    "properties": {
+                                        "postal/code~": {"type": "string"}
+                                    },
+                                }
+                            },
+                        }
+                    )
+                )
+            },
+        ),
+    )
+
+    suite = generate_test_suite(make_result(endpoint))
+
+    assert len(suite.cases) == 3
+    negatives = {case.affected_property: case for case in suite.cases[1:]}
+    assert negatives["/address"].request_body.value == {}
+    negative = negatives["/address/postal~1code~0"]
+    assert negative.request_body.value == {"address": {}}
+    assert negative.affected_property == "/address/postal~1code~0"
+    assert negative.case_id == build_case_id(
+        "negative", endpoint.path, endpoint.method,
+        "required-property:/address/postal~1code~0",
+    )
+
+
+def test_negative_cases_are_deterministic_unique_and_do_not_mutate_input() -> None:
+    endpoint = make_endpoint(
+        "/deterministic-negative",
+        "post",
+        responses={"400": Response(description="Invalid request")},
+        request_body=RequestBody(
+            required=True,
+            content={
+                "application/json": MediaType(
+                    schema=Schema(
+                        raw={
+                            "type": "object",
+                            "example": {"name": "from-input", "meta": {"values": [1]}},
+                            "required": ["name", "meta"],
+                            "properties": {
+                                "name": {"type": "string"},
+                                "meta": {
+                                    "type": "object",
+                                    "required": ["values"],
+                                    "properties": {
+                                        "values": {"type": "array", "items": {"type": "integer"}}
+                                    },
+                                },
+                            },
+                        }
+                    )
+                )
+            },
+        ),
+    )
+    result = make_result(endpoint)
+    schema_raw = result.api.endpoints[0].request_body.content["application/json"].schema.raw
+    before = result.model_dump_json()
+
+    first = generate_test_suite(result)
+    second = generate_test_suite(result)
+
+    assert first.model_dump_json() == second.model_dump_json()
+    assert result.model_dump_json() == before
+    assert len(first.cases) == 4
+    assert len({case.case_id for case in first.cases}) == 4
+    negative = next(case for case in first.cases if case.affected_property == "/name")
+    generated_values = negative.request_body.value
+    assert generated_values is not schema_raw["example"]
+    generated_values["meta"]["values"].append(2)
+    assert schema_raw["example"]["meta"]["values"] == [1]
+    schema_raw["example"]["meta"]["values"].append(3)
+    assert generated_values["meta"]["values"] == [1, 2]
+
+
+def test_unsupported_request_body_schema_emits_diagnostic_without_cases() -> None:
+    endpoint = make_endpoint(
+        "/unsupported-negative",
+        "post",
+        request_body=RequestBody(
+            required=True,
+            content={
+                "application/json": MediaType(
+                    schema=Schema(
+                        raw={
+                            "type": "object",
+                            "required": ["name"],
+                            "properties": {
+                                "name": {"type": "string", "format": "email"}
+                            },
+                        }
+                    )
+                )
+            },
+        ),
+    )
+
+    suite = generate_test_suite(make_result(endpoint))
+
+    assert suite.cases == ()
+    assert len(suite.diagnostics) == 1
+    assert suite.diagnostics[0].code == "unsupported_schema_keyword"
+    assert suite.diagnostics[0].endpoint_path == endpoint.path
+
+
+def test_missing_declared_4xx_is_explicit_without_inventing_a_status() -> None:
+    endpoint = make_endpoint(
+        "/no-error-contract",
+        "post",
+        responses={"200": Response(description="OK")},
+        request_body=RequestBody(
+            required=True,
+            content={
+                "application/json": MediaType(
+                    schema=Schema(
+                        raw={
+                            "type": "object",
+                            "required": ["name"],
+                            "properties": {"name": {"type": "string"}},
+                        }
+                    )
+                )
+            },
+        ),
+    )
+
+    suite = generate_test_suite(make_result(endpoint))
+
+    assert len(suite.cases) == 2
+    negative = suite.cases[1]
+    assert negative.expected_outcome == "request_rejection_status_unspecified"
+    assert negative.response_expectations[0].status_key == "200"
+    assert len(suite.diagnostics) == 1
+    assert suite.diagnostics[0].code == "negative_response_contract_unavailable"
+    assert "no HTTP status is inferred" in suite.diagnostics[0].message
 
 
 def test_json_null_body_is_present_only_when_schema_allows_null() -> None:
