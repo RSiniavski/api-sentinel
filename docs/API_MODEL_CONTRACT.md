@@ -39,7 +39,7 @@ See [the architecture proposal](API_MODEL_NORMALIZER_PROPOSAL.md), [the Parser](
 
 ## 4. Python types and common model configuration
 
-The following definitions show the proposed contract. They are illustrative design code, not source files or an implementation. Model validators may enforce local invariants such as path parameters being required, mutually exclusive `schema`/`content` on a parameter, and a nonempty response map.
+The following definitions describe the approved API Model contract and correspond to the implemented Pydantic models in `backend/app/services/openapi/models.py`. The code is presented as a contract reference; the actual implementation is maintained in the source file. Model validators enforce local invariants such as path parameters being required, mutually exclusive `schema`/`content` on a parameter, and a nonempty response map.
 
 ```python
 from __future__ import annotations
@@ -787,29 +787,51 @@ The error identifies `unsupported_path_item_reference` at `/paths/~1pets/$ref`. 
 
 ## 10. Open questions and risks
 
-1. **Direct Pydantic dependency:** approve a direct Pydantic pin when implementation begins. Current requirements declare pydantic-settings but do not directly declare pydantic; the current local environment reports Pydantic 2.14.2.
-2. **Nested mutability:** The MVP decision is to keep `Schema.raw` as regular JSON-compatible dictionaries/lists, deep-copy on construction, and treat stored values as read-only by convention; `copy_raw()` provides an intentional mutable copy. Direct nested mutation remains technically possible. Revisit only if consumers need enforced deep immutability, since immutable mappings complicate normal Pydantic JSON serialization.
-3. **Source round trip:** this model is generator-oriented and not a lossless representation of every OpenAPI object. Decide whether the original parsed document is retained alongside the model for edit/export and diagnostic use cases.
-4. **Parameter override provenance:** MVP returns a `ParameterOverrideDiagnostic` in `NormalizationResult` with identity, both scopes, and reference URIs when applicable. Retaining the full displaced Parameter object for round-tripping is deferred; preserve the original parsed document separately if that becomes necessary.
-5. **Reference coverage:** the current Parser filters external `$ref` values but does not visibly filter every JSON Schema reference keyword. Decide on `$dynamicRef`/custom dialect policy before promising no external reference behavior for all 3.1 constructs.
-6. **Anchor limitation:** current installed validator fails a referenced OpenAPI 3.1 anchor. Decide whether anchors are unsupported in the first model/Generator release, or whether validator support should be addressed as separate Parser work.
-7. **Components coverage:** confirm whether opaque `Components.other` is sufficient for 3.1 `pathItems`, examples, headers, links, callbacks, and other objects the UI may need to inspect.
-8. **Webhooks:** keep webhooks separate from ordinary client-call endpoints. Decide whether Basic Edition merely preserves them or reports a structured unsupported-feature diagnostic.
-9. **Empty server arrays:** preserve absent versus empty declarations as designed; verify exact inheritance/default behavior for path and operation scopes against both supported OAS families before implementing effective server selection.
-10. **Normalization failures:** decide whether unsupported constructs cause a single `OpenAPINormalizationError` or return a partial model with diagnostics. For deterministic test generation, the recommended MVP is fail clearly for constructs that would otherwise be silently misrepresented, while retaining opaque nonessential data.
-11. **Format/constraint support:** the model can preserve any keyword, but the Test Generator needs a documented subset of formats and patterns it can generate deterministically.
+The API Model implementation is in place. The following items remain relevant for the Normalizer, Generator, or future extensions.
 
-## 11. Recommended implementation sequence
+1. **Nested mutability:** The MVP keeps `Schema.raw` as regular JSON-compatible dictionaries/lists, deep-copies input on construction, and treats stored values as read-only by convention. `copy_raw()` provides an intentional mutable copy. Direct nested mutation remains technically possible. Revisit only if consumers need enforced deep immutability.
+2. **Source round trip:** The API Model is generator-oriented and is not a lossless representation of every OpenAPI object. Decide whether the original parsed document should be retained alongside the model for future edit/export and diagnostic use cases.
+3. **Parameter override provenance:** The contract defines `ParameterOverrideDiagnostic` in `NormalizationResult`, including identity, both declaration scopes, and reference URIs where applicable. Retaining the full displaced Parameter object for round-tripping is deferred.
+4. **Reference coverage:** The current Parser filters external `$ref` values. Coverage of other JSON Schema reference keywords, including `$dynamicRef` and custom dialect behavior, needs a separate decision before claiming that all possible external reference mechanisms are rejected.
+5. **Anchor limitation:** The installed OpenAPI validator has a known limitation with referenced OpenAPI 3.1 anchors. Decide whether anchors are unsupported in the first Normalizer/Generator release or whether validator support should be addressed as separate Parser work.
+6. **Components coverage:** `Components.other` currently preserves less common component categories as JSON-compatible objects or local references. Confirm whether this is sufficient for the Basic Edition and which categories need typed interpretation later.
+7. **Webhooks:** Webhooks are retained separately from ordinary client-call endpoints. Decide whether the Basic Edition should only preserve them or report a structured unsupported-feature diagnostic.
+8. **Empty server arrays:** The model preserves absent versus explicitly empty server declarations. Effective server selection must follow the exact OpenAPI 3.0.x and 3.1.x inheritance/default rules.
+9. **Normalization failures:** The recommended MVP behavior is to fail clearly when an unsupported construct would otherwise produce an incomplete or misleading model. Partial normalization should not silently discard information.
+10. **Format and constraint support:** The model preserves schema keywords, but the Test Generator still needs a documented subset of formats, patterns, and constraints that it can generate deterministic values for.
+11. **Reference traversal limits:** The future Generator must define explicit depth, cycle-detection, and generation-size limits when following local reference edges. The API Model itself must continue to retain references without recursive expansion.
 
-1. Approve this contract and decide the remaining open questions that affect semantics: Pydantic direct pin, reference coverage, and source-document retention. Path Item `$ref` rejection and parameter override diagnostics are MVP decisions in this contract.
-2. Add model tests for Pydantic strictness, serialization, aliasing/copy behavior, and distinctions among `None`, empty tuples, and anonymous security alternatives.
-3. Implement schema raw preservation and `LocalReference` views first; test composition, unknown keywords, 3.0 `nullable`, 3.1 null unions, and boolean schemas.
-4. Implement component registries and typed `Reference` entries without expansion.
-5. Normalize API metadata, security schemes, and root servers.
-6. Normalize endpoints, merge `ParameterEntry` values by `(name, location)` without expanding winning references, preserve effective source scope, and return override diagnostics separately.
-7. Normalize request bodies, media types, responses, status keys, and path/operation server declarations.
-8. Add recursive component/reference fixtures and assert the model stays finite and deterministic.
-9. Update architecture documentation to describe Parser → Normalizer → Test Generator accurately.
-10. Only after this model contract is stable, implement Generator consumers and deterministic test definitions.
+## 11. Implementation status and next steps
 
-No part of this proposal has been implemented. The current Parser and application behavior remain unchanged until explicit approval to implement.
+### Completed
+
+1. Implemented the OpenAPI Parser with JSON/YAML support, content-size limits, safe YAML loading, and OpenAPI 3.0.x/3.1.x validation.
+2. Implemented shared local reference URI syntax validation.
+3. Implemented the API Model using Pydantic v2 with strict validation, forbidden extra fields, and frozen model configuration.
+4. Implemented the core model entities, including `ApiModel`, `Endpoint`, `Parameter`, `Schema`, `Components`, request/response models, security models, and reference types.
+5. Implemented schema raw-data preservation, including boolean schemas, composition keywords, unknown keywords, and vendor extensions.
+6. Implemented local reference representation without recursive expansion.
+7. Implemented model-level validation for path parameters, parameter schema/content exclusivity, and nonempty endpoint responses.
+8. Added tests covering model construction, validation, serialization, reference handling, schema preservation, and distinctions between absent and explicitly empty values.
+9. Added a direct Pydantic dependency pin to `requirements.txt`.
+
+### Remaining before Normalizer implementation
+
+1. Complete the final API Model audit against this contract.
+2. Resolve any discrepancies found between the implementation, tests, and documented behavior.
+3. Add or adjust tests where the audit identifies missing coverage.
+4. Ensure the contract accurately describes the implemented model and the remaining Normalizer responsibilities.
+
+### Next development stage: API Model Normalizer
+
+1. Implement `normalize_openapi_document(document: dict[str, Any]) -> NormalizationResult`.
+2. Normalize API metadata, root servers, security requirements, and component registries.
+3. Normalize paths and operations into deterministic `Endpoint` objects.
+4. Merge path-level and operation-level parameters by `(name, location)`, preserving declaration order and reference edges.
+5. Generate separate parameter override diagnostics.
+6. Normalize request bodies, media types, responses, response status keys, and path/operation server declarations.
+7. Reject unsupported Path Item `$ref` usage with a clear `OpenAPINormalizationError`.
+8. Add representative OpenAPI 3.0.x and 3.1.x fixtures and tests for normalization behavior.
+9. Verify deterministic output and reference-cycle handling.
+
+The Deterministic Test Generator must not be implemented until the Normalizer has been completed, tested, and its output contract has been verified.
