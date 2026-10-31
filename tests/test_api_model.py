@@ -241,6 +241,141 @@ def test_parameter_and_other_reference_unions_validate_expected_variants() -> No
     assert isinstance(request_body_adapter.validate_python(RequestBody(content={})), RequestBody)
 
 
+def test_components_other_preserves_json_objects_and_local_references_round_trip() -> None:
+    components = Components(
+        other={
+            "examples": {
+                "inline": {"summary": "Example", "value": {"name": "widget"}},
+                "shared": LocalReference(
+                    uri="#/components/examples/SharedExample",
+                    extensions={"x-reference-source": "catalog"},
+                ),
+                "uri_metadata": {
+                    "uri": "#/components/examples/NotAReference",
+                    "kind": "opaque metadata",
+                },
+                "uri_and_extensions_metadata": {
+                    "uri": "#/components/examples/AlsoNotAReference",
+                    "extensions": {"x-label": "plain JSON"},
+                    "kind": "ordinary component object",
+                },
+            },
+            "headers": {
+                "X-Rate-Limit": {"description": "Requests remaining", "schema": {"type": "integer"}}
+            },
+            "links": {
+                "GetOwner": {"operationId": "getOwner", "parameters": {"ownerId": "$response.body#/ownerId"}}
+            },
+            "callbacks": {
+                "onEvent": {
+                    "{$request.body#/callbackUrl}": {
+                        "post": {"requestBody": {"description": "Event payload"}}
+                    }
+                }
+            },
+            "pathItems": {
+                "SharedPath": {
+                    "get": {"responses": {"200": {"description": "OK"}}}
+                }
+            },
+        }
+    )
+
+    assert components.other["examples"]["inline"] == {
+        "summary": "Example",
+        "value": {"name": "widget"},
+    }
+    assert isinstance(components.other["examples"]["shared"], LocalReference)
+    assert components.other["examples"]["shared"].uri == "#/components/examples/SharedExample"  # type: ignore[union-attr]
+    assert components.other["examples"]["shared"].extensions == {"x-reference-source": "catalog"}  # type: ignore[union-attr]
+    assert components.other["examples"]["uri_metadata"] == {
+        "uri": "#/components/examples/NotAReference",
+        "kind": "opaque metadata",
+    }
+    assert components.other["examples"]["uri_and_extensions_metadata"] == {
+        "uri": "#/components/examples/AlsoNotAReference",
+        "extensions": {"x-label": "plain JSON"},
+        "kind": "ordinary component object",
+    }
+    assert components.other["headers"]["X-Rate-Limit"]["schema"]["type"] == "integer"  # type: ignore[index]
+    assert components.other["links"]["GetOwner"]["operationId"] == "getOwner"  # type: ignore[index]
+    assert "{$request.body#/callbackUrl}" in components.other["callbacks"]["onEvent"]  # type: ignore[operator]
+    assert components.other["pathItems"]["SharedPath"]["get"]["responses"]["200"]["description"] == "OK"  # type: ignore[index]
+
+    restored = Components.model_validate(components.model_dump())
+
+    assert restored == components
+    assert isinstance(restored.other["examples"]["shared"], LocalReference)
+    assert restored.other["examples"]["shared"].uri == "#/components/examples/SharedExample"  # type: ignore[union-attr]
+    assert restored.other["examples"]["shared"].extensions == {"x-reference-source": "catalog"}  # type: ignore[union-attr]
+    assert restored.other["examples"]["uri_metadata"] == {
+        "uri": "#/components/examples/NotAReference",
+        "kind": "opaque metadata",
+    }
+    assert restored.other["examples"]["uri_and_extensions_metadata"] == {
+        "uri": "#/components/examples/AlsoNotAReference",
+        "extensions": {"x-label": "plain JSON"},
+        "kind": "ordinary component object",
+    }
+
+
+def test_components_other_restores_legacy_reference_serialization_without_extensions() -> None:
+    restored = Components.model_validate(
+        {
+            "other": {
+                "examples": {
+                    "legacy": {
+                        "uri": "#/components/examples/Legacy",
+                        "summary": None,
+                        "description": None,
+                    }
+                }
+            }
+        }
+    )
+
+    reference = restored.other["examples"]["legacy"]
+    assert isinstance(reference, LocalReference)
+    assert reference.uri == "#/components/examples/Legacy"
+    assert reference.extensions == {}
+
+
+def test_local_reference_extensions_serialize_and_validate_from_json() -> None:
+    reference = LocalReference(
+        uri="#/components/responses/NotFound",
+        summary="Reusable response",
+        description="Shared response metadata",
+        extensions={"x-owner": "platform", "x-flags": ["stable", 2]},
+    )
+
+    serialized = reference.model_dump_json()
+    restored = LocalReference.model_validate_json(serialized)
+
+    assert restored == reference
+    assert json.loads(serialized)["extensions"] == {
+        "x-owner": "platform",
+        "x-flags": ["stable", 2],
+    }
+
+
+def test_components_other_rejects_invalid_data_in_local_reference_shape() -> None:
+    invalid_reference_data = {
+        "uri": "https://example.com/shared-example",
+        "summary": None,
+        "description": None,
+    }
+
+    with pytest.raises(ValidationError, match="valid local URI fragment reference"):
+        Components.model_validate(
+            {"other": {"examples": {"shared": invalid_reference_data}}}
+        )
+
+
+def test_components_other_rejects_unsupported_extra_fields() -> None:
+    with pytest.raises(ValidationError, match="extra_forbidden"):
+        Components(other={}, unsupported="value")  # type: ignore[call-arg]
+
+
 def test_local_parameter_invariants_are_enforced() -> None:
     with pytest.raises(ValidationError, match="Path parameters must be required"):
         Parameter(name="id", location="path", source_scope="path")
@@ -277,6 +412,153 @@ def test_none_empty_and_anonymous_security_states_remain_distinct() -> None:
     assert anonymous.security == (SecurityRequirement(schemes={}),)
     assert operation_inherit.security is None
     assert operation_disable.security == ()
+
+
+def test_security_requirements_preserve_alternatives_schemes_and_oauth_scopes() -> None:
+    api_alternatives = (
+        SecurityRequirement(
+            schemes={"tenantKey": (), "oauth": ("read:items", "write:items")}
+        ),
+        SecurityRequirement(schemes={"bearerAuth": ()}),
+    )
+    operation_alternatives = (
+        SecurityRequirement(schemes={"mutualTls": (), "oauth": ("admin",)}),
+        SecurityRequirement(schemes={}),
+    )
+    api = ApiModel(
+        openapi_version="3.1.1",
+        info=ApiInfo(title="Security cases", version="1"),
+        security=api_alternatives,
+        endpoints=(valid_endpoint(security=operation_alternatives),),
+    )
+
+    assert api.security == api_alternatives
+    assert api.security[0].schemes == {
+        "tenantKey": (),
+        "oauth": ("read:items", "write:items"),
+    }
+    assert api.security[0].schemes["oauth"] == ("read:items", "write:items")
+    assert api.security[1] == SecurityRequirement(schemes={"bearerAuth": ()})
+    assert api.endpoints[0].security == operation_alternatives
+
+
+def test_security_none_empty_and_anonymous_states_survive_json_round_trip() -> None:
+    api_states = (
+        None,
+        (),
+        (SecurityRequirement(schemes={}),),
+    )
+    endpoint_states = (
+        None,
+        (),
+        (SecurityRequirement(schemes={}),),
+    )
+
+    for api_security in api_states:
+        for endpoint_security in endpoint_states:
+            api = ApiModel(
+                openapi_version="3.1.1",
+                info=ApiInfo(title="Security states", version="1"),
+                security=api_security,
+                endpoints=(valid_endpoint(security=endpoint_security),),
+            )
+
+            restored = ApiModel.model_validate_json(api.model_dump_json())
+
+            assert restored.security == api_security
+            assert restored.endpoints[0].security == endpoint_security
+    assert api_states[0] is None and api_states[1] == ()
+    assert api_states[2] == (SecurityRequirement(schemes={}),)
+
+
+@pytest.mark.parametrize(
+    "scheme",
+    [
+        SecurityScheme(
+            type="apiKey",
+            name="X-API-Key",
+            location="header",
+            description="Tenant API key",
+            extensions={"x-provider": "gateway"},
+        ),
+        SecurityScheme(
+            type="http",
+            scheme="bearer",
+            bearer_format="JWT",
+            description="Bearer authentication",
+            extensions={"x-provider": {"name": "identity"}},
+        ),
+        SecurityScheme(
+            type="oauth2",
+            flows={
+                "authorizationCode": {
+                    "authorizationUrl": "https://auth.example.test/authorize",
+                    "tokenUrl": "https://auth.example.test/token",
+                    "refreshUrl": "https://auth.example.test/refresh",
+                    "scopes": {
+                        "read:items": "Read items",
+                        "write:items": "Write items",
+                    },
+                }
+            },
+            description="OAuth authorization code flow",
+            extensions={"x-provider": "oauth"},
+        ),
+        SecurityScheme(
+            type="openIdConnect",
+            openid_connect_url="https://identity.example.test/.well-known/openid-configuration",
+            description="OpenID Connect",
+            extensions={"x-provider": "oidc"},
+        ),
+        SecurityScheme(
+            type="mutualTLS",
+            description="Client certificate authentication",
+            extensions={"x-provider": "mtls"},
+        ),
+    ],
+)
+def test_security_scheme_types_and_metadata_survive_json_round_trip(
+    scheme: SecurityScheme,
+) -> None:
+    restored = SecurityScheme.model_validate_json(scheme.model_dump_json())
+
+    assert restored == scheme
+    assert restored.type == scheme.type
+    assert restored.description == scheme.description
+    assert restored.extensions == scheme.extensions
+
+    if scheme.type == "apiKey":
+        assert restored.name == "X-API-Key"
+        assert restored.location == "header"
+    elif scheme.type == "http":
+        assert restored.scheme == "bearer"
+        assert restored.bearer_format == "JWT"
+    elif scheme.type == "oauth2":
+        assert restored.flows == scheme.flows
+        assert restored.flows["authorizationCode"]["authorizationUrl"] == "https://auth.example.test/authorize"  # type: ignore[index]
+        assert restored.flows["authorizationCode"]["tokenUrl"] == "https://auth.example.test/token"  # type: ignore[index]
+        assert restored.flows["authorizationCode"]["refreshUrl"] == "https://auth.example.test/refresh"  # type: ignore[index]
+        assert restored.flows["authorizationCode"]["scopes"] == {
+            "read:items": "Read items",
+            "write:items": "Write items",
+        }  # type: ignore[index]
+    elif scheme.type == "openIdConnect":
+        assert restored.openid_connect_url == scheme.openid_connect_url
+    else:
+        assert scheme.type == "mutualTLS"
+
+
+@pytest.mark.parametrize("credential_field", ["token", "password", "access_token"])
+def test_security_scheme_rejects_credential_fields(credential_field: str) -> None:
+    with pytest.raises(ValidationError, match="extra_forbidden"):
+        SecurityScheme(type="http", **{credential_field: "secret"})
+
+
+def test_security_models_keep_strict_extra_forbid_configuration() -> None:
+    for security_model in (SecurityRequirement, SecurityScheme):
+        assert security_model.model_config["strict"] is True
+        assert security_model.model_config["extra"] == "forbid"
+        assert security_model.model_config["frozen"] is True
 
 
 def test_json_serialization_and_deserialization_preserve_representative_model() -> None:

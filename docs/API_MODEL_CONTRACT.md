@@ -455,9 +455,12 @@ This keeps the MVP typed around concepts the first Generator needs while prevent
 | `LocalReference.uri` | `str` | Required | Exact local URI reference string; no target content is embedded. |
 | `LocalReference.summary` | `str \| None` | `None` | Reference Object override or schema sibling annotation when present. |
 | `LocalReference.description` | `str \| None` | `None` | Reference Object override or schema sibling annotation when present. |
+| `LocalReference.extensions` | `dict[str, JsonValue]` | `{}` | `x-*` reference-level metadata, preserved separately from the reference URI and summary/description. |
 | `ParameterReference.reference` | `LocalReference` | Required | Generic local reference data, nested to keep parameter metadata out of all other reference types. |
 | `ParameterReference` | Model | — | Parameter-only wrapper around a reference edge; used only by `ParameterEntry`. |
 | `ParameterReference.source_scope` | `ParameterScope` | Required | Declaration scope: `path`, `operation`, or `component`. |
+
+When normalizing a reference-shaped object, preserve `$ref`, supported `summary` and `description` metadata, and all `x-*` fields in `LocalReference.extensions`. Reject other unsupported fields instead of discarding them. Extensions do not cause reference resolution or expansion. This model capability does not imply that such fields are valid on every OpenAPI Reference Object: the OpenAPI 3.1.1 specification says Reference Objects cannot be extended with additional properties, and the current `openapi-spec-validator` rejects `x-*` fields there. The Normalizer can preserve them when they are supplied by an extension-tolerant upstream or caller. For ordinary OpenAPI 3.0 references, summary/description siblings and reference-level extension fields are not expected, so the model metadata remains empty.
 
 ### Normalization result and override diagnostics
 

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from typing import Literal, TypeAlias
+from typing import Any, Literal, TypeAlias
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from typing_extensions import TypeAliasType
@@ -20,6 +20,18 @@ SchemaSource: TypeAlias = bool | JsonObject
 ParameterLocation: TypeAlias = Literal["path", "query", "header", "cookie"]
 ParameterScope: TypeAlias = Literal["path", "operation", "component"]
 
+_LEGACY_LOCAL_REFERENCE_FIELDS = frozenset({"uri", "summary", "description"})
+_LOCAL_REFERENCE_FIELDS = _LEGACY_LOCAL_REFERENCE_FIELDS | {"extensions"}
+
+
+def _is_serialized_local_reference(value: Any) -> bool:
+    """Recognize complete current or legacy LocalReference model dumps."""
+    return (
+        isinstance(value, dict)
+        and frozenset(value)
+        in {_LEGACY_LOCAL_REFERENCE_FIELDS, frozenset(_LOCAL_REFERENCE_FIELDS)}
+    )
+
 
 class Model(BaseModel):
     """Base for strict, frozen API model values."""
@@ -33,6 +45,7 @@ class LocalReference(Model):
     uri: str
     summary: str | None = None
     description: str | None = None
+    extensions: dict[str, JsonValue] = Field(default_factory=dict)
 
     @field_validator("uri")
     @classmethod
@@ -162,6 +175,19 @@ class MediaType(Model):
     encoding: dict[str, JsonObject] = Field(default_factory=dict)
     extensions: dict[str, JsonValue] = Field(default_factory=dict)
 
+    @field_validator("examples", mode="before")
+    @classmethod
+    def restore_local_example_references(cls, value: Any) -> Any:
+        """Restore serialized LocalReference values without reclassifying arbitrary objects."""
+        if not isinstance(value, dict):
+            return value
+        return {
+            name: LocalReference.model_validate(example)
+            if _is_serialized_local_reference(example)
+            else example
+            for name, example in value.items()
+        }
+
 
 class RequestBody(Model):
     """A declared request body, including whether it is required."""
@@ -199,6 +225,26 @@ class Components(Model):
     other: dict[str, dict[str, JsonObject | LocalReference]] = Field(
         default_factory=dict
     )
+
+    @field_validator("other", mode="before")
+    @classmethod
+    def restore_local_references(cls, value: Any) -> Any:
+        """Restore reference models when rebuilding a serialized component registry."""
+        if not isinstance(value, dict):
+            return value
+
+        restored: dict[str, Any] = {}
+        for category, entries in value.items():
+            if not isinstance(entries, dict):
+                restored[category] = entries
+                continue
+            restored[category] = {
+                name: LocalReference.model_validate(entry)
+                if _is_serialized_local_reference(entry)
+                else entry
+                for name, entry in entries.items()
+            }
+        return restored
 
 
 class Endpoint(Model):
