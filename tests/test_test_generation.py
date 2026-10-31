@@ -666,6 +666,94 @@ def test_required_parameter_cases_remove_one_parameter_preserve_metadata_and_ord
     assert result.model_dump_json() == original
 
 
+def test_required_request_body_generates_one_deterministic_omission_case() -> None:
+    endpoint = Endpoint(
+        path="/body/{item_id}",
+        method="post",
+        parameters=(
+            Parameter(
+                name="item_id",
+                location="path",
+                required=True,
+                schema=Schema(raw={"type": "integer", "example": 5}),
+                source_scope="path",
+            ),
+            Parameter(
+                name="trace",
+                location="query",
+                required=True,
+                schema=Schema(raw={"type": "string", "example": "trace-1"}),
+                source_scope="operation",
+            ),
+        ),
+        request_body=RequestBody(
+            required=True,
+            content={
+                "application/json": MediaType(
+                    schema=Schema(raw={"type": "object", "properties": {"active": {"type": "boolean"}}})
+                )
+            },
+        ),
+        security=(SecurityRequirement(schemes={"apiKey": ()}),),
+        responses={"400": Response(description="Invalid request")},
+    )
+    result = make_result(endpoint)
+    original = result.model_dump_json()
+
+    first_suite = generate_test_suite(result)
+    second_suite = generate_test_suite(result)
+    positive = next(case for case in first_suite.cases if case.category == "positive")
+    omissions = [
+        case for case in first_suite.cases
+        if case.violated_constraint == "required_request_body"
+    ]
+
+    assert len(omissions) == 1
+    omission = omissions[0]
+    assert omission.request_body is None
+    assert omission.parameters == positive.parameters
+    assert [item.name for item in omission.parameters] == ["item_id", "trace"]
+    assert omission.security == positive.security
+    assert omission.response_expectations == positive.response_expectations
+    assert (omission.path, omission.method) == (positive.path, positive.method)
+    assert omission.category == "negative"
+    assert omission.violated_constraint == "required_request_body"
+    assert omission.expected_outcome == "request_rejection_status_unspecified"
+    assert omission.affected_property is None
+    assert omission.provenance[-2:] == (
+        "/paths/~1body~1{item_id}/post/requestBody",
+        "violated_constraint:required_request_body",
+    )
+    assert omission.case_id == build_case_id(
+        "negative", endpoint.path, endpoint.method, "required-request-body"
+    )
+    assert omission.case_id != positive.case_id
+    assert first_suite.model_dump_json() == second_suite.model_dump_json()
+    assert positive.request_body == GeneratedBody(
+        media_type="application/json", value={}
+    )
+    assert result.model_dump_json() == original
+
+
+@pytest.mark.parametrize("request_body", [
+    None,
+    RequestBody(
+        required=False,
+        content={"application/json": MediaType(schema=Schema(raw={"type": "string"}))},
+    ),
+])
+def test_optional_or_absent_request_body_has_no_omission_case(
+    request_body: RequestBody | None,
+) -> None:
+    endpoint = make_endpoint("/optional-body", "post", request_body=request_body)
+
+    suite = generate_test_suite(make_result(endpoint))
+
+    assert len(suite.cases) == 1
+    assert suite.cases[0].category == "positive"
+    assert all(case.violated_constraint != "required_request_body" for case in suite.cases)
+
+
 def test_generates_distinct_cases_for_different_methods_and_paths() -> None:
     result = make_result(
         make_endpoint("/items", "get", operation_id="same"),
@@ -777,7 +865,7 @@ def test_one_required_property_produces_one_explicit_negative_case() -> None:
 
     suite = generate_test_suite(result)
 
-    assert len(suite.cases) == 4
+    assert len(suite.cases) == 5
     positive = next(case for case in suite.cases if case.category == "positive")
     negative = next(case for case in suite.cases if case.violated_constraint == "required_property")
     parameter_negative = next(
@@ -835,7 +923,7 @@ def test_multiple_required_properties_each_omit_only_the_target_and_skip_read_on
 
     suite = generate_test_suite(make_result(endpoint))
 
-    assert len(suite.cases) == 5
+    assert len(suite.cases) == 6
     positive = suite.cases[0]
     assert positive.request_body.value == {"alpha": "sentinel", "beta": 0}
     negatives = {
@@ -886,7 +974,7 @@ def test_nested_required_property_is_omitted_and_pointer_is_preserved() -> None:
 
     suite = generate_test_suite(make_result(endpoint))
 
-    assert len(suite.cases) == 5
+    assert len(suite.cases) == 6
     negatives = {
         case.affected_property: case
         for case in suite.cases
@@ -941,7 +1029,7 @@ def test_negative_cases_are_deterministic_unique_and_do_not_mutate_input() -> No
 
     assert first.model_dump_json() == second.model_dump_json()
     assert result.model_dump_json() == before
-    assert len(first.cases) == 7
+    assert len(first.cases) == 8
     assert len({case.case_id for case in first.cases}) == len(first.cases)
     negative = next(
         case for case in first.cases
@@ -1008,7 +1096,7 @@ def test_required_name_without_property_schema_is_diagnostic_not_negative_case()
 
     suite = generate_test_suite(make_result(endpoint))
 
-    assert len(suite.cases) == 3
+    assert len(suite.cases) == 4
     positive = next(case for case in suite.cases if case.category == "positive")
     negative = next(case for case in suite.cases if case.violated_constraint == "required_property")
     assert positive.category == "positive"
@@ -1056,7 +1144,7 @@ def test_missing_declared_4xx_is_explicit_without_inventing_a_status() -> None:
 
     suite = generate_test_suite(make_result(endpoint))
 
-    assert len(suite.cases) == 3
+    assert len(suite.cases) == 4
     negative = next(case for case in suite.cases if case.violated_constraint == "required_property")
     assert negative.expected_outcome == "request_rejection_status_unspecified"
     assert negative.response_expectations[0].status_key == "200"
@@ -2036,7 +2124,7 @@ def test_numeric_boundary_generation_skips_read_only_properties_and_diagnoses_un
 
     suite = generate_test_suite(make_result(endpoint))
 
-    assert len(suite.cases) == 1
+    assert len(suite.cases) == 2
     assert suite.cases[0].category == "positive"
     assert suite.cases[0].request_body.value == {}
     assert len(suite.diagnostics) == 1

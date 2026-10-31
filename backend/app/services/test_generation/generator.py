@@ -98,6 +98,9 @@ def generate_test_suite(result: NormalizationResult) -> GeneratedTestSuite:
             diagnostics.extend(string_diagnostics)
             parameter_cases = _required_parameter_negative_cases(endpoint, positive)
             cases.extend(parameter_cases)
+            request_body_case = _required_request_body_negative_case(endpoint, positive)
+            if request_body_case is not None:
+                cases.append(request_body_case)
         except _UnsupportedOperation as issue:
             diagnostics.append(
                 GenerationDiagnostic(
@@ -170,6 +173,40 @@ def _required_parameter_negative_cases(
             )
         )
     return tuple(cases)
+
+
+def _required_request_body_negative_case(
+    endpoint: Endpoint, positive: GeneratedTestCase
+) -> GeneratedTestCase | None:
+    """Omit a required request body when the positive baseline generated one."""
+    request_body = endpoint.request_body
+    if (
+        not isinstance(request_body, RequestBody)
+        or not request_body.required
+        or positive.request_body is None
+    ):
+        return None
+
+    pointer = _child(_endpoint_pointer(endpoint), "requestBody")
+    return GeneratedTestCase(
+        case_id=build_case_id(
+            "negative", endpoint.path, endpoint.method, "required-request-body"
+        ),
+        category="negative",
+        path=positive.path,
+        method=positive.method,
+        parameters=tuple(deepcopy(value) for value in positive.parameters),
+        request_body=None,
+        security=deepcopy(positive.security),
+        response_expectations=deepcopy(positive.response_expectations),
+        provenance=(
+            *positive.provenance,
+            pointer,
+            "violated_constraint:required_request_body",
+        ),
+        expected_outcome="request_rejection_status_unspecified",
+        violated_constraint="required_request_body",
+    )
 
 
 def _required_property_negative_cases(
