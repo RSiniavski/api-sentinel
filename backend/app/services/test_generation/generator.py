@@ -114,7 +114,7 @@ def _required_property_negative_cases(
     media = request_body.content["application/json"]
     if media.schema is None or not isinstance(media.schema.raw, dict):
         return (), ()
-    if positive.request_body is None or not isinstance(positive.request_body.value, dict):
+    if positive.request_body is None:
         return (), ()
 
     raw_schema = media.schema.raw
@@ -202,7 +202,7 @@ def _required_property_negative_cases(
 
 def _required_writable_property_paths(
     schema: Any,
-    value: dict[str, Any],
+    value: Any,
     path: tuple[str, ...] = (),
     *,
     schema_pointer: str,
@@ -229,7 +229,7 @@ def _required_writable_property_paths(
         child_schema = properties[name]
         if isinstance(child_schema, dict) and child_schema.get("readOnly") is True:
             continue
-        if name not in value:
+        if not isinstance(value, dict) or name not in value:
             continue
         property_path = (*path, name)
         property_schema_pointer = _child(schema_pointer, "properties", name)
