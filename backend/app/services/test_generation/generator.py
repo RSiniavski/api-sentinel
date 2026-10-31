@@ -1271,6 +1271,32 @@ def _fallback_values(schema: dict[str, Any], version: str, pointer: str, directi
         if isinstance(multiple, (int, float)) and not isinstance(multiple, bool) and multiple > 0:
             candidates.extend((multiple, -multiple, multiple * 2, -multiple * 2))
         if kind == "integer":
+            if isinstance(multiple, (int, float)) and not isinstance(multiple, bool) and multiple > 0:
+                # Integer multiples of a reduced decimal p/q lie on the p-step
+                # lattice. Include lattice points around each bound so the
+                # fallback can find a valid value even when p itself is far
+                # from the constrained interval.
+                multiple_decimal = Decimal(str(multiple))
+                numerator, _ = multiple_decimal.as_integer_ratio()
+                lattice_step = Decimal(abs(numerator))
+                candidates.extend((int(lattice_step), -int(lattice_step)))
+                for key in ("minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"):
+                    bound = _as_decimal(schema.get(key))
+                    if bound is None:
+                        continue
+                    floor_units = _decimal_floor_units(bound, lattice_step)
+                    ceil_units = _decimal_ceil_units(bound, lattice_step)
+                    for units in sorted(
+                        {
+                            floor_units - 1,
+                            floor_units,
+                            floor_units + 1,
+                            ceil_units - 1,
+                            ceil_units,
+                            ceil_units + 1,
+                        }
+                    ):
+                        candidates.append(units * int(lattice_step))
             candidates = [int(value) for value in candidates if float(value).is_integer()]
         return tuple(dict.fromkeys(candidates))
     if kind == "boolean":

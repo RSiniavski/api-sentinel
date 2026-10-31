@@ -1456,6 +1456,101 @@ def test_integer_exclusive_minimum_with_fractional_multiple_of_uses_integer_cand
 
 
 @pytest.mark.parametrize(
+    ("multiple_of", "expected"),
+    [(1.5, 3), (0.5, 1), (0.25, 1), (2.5, 5)],
+)
+def test_positive_integer_fallback_supports_fractional_multiple_of(
+    multiple_of: float, expected: int
+) -> None:
+    endpoint = make_endpoint(
+        "/integer-positive-multiple",
+        "post",
+        request_body=RequestBody(
+            required=True,
+            content={
+                "application/json": MediaType(
+                    schema=Schema(
+                        raw={"type": "integer", "minimum": 1, "multipleOf": multiple_of}
+                    )
+                )
+            },
+        ),
+    )
+
+    result = make_result(endpoint)
+    first = generate_test_suite(result)
+    second = generate_test_suite(result)
+
+    assert first.cases[0].category == "positive"
+    assert first.cases[0].request_body.value == expected
+    assert isinstance(first.cases[0].request_body.value, int)
+    assert (first.cases[0].request_body.value / multiple_of).is_integer()
+    assert first.model_dump_json() == second.model_dump_json()
+
+
+@pytest.mark.parametrize(
+    ("version", "numeric_bounds", "expected"),
+    [
+        ("3.1.1", {"minimum": 10.5, "maximum": 20}, 12),
+        ("3.1.1", {"minimum": 500, "maximum": 510}, 501),
+        ("3.0.3", {"minimum": 10, "maximum": 20, "exclusiveMinimum": True}, 12),
+    ],
+)
+def test_positive_integer_fractional_multiple_of_respects_numeric_bounds(
+    version: str, numeric_bounds: dict[str, object], expected: int
+) -> None:
+    endpoint = make_endpoint(
+        "/integer-positive-bounded-multiple",
+        "post",
+        request_body=RequestBody(
+            required=True,
+            content={
+                "application/json": MediaType(
+                    schema=Schema(
+                        raw={"type": "integer", "multipleOf": 1.5, **numeric_bounds}
+                    )
+                )
+            },
+        ),
+    )
+
+    case = generate_test_suite(make_result(endpoint, version=version)).cases[0]
+
+    assert case.category == "positive"
+    assert case.request_body.value == expected
+    assert isinstance(case.request_body.value, int)
+    assert (case.request_body.value / 1.5).is_integer()
+
+
+def test_positive_integer_fractional_multiple_of_reports_no_value_when_bounds_exclude_lattice() -> None:
+    endpoint = make_endpoint(
+        "/integer-positive-no-multiple",
+        "post",
+        request_body=RequestBody(
+            required=True,
+            content={
+                "application/json": MediaType(
+                    schema=Schema(
+                        raw={
+                            "type": "integer",
+                            "multipleOf": 1.5,
+                            "minimum": 10,
+                            "maximum": 11,
+                        }
+                    )
+                )
+            },
+        ),
+    )
+
+    suite = generate_test_suite(make_result(endpoint))
+
+    assert suite.cases == ()
+    assert len(suite.diagnostics) == 1
+    assert suite.diagnostics[0].code == "no_positive_schema_value"
+
+
+@pytest.mark.parametrize(
     ("numeric_schema", "expected"),
     [
         ({"minimum": 0.2, "exclusiveMinimum": 0.1}, 0.15),
