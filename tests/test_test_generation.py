@@ -1147,3 +1147,692 @@ def test_nullable_and_null_union_candidates_follow_document_version(
     case = generate_test_suite(make_result(endpoint, version=version)).cases[0]
 
     assert case.request_body == GeneratedBody(media_type="application/json", value=expected)
+
+
+@pytest.mark.parametrize(
+    ("version", "numeric_schema", "expected_constraint", "expected_value"),
+    [
+        ("3.1.1", {"type": "integer", "minimum": 10}, "minimum", 9),
+        ("3.1.1", {"type": "number", "maximum": 10}, "maximum", 11),
+        ("3.1.1", {"type": "integer", "exclusiveMinimum": 10}, "exclusiveMinimum", 10),
+        ("3.1.1", {"type": "number", "exclusiveMaximum": 10}, "exclusiveMaximum", 10),
+        (
+            "3.0.3",
+            {"type": "integer", "minimum": 10, "exclusiveMinimum": True},
+            "exclusiveMinimum",
+            10,
+        ),
+        (
+            "3.0.3",
+            {"type": "number", "maximum": 10, "exclusiveMaximum": True},
+            "exclusiveMaximum",
+            10,
+        ),
+    ],
+)
+def test_numeric_boundary_cases_support_openapi_versions_and_numeric_types(
+    version: str,
+    numeric_schema: dict[str, object],
+    expected_constraint: str,
+    expected_value: int,
+) -> None:
+    endpoint = make_endpoint(
+        "/numeric",
+        "post",
+        request_body=RequestBody(
+            required=True,
+            content={
+                "application/json": MediaType(
+                    schema=Schema(
+                        raw={
+                            "type": "object",
+                            "required": ["value"],
+                            "properties": {"value": numeric_schema},
+                        }
+                    )
+                )
+            },
+        ),
+    )
+
+    suite = generate_test_suite(make_result(endpoint, version=version))
+
+    positive = suite.cases[0]
+    negative = next(
+        case for case in suite.cases if case.violated_constraint == expected_constraint
+    )
+    assert positive.category == "positive"
+    assert negative.category == "negative"
+    assert negative.request_body.value == {"value": expected_value}
+    assert negative.violated_constraint == expected_constraint
+    assert negative.affected_property == "/value"
+    assert negative.expected_outcome == "request_rejection_status_unspecified"
+    assert negative.case_id == build_case_id(
+        "negative",
+        endpoint.path,
+        endpoint.method,
+        f"numeric-boundary:/value:{expected_constraint}:{expected_value}",
+    )
+    assert not any(
+        diagnostic.code == "numeric_boundary_no_safe_candidate"
+        for diagnostic in suite.diagnostics
+    )
+
+
+def test_numeric_boundaries_support_nested_properties_and_multiple_of() -> None:
+    endpoint = make_endpoint(
+        "/nested-numeric",
+        "post",
+        request_body=RequestBody(
+            required=True,
+            content={
+                "application/json": MediaType(
+                    schema=Schema(
+                        raw={
+                            "type": "object",
+                            "required": ["data"],
+                            "properties": {
+                                "data": {
+                                    "type": "object",
+                                    "required": ["amount"],
+                                    "properties": {
+                                        "amount": {
+                                            "type": "number",
+                                            "minimum": 1.0,
+                                            "multipleOf": 0.1,
+                                        }
+                                    },
+                                }
+                            },
+                        }
+                    )
+                )
+            },
+        ),
+    )
+
+    suite = generate_test_suite(make_result(endpoint))
+
+    assert suite.cases[0].category == "positive"
+    assert suite.cases[0].request_body.value == {"data": {"amount": 1}}
+    negative = next(case for case in suite.cases if case.violated_constraint == "minimum")
+    assert negative.request_body.value == {"data": {"amount": 0.9}}
+    assert negative.violated_constraint == "minimum"
+    assert negative.affected_property == "/data/amount"
+    assert negative.provenance[-3:] == (
+        "/paths/~1nested-numeric/post/requestBody/content/application~1json/schema/properties/data/properties/amount",
+        "/paths/~1nested-numeric/post/requestBody/content/application~1json/schema/properties/data/properties/amount/minimum",
+        "violated_constraint:minimum:/data/amount",
+    )
+
+
+def test_overlapping_numeric_bounds_produce_values_violating_only_the_target() -> None:
+    endpoint = make_endpoint(
+        "/overlapping-numeric",
+        "post",
+        responses={"400": Response(description="Invalid request")},
+        request_body=RequestBody(
+            required=True,
+            content={
+                "application/json": MediaType(
+                    schema=Schema(
+                        raw={
+                            "type": "object",
+                            "required": ["amount"],
+                            "properties": {
+                                "amount": {
+                                    "type": "integer",
+                                    "minimum": 10,
+                                    "maximum": 10,
+                                }
+                            },
+                        }
+                    )
+                )
+            },
+        ),
+    )
+
+    suite = generate_test_suite(make_result(endpoint))
+
+    numeric_cases = [
+        case for case in suite.cases
+        if case.violated_constraint in {"minimum", "maximum"}
+    ]
+    assert [(case.violated_constraint, case.request_body.value) for case in numeric_cases] == [
+        ("minimum", {"amount": 9}),
+        ("maximum", {"amount": 11}),
+    ]
+    assert suite.diagnostics == ()
+
+
+def test_optional_numeric_properties_can_be_added_for_boundary_cases() -> None:
+    endpoint = make_endpoint(
+        "/optional-numeric",
+        "post",
+        responses={"400": Response(description="Invalid request")},
+        request_body=RequestBody(
+            required=True,
+            content={
+                "application/json": MediaType(
+                    schema=Schema(
+                        raw={
+                            "type": "object",
+                            "properties": {
+                                "optional": {"type": "integer", "minimum": 10}
+                            },
+                        }
+                    )
+                )
+            },
+        ),
+    )
+
+    suite = generate_test_suite(make_result(endpoint))
+
+    assert suite.cases[0].request_body.value == {}
+    negative = next(case for case in suite.cases if case.violated_constraint == "minimum")
+    assert negative.request_body.value == {"optional": 9}
+    assert negative.affected_property == "/optional"
+    assert suite.diagnostics == ()
+
+
+def test_nested_optional_object_is_safely_materialized_for_numeric_boundary() -> None:
+    endpoint = make_endpoint(
+        "/optional-nested-numeric",
+        "post",
+        responses={"400": Response(description="Invalid request")},
+        request_body=RequestBody(
+            required=True,
+            content={
+                "application/json": MediaType(
+                    schema=Schema(
+                        raw={
+                            "type": "object",
+                            "properties": {
+                                "optional": {
+                                    "type": "object",
+                                    "required": ["label"],
+                                    "properties": {
+                                        "label": {"type": "string"},
+                                        "amount": {"type": "number", "minimum": 1},
+                                    },
+                                }
+                            },
+                        }
+                    )
+                )
+            },
+        ),
+    )
+
+    suite = generate_test_suite(make_result(endpoint))
+    negative = next(case for case in suite.cases if case.violated_constraint == "minimum")
+
+    assert suite.cases[0].request_body.value == {}
+    assert negative.request_body.value == {"optional": {"label": "sentinel", "amount": 0}}
+    assert negative.affected_property == "/optional/amount"
+
+
+def test_decimal_boundary_candidates_preserve_decimal_precision() -> None:
+    endpoint = make_endpoint(
+        "/decimal-boundary",
+        "post",
+        request_body=RequestBody(
+            required=True,
+            content={
+                "application/json": MediaType(
+                    schema=Schema(
+                        raw={
+                            "type": "object",
+                            "required": ["amount"],
+                            "properties": {
+                                "amount": {
+                                    "type": "number",
+                                    "minimum": 0.3,
+                                    "multipleOf": 0.1,
+                                }
+                            },
+                        }
+                    )
+                )
+            },
+        ),
+    )
+
+    suite = generate_test_suite(make_result(endpoint))
+    negative = next(case for case in suite.cases if case.violated_constraint == "minimum")
+
+    assert negative.request_body.value == {"amount": 0.2}
+    assert negative.case_id == build_case_id(
+        "negative", endpoint.path, endpoint.method, "numeric-boundary:/amount:minimum:0.2"
+    )
+
+
+@pytest.mark.parametrize(
+    ("multiple_of", "expected"),
+    [(0.5, 10), (0.25, 10)],
+)
+def test_integer_exclusive_minimum_with_fractional_multiple_of_uses_integer_candidate(
+    multiple_of: float, expected: int
+) -> None:
+    endpoint = make_endpoint(
+        "/integer-fractional-multiple",
+        "post",
+        request_body=RequestBody(
+            required=True,
+            content={
+                "application/json": MediaType(
+                    schema=Schema(
+                        raw={
+                            "type": "object",
+                            "required": ["amount"],
+                            "properties": {
+                                "amount": {
+                                    "type": "integer",
+                                    "exclusiveMinimum": 10.5,
+                                    "multipleOf": multiple_of,
+                                }
+                            },
+                        }
+                    )
+                )
+            },
+        ),
+    )
+
+    suite = generate_test_suite(make_result(endpoint))
+    negative = next(case for case in suite.cases if case.violated_constraint == "exclusiveMinimum")
+
+    assert negative.request_body.value == {"amount": expected}
+    assert negative.violated_constraint == "exclusiveMinimum"
+    assert isinstance(negative.request_body.value["amount"], int)
+    assert negative.request_body.value["amount"] < 10.5
+    assert (negative.request_body.value["amount"] / multiple_of).is_integer()
+    assert not any(
+        diagnostic.code == "numeric_boundary_no_safe_candidate"
+        for diagnostic in suite.diagnostics
+    )
+
+
+@pytest.mark.parametrize(
+    ("numeric_schema", "expected"),
+    [
+        ({"minimum": 0.2, "exclusiveMinimum": 0.1}, 0.15),
+        ({"minimum": 1.02, "exclusiveMinimum": 1.01}, 1.015),
+    ],
+)
+def test_narrow_decimal_intervals_produce_an_interior_candidate(
+    numeric_schema: dict[str, object], expected: float
+) -> None:
+    endpoint = make_endpoint(
+        "/narrow-decimal-interval",
+        "post",
+        request_body=RequestBody(
+            required=True,
+            content={
+                "application/json": MediaType(
+                    schema=Schema(
+                        raw={
+                            "type": "object",
+                            "required": ["amount"],
+                            "properties": {"amount": {"type": "number", **numeric_schema}},
+                        }
+                    )
+                )
+            },
+        ),
+    )
+
+    suite = generate_test_suite(make_result(endpoint))
+    negative = next(case for case in suite.cases if case.violated_constraint == "minimum")
+    value = negative.request_body.value["amount"]
+
+    assert value == expected
+    assert value < numeric_schema["minimum"]
+    assert value > numeric_schema["exclusiveMinimum"]
+    assert negative.violated_constraint == "minimum"
+    assert not any(
+        diagnostic.code == "numeric_boundary_no_safe_candidate"
+        and diagnostic.source_pointer.endswith("/minimum")
+        for diagnostic in suite.diagnostics
+    )
+
+
+def test_numeric_diagnostic_pointer_uses_optional_ancestor_schema_location() -> None:
+    endpoint = make_endpoint(
+        "/numeric-diagnostic-pointer",
+        "post",
+        request_body=RequestBody(
+            required=True,
+            content={
+                "application/json": MediaType(
+                    schema=Schema(
+                        raw={
+                            "type": "object",
+                            "properties": {
+                                "outer": {
+                                    "type": "object",
+                                    "required": ["label"],
+                                    "properties": {
+                                        "label": {"type": "string", "format": "unsupported"},
+                                        "amount": {"type": "number", "minimum": 1},
+                                    },
+                                }
+                            },
+                        }
+                    )
+                )
+            },
+        ),
+    )
+
+    suite = generate_test_suite(make_result(endpoint))
+    diagnostic = next(item for item in suite.diagnostics if item.code == "unsupported_schema_keyword")
+
+    assert diagnostic.source_pointer == (
+        "/paths/~1numeric-diagnostic-pointer/post/requestBody/content/"
+        "application~1json/schema/properties/outer/properties/label/format"
+    )
+
+
+def test_decimal_boundary_uses_verified_adjacent_float_when_lattice_value_is_unrepresentable() -> None:
+    endpoint = make_endpoint(
+        "/float-precision",
+        "post",
+        responses={"400": Response(description="Invalid request")},
+        request_body=RequestBody(
+            required=True,
+            content={
+                "application/json": MediaType(
+                    schema=Schema(
+                        raw={
+                            "type": "object",
+                            "required": ["amount"],
+                            "properties": {
+                                "amount": {
+                                    "type": "number",
+                                    "minimum": 0.30000000000000004,
+                                }
+                            },
+                        }
+                    )
+                )
+            },
+        ),
+    )
+
+    suite = generate_test_suite(make_result(endpoint))
+    negative = next(case for case in suite.cases if case.violated_constraint == "minimum")
+
+    assert negative.request_body.value == {"amount": 0.3}
+    assert negative.request_body.value["amount"] < 0.30000000000000004
+
+
+def test_numeric_case_payload_is_isolated_from_positive_case_and_input() -> None:
+    endpoint = make_endpoint(
+        "/numeric-isolation",
+        "post",
+        request_body=RequestBody(
+            required=True,
+            content={
+                "application/json": MediaType(
+                    schema=Schema(
+                        raw={
+                            "type": "object",
+                            "required": ["details"],
+                            "properties": {
+                                "details": {
+                                    "type": "object",
+                                    "required": ["amount", "tags"],
+                                    "properties": {
+                                        "amount": {"type": "number", "minimum": 1},
+                                        "tags": {"type": "array", "items": {"type": "string"}},
+                                    },
+                                }
+                            },
+                        }
+                    )
+                )
+            },
+        ),
+    )
+    result = make_result(endpoint)
+    original = result.model_dump_json()
+
+    suite = generate_test_suite(result)
+    positive = suite.cases[0]
+    negative = next(case for case in suite.cases if case.violated_constraint == "minimum")
+    assert negative.request_body.value is not positive.request_body.value
+    assert negative.request_body.value["details"] is not positive.request_body.value["details"]
+
+    negative.request_body.value["details"]["tags"].append("generated-only")
+    assert positive.request_body.value["details"]["tags"] == []
+    assert result.model_dump_json() == original
+
+
+def test_numeric_negative_case_preserves_and_copies_parameters_security_and_responses() -> None:
+    parameter = Parameter(
+        name="trace",
+        location="query",
+        required=True,
+        schema=Schema(raw={"type": "string"}),
+        source_scope="operation",
+    )
+    security = SecurityRequirement(schemes={"oauth": ("write",)})
+    endpoint = Endpoint(
+        path="/numeric-metadata",
+        method="post",
+        parameters=(parameter,),
+        security=(security,),
+        responses={
+            "400": Response(
+                description="Invalid request",
+                content={
+                    "application/json": MediaType(
+                        schema=Schema(
+                            raw={"type": "object", "properties": {"error": {"type": "string"}}}
+                        )
+                    )
+                },
+            )
+        },
+        request_body=RequestBody(
+            required=True,
+            content={
+                "application/json": MediaType(
+                    schema=Schema(
+                        raw={
+                            "type": "object",
+                            "required": ["amount"],
+                            "properties": {"amount": {"type": "number", "minimum": 2}},
+                        }
+                    )
+                )
+            },
+        ),
+    )
+
+    suite = generate_test_suite(make_result(endpoint))
+    positive = suite.cases[0]
+    negative = next(case for case in suite.cases if case.violated_constraint == "minimum")
+
+    assert negative.parameters == positive.parameters
+    assert negative.parameters is not positive.parameters
+    assert negative.security == positive.security
+    assert negative.security is not positive.security
+    assert negative.response_expectations == positive.response_expectations
+    assert negative.response_expectations[0].schemas_by_media_type["application/json"] is not (
+        positive.response_expectations[0].schemas_by_media_type["application/json"]
+    )
+    assert negative.expected_outcome == "request_rejection_status_unspecified"
+
+
+def test_numeric_boundary_generation_reports_unavailable_candidates_for_constraints() -> None:
+    endpoint = make_endpoint(
+        "/numeric-no-candidate",
+        "post",
+        request_body=RequestBody(
+            required=True,
+            content={
+                "application/json": MediaType(
+                    schema=Schema(
+                        raw={
+                            "type": "object",
+                            "required": ["amount"],
+                            "properties": {
+                                "amount": {
+                                    "type": "number",
+                                    "minimum": 10,
+                                    "exclusiveMinimum": 9.9,
+                                    "multipleOf": 1,
+                                }
+                            },
+                        }
+                    )
+                )
+            },
+        ),
+    )
+
+    suite = generate_test_suite(make_result(endpoint))
+
+    assert suite.cases[0].category == "positive"
+    numeric_diagnostics = [
+        diagnostic for diagnostic in suite.diagnostics
+        if diagnostic.code == "numeric_boundary_no_safe_candidate"
+    ]
+    assert len(numeric_diagnostics) == 2
+    assert all(diagnostic.endpoint_path == endpoint.path for diagnostic in numeric_diagnostics)
+    assert {diagnostic.source_pointer.rsplit("/", 1)[-1] for diagnostic in numeric_diagnostics} == {
+        "minimum", "exclusiveMinimum"
+    }
+
+
+def test_numeric_boundary_generation_skips_read_only_properties_and_diagnoses_unsupported_schema() -> None:
+    endpoint = make_endpoint(
+        "/numeric-unsupported",
+        "post",
+        responses={"400": Response(description="Invalid request")},
+        request_body=RequestBody(
+            required=True,
+            content={
+                "application/json": MediaType(
+                    schema=Schema(
+                        raw={
+                            "type": "object",
+                            "properties": {
+                                "server_value": {
+                                    "type": "integer",
+                                    "minimum": 1,
+                                    "readOnly": True,
+                                },
+                                "custom_value": {
+                                    "type": "integer",
+                                    "minimum": 1,
+                                    "format": "custom-number",
+                                },
+                            },
+                        }
+                    )
+                )
+            },
+        ),
+    )
+
+    suite = generate_test_suite(make_result(endpoint))
+
+    assert len(suite.cases) == 1
+    assert suite.cases[0].category == "positive"
+    assert suite.cases[0].request_body.value == {}
+    assert len(suite.diagnostics) == 1
+    assert suite.diagnostics[0].code == "unsupported_schema_keyword"
+    assert suite.diagnostics[0].source_pointer.endswith("/format")
+
+
+@pytest.mark.parametrize(
+    ("enum_or_const", "expected_negative"),
+    [
+        ({"enum": [9, 10]}, {"amount": 9}),
+        ({"enum": [10, 11]}, None),
+        ({"const": 10}, None),
+    ],
+)
+def test_numeric_boundary_candidates_respect_enum_and_const(
+    enum_or_const: dict[str, object], expected_negative: dict[str, int] | None
+) -> None:
+    endpoint = make_endpoint(
+        "/numeric-enum",
+        "post",
+        request_body=RequestBody(
+            required=True,
+            content={
+                "application/json": MediaType(
+                    schema=Schema(
+                        raw={
+                            "type": "object",
+                            "required": ["amount"],
+                            "properties": {
+                                "amount": {"type": "integer", "minimum": 10, **enum_or_const}
+                            },
+                        }
+                    )
+                )
+            },
+        ),
+    )
+
+    suite = generate_test_suite(make_result(endpoint))
+
+    if expected_negative is None:
+        assert all(case.violated_constraint != "minimum" for case in suite.cases)
+        assert any(
+            diagnostic.code == "numeric_boundary_no_safe_candidate"
+            for diagnostic in suite.diagnostics
+        )
+    else:
+        negative = next(case for case in suite.cases if case.violated_constraint == "minimum")
+        assert negative.request_body.value == expected_negative
+        assert not any(
+            diagnostic.code == "numeric_boundary_no_safe_candidate"
+            for diagnostic in suite.diagnostics
+        )
+
+
+def test_numeric_boundary_cases_are_ordered_stable_and_do_not_mutate_input() -> None:
+    endpoint = make_endpoint(
+        "/numeric-deterministic",
+        "post",
+        request_body=RequestBody(
+            required=True,
+            content={
+                "application/json": MediaType(
+                    schema=Schema(
+                        raw={
+                            "type": "object",
+                            "required": ["second", "first"],
+                            "properties": {
+                                "second": {"type": "integer", "maximum": 10},
+                                "first": {"type": "integer", "minimum": 2},
+                            },
+                        }
+                    )
+                )
+            },
+        ),
+    )
+    result = make_result(endpoint)
+    before = result.model_dump_json()
+
+    first = generate_test_suite(result)
+    second = generate_test_suite(result)
+
+    assert first.model_dump_json() == second.model_dump_json()
+    assert result.model_dump_json() == before
+    numeric_cases = [case for case in first.cases if case.violated_constraint in {"minimum", "maximum"}]
+    assert [case.affected_property for case in numeric_cases] == ["/first", "/second"]
+    assert [case.request_body.value for case in numeric_cases] == [
+        {"second": 0, "first": 1},
+        {"second": 11, "first": 2},
+    ]
+    assert len({case.case_id for case in first.cases}) == len(first.cases)

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import math
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, localcontext
 from hashlib import sha256
 from typing import Any
 
@@ -81,6 +81,11 @@ def generate_test_suite(result: NormalizationResult) -> GeneratedTestSuite:
             )
             cases.extend(negative_cases)
             diagnostics.extend(negative_diagnostics)
+            numeric_cases, numeric_diagnostics = _numeric_boundary_negative_cases(
+                endpoint, positive, result.api.openapi_version
+            )
+            cases.extend(numeric_cases)
+            diagnostics.extend(numeric_diagnostics)
         except _UnsupportedOperation as issue:
             diagnostics.append(
                 GenerationDiagnostic(
@@ -198,6 +203,557 @@ def _required_property_negative_cases(
             )
         )
     return tuple(cases), tuple(diagnostics)
+
+
+def _numeric_boundary_negative_cases(
+    endpoint: Endpoint, positive: GeneratedTestCase, version: str
+) -> tuple[tuple[GeneratedTestCase, ...], tuple[GenerationDiagnostic, ...]]:
+    """Generate one negative body candidate per safely targetable numeric bound."""
+    request_body = endpoint.request_body
+    if not isinstance(request_body, RequestBody) or positive.request_body is None:
+        return (), ()
+    if set(request_body.content) != {"application/json"}:
+        return (), ()
+    media = request_body.content["application/json"]
+    if media.schema is None or not isinstance(media.schema.raw, (dict, bool)):
+        return (), ()
+
+    schema = media.schema.raw
+    root_pointer = _child(
+        _endpoint_pointer(endpoint), "requestBody", "content", "application/json", "schema"
+    )
+    body_value = positive.request_body.value
+    targets: list[tuple[tuple[str, ...], dict[str, Any], str, str]] = []
+    _collect_numeric_targets(schema, (), root_pointer, targets)
+
+    cases: list[GeneratedTestCase] = []
+    diagnostics: list[GenerationDiagnostic] = []
+    for path, target_schema, schema_pointer, constraint in targets:
+        keyword_pointer = _child(schema_pointer, constraint)
+        try:
+            _check_schema(target_schema, version, schema_pointer, "request", 0)
+        except _UnsupportedOperation as issue:
+            diagnostics.append(
+                GenerationDiagnostic(
+                    code=issue.code,
+                    message=str(issue),
+                    endpoint_path=endpoint.path,
+                    endpoint_method=endpoint.method,
+                    source_pointer=issue.pointer,
+                    reference_uri=issue.reference_uri,
+                )
+            )
+            continue
+        candidate = _numeric_boundary_candidate(
+            target_schema, constraint, version
+        )
+        if candidate is None:
+            diagnostics.append(
+                GenerationDiagnostic(
+                    code="numeric_boundary_no_safe_candidate",
+                    message=(
+                        f"No deterministic numeric value was found that violates "
+                        f"'{constraint}' while satisfying the other supported constraints."
+                    ),
+                    endpoint_path=endpoint.path,
+                    endpoint_method=endpoint.method,
+                    source_pointer=keyword_pointer,
+                    reference_uri=None,
+                )
+            )
+            continue
+
+        value, candidate_key = candidate
+        generated_value = deepcopy(body_value)
+        parent = generated_value
+        current_schema = schema
+        current_schema_pointer = root_pointer
+        parent_issue: _UnsupportedOperation | None = None
+        for name in path[:-1]:
+            child_schema = current_schema.get("properties", {}).get(name)
+            if not isinstance(child_schema, dict) or not isinstance(parent, dict):
+                parent = None
+                break
+            if name not in parent:
+                try:
+                    child_value, _ = _select_value(
+                        child_schema,
+                        version,
+                        [],
+                        _child(current_schema_pointer, "properties", name),
+                        direction="request",
+                    )
+                except _UnsupportedOperation as issue:
+                    parent_issue = issue
+                    parent = None
+                    break
+                if not isinstance(child_value, dict):
+                    parent = None
+                    break
+                parent[name] = deepcopy(child_value)
+            if not isinstance(parent[name], dict):
+                parent = None
+                break
+            parent = parent[name]
+            current_schema = child_schema
+            current_schema_pointer = _child(current_schema_pointer, "properties", name)
+        if path and parent is None:
+            if parent_issue is not None:
+                diagnostics.append(
+                    GenerationDiagnostic(
+                        code=parent_issue.code,
+                        message=str(parent_issue),
+                        endpoint_path=endpoint.path,
+                        endpoint_method=endpoint.method,
+                        source_pointer=parent_issue.pointer,
+                        reference_uri=parent_issue.reference_uri,
+                    )
+                )
+                continue
+            diagnostics.append(
+                GenerationDiagnostic(
+                    code="numeric_boundary_parent_not_generated",
+                    message=(
+                        "The numeric property's ancestor object could not be safely "
+                        "generated; no boundary case was generated."
+                    ),
+                    endpoint_path=endpoint.path,
+                    endpoint_method=endpoint.method,
+                    source_pointer=schema_pointer,
+                    reference_uri=None,
+                )
+            )
+            continue
+        if path:
+            parent[path[-1]] = value
+        else:
+            generated_value = value
+
+        property_pointer = _json_pointer(path) if path else ""
+        cases.append(
+            GeneratedTestCase(
+                case_id=build_case_id(
+                    "negative",
+                    endpoint.path,
+                    endpoint.method,
+                    f"numeric-boundary:{property_pointer}:{constraint}:{candidate_key}",
+                ),
+                category="negative",
+                path=positive.path,
+                method=positive.method,
+                parameters=deepcopy(positive.parameters),
+                request_body=GeneratedBody(
+                    media_type="application/json", value=generated_value
+                ),
+                security=deepcopy(positive.security),
+                response_expectations=deepcopy(positive.response_expectations),
+                provenance=(
+                    *positive.provenance,
+                    schema_pointer,
+                    keyword_pointer,
+                    f"violated_constraint:{constraint}:{property_pointer}",
+                ),
+                expected_outcome="request_rejection_status_unspecified",
+                violated_constraint=constraint,
+                affected_property=property_pointer,
+            )
+        )
+
+    return tuple(cases), tuple(diagnostics)
+
+
+def _collect_numeric_targets(
+    schema: Any,
+    path: tuple[str, ...],
+    pointer: str,
+    targets: list[tuple[tuple[str, ...], dict[str, Any], str, str]],
+) -> None:
+    """Walk object schemas in stable property order and collect numeric bounds."""
+    if not isinstance(schema, dict):
+        return
+    schema_type = schema.get("type")
+    if schema_type in ("integer", "number"):
+        for constraint in ("minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"):
+            if (
+                constraint == "minimum" and schema.get("exclusiveMinimum") is True
+            ) or (constraint == "maximum" and schema.get("exclusiveMaximum") is True):
+                continue
+            if constraint in schema and not (
+                constraint in ("exclusiveMinimum", "exclusiveMaximum")
+                and isinstance(schema[constraint], bool)
+                and schema[constraint] is False
+            ):
+                targets.append((path, schema, pointer, constraint))
+        return
+
+    properties = schema.get("properties")
+    if not isinstance(properties, dict):
+        return
+    for name in sorted(properties):
+        child = properties[name]
+        if not isinstance(child, dict):
+            continue
+        if child.get("readOnly") is True:
+            continue
+        child_path = (*path, name)
+        child_pointer = _child(pointer, "properties", name)
+        if child.get("type") in ("integer", "number"):
+            if child.get("readOnly") is True:
+                continue
+            for constraint in ("minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"):
+                if (
+                    constraint == "minimum" and child.get("exclusiveMinimum") is True
+                ) or (constraint == "maximum" and child.get("exclusiveMaximum") is True):
+                    continue
+                if constraint in child and not (
+                    constraint in ("exclusiveMinimum", "exclusiveMaximum")
+                    and isinstance(child[constraint], bool)
+                    and child[constraint] is False
+                ):
+                    targets.append((child_path, child, child_pointer, constraint))
+        elif isinstance(child.get("properties"), dict):
+            _collect_numeric_targets(
+                child,
+                child_path,
+                child_pointer,
+                targets,
+            )
+
+
+def _numeric_boundary_candidate(
+    schema: dict[str, Any], constraint: str, version: str
+) -> tuple[int | float, str] | None:
+    """Find a decimal-lattice value violating one bound and respecting the rest."""
+    try:
+        kind = schema.get("type")
+        boundary = _active_numeric_bound(schema, constraint, version)
+        if boundary is None:
+            return None
+
+        restricted_candidates: list[Any] = []
+        if "const" in schema:
+            restricted_candidates.append(schema["const"])
+        elif "enum" in schema:
+            restricted_candidates.extend(schema["enum"])
+        if restricted_candidates:
+            for raw_candidate in restricted_candidates:
+                restricted = _as_decimal(raw_candidate)
+                if restricted is None:
+                    continue
+                if not _violates_numeric_constraint(schema, constraint, restricted, version):
+                    continue
+                if not _numeric_schema_constraints_match(schema, restricted, version, constraint):
+                    continue
+                converted = _decimal_to_json_number(restricted, kind)
+                if converted is not None:
+                    return converted, _decimal_key(restricted)
+            return None
+
+        lower: tuple[Decimal, bool] | None = None
+        upper: tuple[Decimal, bool] | None = None
+
+        def add_lower(bound: Decimal, inclusive: bool) -> None:
+            nonlocal lower
+            if lower is None or bound > lower[0] or (bound == lower[0] and not inclusive):
+                lower = (bound, inclusive)
+            elif bound == lower[0] and not inclusive:
+                lower = (bound, False)
+
+        def add_upper(bound: Decimal, inclusive: bool) -> None:
+            nonlocal upper
+            if upper is None or bound < upper[0] or (bound == upper[0] and not inclusive):
+                upper = (bound, inclusive)
+            elif bound == upper[0] and not inclusive:
+                upper = (bound, False)
+
+        for key, side, strict in _effective_numeric_bounds(schema, version):
+            if key == constraint:
+                continue
+            bound = _numeric_bound_value(schema, key, version)
+            if bound is None:
+                continue
+            (add_lower if side == "lower" else add_upper)(bound, not strict)
+
+        if constraint in ("minimum", "exclusiveMinimum"):
+            add_upper(boundary, inclusive=constraint == "exclusiveMinimum")
+        else:
+            add_lower(boundary, inclusive=constraint == "exclusiveMaximum")
+
+        if lower is not None and upper is not None:
+            if lower[0] > upper[0] or (
+                lower[0] == upper[0] and not (lower[1] and upper[1])
+            ):
+                return None
+
+        multiple = _as_decimal(schema.get("multipleOf"))
+        if multiple is not None and multiple <= 0:
+            return None
+        if multiple is None:
+            if kind == "integer":
+                step = Decimal(1)
+            else:
+                precision = max(
+                    (
+                        _decimal_places(bound[0])
+                        for bound in (lower, upper)
+                        if bound is not None
+                    ),
+                    default=0,
+                )
+                step = Decimal(1).scaleb(-precision) if precision else Decimal(1)
+        else:
+            if kind == "integer":
+                # Integer values that are multiples of p/q are spaced by p
+                # when p/q is in reduced form (e.g. multiples of 0.5 include
+                # every integer, while multiples of 1.5 include every 3rd).
+                numerator, _ = multiple.as_integer_ratio()
+                step = Decimal(abs(numerator))
+            else:
+                step = multiple
+
+        # When supported constraints bound the candidate to a narrow interval,
+        # its midpoint is a deterministic interior candidate. This avoids
+        # choosing a precision-derived step that jumps over that interval.
+        if kind == "number" and multiple is None and lower is not None and upper is not None:
+            midpoint_precision = (
+                len(lower[0].as_tuple().digits)
+                + len(upper[0].as_tuple().digits)
+                + abs(lower[0].as_tuple().exponent)
+                + abs(upper[0].as_tuple().exponent)
+                + 4
+            )
+            with localcontext() as context:
+                context.prec = max(context.prec, midpoint_precision)
+                value = (lower[0] + upper[0]) / 2
+        elif constraint in ("minimum", "exclusiveMinimum"):
+            if upper is None:
+                anchor = boundary
+                inclusive = constraint == "exclusiveMinimum"
+            else:
+                anchor, inclusive = upper
+            units = _decimal_floor_units(anchor, step)
+            value = _decimal_product(units, step)
+            if not inclusive and value == anchor:
+                value -= step
+
+        else:
+            if lower is None:
+                anchor = boundary
+                inclusive = constraint == "exclusiveMaximum"
+            else:
+                anchor, inclusive = lower
+            units = _decimal_ceil_units(anchor, step)
+            value = _decimal_product(units, step)
+            if not inclusive and value == anchor:
+                value += step
+
+        if kind == "integer" and value != value.to_integral_value():
+            return None
+        if lower is not None and (value < lower[0] or (value == lower[0] and not lower[1])):
+            return None
+        if upper is not None and (value > upper[0] or (value == upper[0] and not upper[1])):
+            return None
+        if not _violates_numeric_constraint(schema, constraint, value, version):
+            return None
+        if not _numeric_schema_constraints_match(schema, value, version, constraint):
+            return None
+        converted = _decimal_to_json_number(value, kind)
+        if converted is not None:
+            return converted, _decimal_key(value)
+        if kind == "number":
+            return _float_boundary_fallback(schema, constraint, version, boundary)
+        return None
+    except (InvalidOperation, OverflowError, ValueError):
+        return None
+
+
+def _float_boundary_fallback(
+    schema: dict[str, Any], constraint: str, version: str, boundary: Decimal
+) -> tuple[float, str] | None:
+    """Try adjacent JSON float values when the decimal lattice is not representable."""
+    try:
+        rounded = float(boundary)
+    except (OverflowError, ValueError):
+        return None
+    if not math.isfinite(rounded):
+        return None
+    direction = -math.inf if constraint in ("minimum", "exclusiveMinimum") else math.inf
+    adjacent = math.nextafter(rounded, direction)
+    values = sorted(
+        {rounded, adjacent}, key=lambda item: abs(Decimal(str(item)) - boundary)
+    )
+    for candidate in values:
+        exact_value = Decimal(str(candidate))
+        if not _violates_numeric_constraint(schema, constraint, exact_value, version):
+            continue
+        if not _numeric_schema_constraints_match(schema, exact_value, version, constraint):
+            continue
+        return candidate, _decimal_key(exact_value)
+    return None
+
+
+def _active_numeric_bound(
+    schema: dict[str, Any], constraint: str, version: str
+) -> Decimal | None:
+    """Return the active boundary for a specific dialect-aware keyword."""
+    if version.startswith("3.0."):
+        base = "minimum" if constraint == "exclusiveMinimum" else (
+            "maximum" if constraint == "exclusiveMaximum" else constraint
+        )
+        if constraint.startswith("exclusive"):
+            if schema.get(constraint) is not True or base not in schema:
+                return None
+            return _as_decimal(schema[base])
+        if base not in schema or schema.get("exclusive" + constraint.title()) is True:
+            return None
+        return _as_decimal(schema[base])
+    bound = _as_decimal(schema.get(constraint) if constraint.startswith("exclusive") else schema.get(constraint))
+    if bound is None:
+        return None
+    return bound
+
+
+def _effective_numeric_bounds(
+    schema: dict[str, Any], version: str
+) -> tuple[tuple[str, str, bool], ...]:
+    bounds: list[tuple[str, str, bool]] = []
+    if version.startswith("3.0."):
+        if "minimum" in schema:
+            bounds.append(("minimum", "lower", False))
+            if schema.get("exclusiveMinimum") is True:
+                bounds.append(("exclusiveMinimum", "lower", True))
+        if "maximum" in schema:
+            bounds.append(("maximum", "upper", False))
+            if schema.get("exclusiveMaximum") is True:
+                bounds.append(("exclusiveMaximum", "upper", True))
+    else:
+        if "minimum" in schema:
+            bounds.append(("minimum", "lower", False))
+        if "maximum" in schema:
+            bounds.append(("maximum", "upper", False))
+        if "exclusiveMinimum" in schema:
+            bounds.append(("exclusiveMinimum", "lower", True))
+        if "exclusiveMaximum" in schema:
+            bounds.append(("exclusiveMaximum", "upper", True))
+    return tuple(bounds)
+
+
+def _numeric_schema_constraints_match(
+    schema: dict[str, Any], value: Decimal, version: str, ignored: str
+) -> bool:
+    kind = schema.get("type")
+    if kind == "integer" and value != value.to_integral_value():
+        return False
+    for key, side, strict in _effective_numeric_bounds(schema, version):
+        if key == ignored:
+            continue
+        bound = _numeric_bound_value(schema, key, version)
+        if bound is None:
+            continue
+        if side == "lower" and (value < bound or (strict and value == bound)):
+            return False
+        if side == "upper" and (value > bound or (strict and value == bound)):
+            return False
+    multiple = _as_decimal(schema.get("multipleOf"))
+    if multiple is not None and (multiple <= 0 or not _decimal_is_multiple(value, multiple)):
+        return False
+    if "const" in schema:
+        const = _as_decimal(schema["const"])
+        if const is None or value != const:
+            return False
+    if "enum" in schema:
+        allowed = [_as_decimal(item) for item in schema["enum"]]
+        if not any(item is not None and value == item for item in allowed):
+            return False
+    if kind not in ("integer", "number"):
+        return False
+    return True
+
+
+def _violates_numeric_constraint(
+    schema: dict[str, Any], constraint: str, value: Decimal, version: str
+) -> bool:
+    bound = _active_numeric_bound(schema, constraint, version)
+    if bound is None:
+        return False
+    if constraint == "minimum":
+        return value < bound
+    if constraint == "exclusiveMinimum":
+        return value <= bound
+    if constraint == "maximum":
+        return value > bound
+    return value >= bound
+
+
+def _numeric_bound_value(schema: dict[str, Any], key: str, version: str) -> Decimal | None:
+    if version.startswith("3.0.") and key in ("exclusiveMinimum", "exclusiveMaximum"):
+        key = "minimum" if key == "exclusiveMinimum" else "maximum"
+    return _as_decimal(schema.get(key))
+
+
+def _as_decimal(value: Any) -> Decimal | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
+        return None
+    try:
+        result = Decimal(str(value))
+    except InvalidOperation:
+        return None
+    return result if result.is_finite() else None
+
+
+def _decimal_places(value: Decimal) -> int:
+    return max(0, -value.as_tuple().exponent)
+
+
+def _decimal_floor_units(value: Decimal, step: Decimal) -> int:
+    value_numerator, value_denominator = value.as_integer_ratio()
+    step_numerator, step_denominator = step.as_integer_ratio()
+    return (value_numerator * step_denominator) // (value_denominator * step_numerator)
+
+
+def _decimal_ceil_units(value: Decimal, step: Decimal) -> int:
+    value_numerator, value_denominator = value.as_integer_ratio()
+    step_numerator, step_denominator = step.as_integer_ratio()
+    numerator = value_numerator * step_denominator
+    denominator = value_denominator * step_numerator
+    return -((-numerator) // denominator)
+
+
+def _decimal_product(units: int, step: Decimal) -> Decimal:
+    # Size precision from both factors so Decimal's default context cannot round.
+    precision = len(str(abs(units))) + len(step.as_tuple().digits) + 4
+    with localcontext() as context:
+        context.prec = max(context.prec, precision)
+        return Decimal(units) * step
+
+
+def _decimal_is_multiple(value: Decimal, step: Decimal) -> bool:
+    value_numerator, value_denominator = value.as_integer_ratio()
+    step_numerator, step_denominator = step.as_integer_ratio()
+    numerator = value_numerator * step_denominator
+    denominator = value_denominator * step_numerator
+    return denominator != 0 and numerator % denominator == 0
+
+
+def _decimal_key(value: Decimal) -> str:
+    text = format(value, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return "0" if text in ("", "-0") else text
+
+
+def _decimal_to_json_number(value: Decimal, kind: Any) -> int | float | None:
+    if kind == "integer":
+        return int(value) if value == value.to_integral_value() else None
+    if value == value.to_integral_value():
+        return int(value)
+    try:
+        converted = float(value)
+    except (OverflowError, ValueError):
+        return None
+    if not math.isfinite(converted) or Decimal(str(converted)) != value:
+        return None
+    return converted
 
 
 def _required_writable_property_paths(
