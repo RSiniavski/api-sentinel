@@ -789,6 +789,53 @@ def test_unsupported_request_body_schema_emits_diagnostic_without_cases() -> Non
     assert suite.diagnostics[0].endpoint_path == endpoint.path
 
 
+def test_required_name_without_property_schema_is_diagnostic_not_negative_case() -> None:
+    endpoint = make_endpoint(
+        "/undeclared-required",
+        "post",
+        responses={"400": Response(description="Invalid request")},
+        request_body=RequestBody(
+            required=True,
+            content={
+                "application/json": MediaType(
+                    schema=Schema(
+                        raw={
+                            "type": "object",
+                            "required": ["known", "missing_schema"],
+                            "properties": {"known": {"type": "string"}},
+                        }
+                    )
+                )
+            },
+        ),
+    )
+
+    suite = generate_test_suite(make_result(endpoint))
+
+    assert len(suite.cases) == 2
+    positive, negative = suite.cases
+    assert positive.category == "positive"
+    assert positive.request_body.value == {
+        "known": "sentinel",
+        "missing_schema": None,
+    }
+    assert negative.affected_property == "/known"
+    assert negative.request_body.value == {"missing_schema": None}
+    assert "missing_schema" not in {
+        case.affected_property for case in suite.cases[1:]
+    }
+    assert len(suite.diagnostics) == 1
+    diagnostic = suite.diagnostics[0]
+    assert diagnostic.code == "required_property_schema_missing"
+    assert diagnostic.endpoint_path == endpoint.path
+    assert diagnostic.source_pointer == (
+        "/paths/~1undeclared-required/post/requestBody/content/"
+        "application~1json/schema/required/1"
+    )
+    assert "missing_schema" in diagnostic.message
+    assert "no negative omission case" in diagnostic.message
+
+
 def test_missing_declared_4xx_is_explicit_without_inventing_a_status() -> None:
     endpoint = make_endpoint(
         "/no-error-contract",

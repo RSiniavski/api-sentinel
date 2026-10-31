@@ -125,10 +125,10 @@ def _required_property_negative_cases(
         "application/json",
         "schema",
     )
-    property_paths = _required_writable_property_paths(
+    property_paths, undeclared_required = _required_writable_property_paths(
         raw_schema, positive.request_body.value, schema_pointer=schema_pointer
     )
-    if not property_paths:
+    if not property_paths and not undeclared_required:
         return (), ()
 
     root = _endpoint_pointer(endpoint)
@@ -169,9 +169,22 @@ def _required_property_negative_cases(
             )
         )
 
-    diagnostics: tuple[GenerationDiagnostic, ...] = ()
+    diagnostics: list[GenerationDiagnostic] = [
+        GenerationDiagnostic(
+            code="required_property_schema_missing",
+            message=(
+                f"Required property '{name}' has no declared property schema; "
+                "no negative omission case was generated for it."
+            ),
+            endpoint_path=endpoint.path,
+            endpoint_method=endpoint.method,
+            source_pointer=pointer,
+            reference_uri=None,
+        )
+        for name, pointer in undeclared_required
+    ]
     if not any(_declares_client_error(status) for status in endpoint.responses):
-        diagnostics = (
+        diagnostics.append(
             GenerationDiagnostic(
                 code="negative_response_contract_unavailable",
                 message=(
@@ -182,9 +195,9 @@ def _required_property_negative_cases(
                 endpoint_method=endpoint.method,
                 source_pointer=_child(root, "responses"),
                 reference_uri=None,
-            ),
+            )
         )
-    return tuple(cases), diagnostics
+    return tuple(cases), tuple(diagnostics)
 
 
 def _required_writable_property_paths(
@@ -193,16 +206,26 @@ def _required_writable_property_paths(
     path: tuple[str, ...] = (),
     *,
     schema_pointer: str,
-) -> tuple[tuple[tuple[str, ...], str], ...]:
-    """Return required writable object-property paths in stable order."""
+) -> tuple[
+    tuple[tuple[tuple[str, ...], str], ...],
+    tuple[tuple[str, str], ...],
+]:
+    """Return supported omissions and required names lacking property schemas."""
     if not isinstance(schema, dict):
-        return ()
+        return (), ()
     properties = schema.get("properties", {})
     if not isinstance(properties, dict):
-        return ()
+        return (), ()
 
     found: list[tuple[tuple[str, ...], str]] = []
+    undeclared: list[tuple[str, str]] = []
     for name in sorted(set(schema.get("required", []))):
+        if name not in properties:
+            required_index = schema["required"].index(name)
+            undeclared.append(
+                (name, _child(schema_pointer, "required", str(required_index)))
+            )
+            continue
         child_schema = properties[name]
         if isinstance(child_schema, dict) and child_schema.get("readOnly") is True:
             continue
@@ -213,15 +236,15 @@ def _required_writable_property_paths(
         found.append((property_path, property_schema_pointer))
         child_value = value[name]
         if isinstance(child_schema, dict) and isinstance(child_value, dict):
-            found.extend(
-                _required_writable_property_paths(
-                    child_schema,
-                    child_value,
-                    property_path,
-                    schema_pointer=property_schema_pointer,
-                )
+            nested_found, nested_undeclared = _required_writable_property_paths(
+                child_schema,
+                child_value,
+                property_path,
+                schema_pointer=property_schema_pointer,
             )
-    return tuple(found)
+            found.extend(nested_found)
+            undeclared.extend(nested_undeclared)
+    return tuple(found), tuple(undeclared)
 
 
 def _json_pointer(path: tuple[str, ...]) -> str:
@@ -570,7 +593,10 @@ def _check_schema(
         raise _UnsupportedOperation("unsupported_schema_form", "required must be an array of names.", _child(pointer, "required"))
     for name in sorted(set(required)):
         if name not in properties:
-            raise _UnsupportedOperation("unsupported_schema_form", f"Required property '{name}' has no schema.", _child(pointer, "required"))
+            # JSON Schema allows a required name without a sibling property schema.
+            # It is present-but-unconstrained, so keep it in positive data and
+            # report that no targeted omission case can be derived for it.
+            continue
         child = properties[name]
         if direction == "request" and isinstance(child, dict) and child.get("readOnly") is True:
             continue
@@ -718,6 +744,9 @@ def _fallback_values(schema: dict[str, Any], version: str, pointer: str, directi
         properties = schema.get("properties", {})
         value: dict[str, Any] = {}
         for name in sorted(set(schema.get("required", []))):
+            if name not in properties:
+                value[name] = None
+                continue
             child = properties[name]
             if direction == "request" and isinstance(child, dict) and child.get("readOnly") is True:
                 continue
