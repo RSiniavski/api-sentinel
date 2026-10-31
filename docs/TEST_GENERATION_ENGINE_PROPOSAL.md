@@ -106,6 +106,11 @@ def generate_test_suite(
 Add a new, generator-owned output contract rather than adding fields to `ApiModel`:
 
 ```python
+from typing import Literal
+
+from app.services.openapi.models import JsonValue, Schema, SecurityRequirement
+
+
 class GeneratedTestSuite:
     api_title: str
     api_version: str
@@ -124,17 +129,38 @@ class GeneratedTestCase:
     response_expectations: tuple[ResponseExpectation, ...]
     provenance: tuple[str, ...]  # stable OpenAPI pointers/references for review
 
+class GeneratedParameterValue:
+    name: str
+    location: Literal["path", "query", "header", "cookie"]
+    value: JsonValue
+    provenance: tuple[str, ...]  # source JSON Pointer, then any reference URIs followed
+
+class GeneratedBody:
+    media_type: str
+    value: JsonValue
+
+class ResponseExpectation:
+    status_key: str
+    media_types: tuple[str, ...]
+    schemas_by_media_type: dict[str, Schema | None]
+    response_reference_uri: str | None
+
 class GenerationDiagnostic:
-    code: str
+    code: str                    # stable machine-readable code
     message: str
     endpoint_path: str | None
     endpoint_method: str | None
-    schema_reference: str | None
+    source_pointer: str | None
+    reference_uri: str | None
 ```
 
 These are proposed types, not existing classes. A concrete implementation may use strict frozen Pydantic v2 models, consistent with the current project, or small dataclasses if serialization is not yet required. Prefer Pydantic if the generated suite will be persisted/exported. Keep request values JSON-compatible and represent parameter location separately; do not serialize query/header/path values into a URL in the generator.
 
-`ResponseExpectation` should preserve the declared status key and optional media-type/schema contract, not assert that a particular response will occur. A later execution engine matches the observed status against exact, class (`2XX`), or `default` response definitions and evaluates the matching contract.
+`GeneratedParameterValue.provenance` contains stable source JSON Pointers and, for referenced declarations, the local reference URIs followed. The tuple order is deterministic and describes where a value came from without duplicating the original parameter model. A generator diagnostic carries a stable `code`, endpoint path/method when known, and the most specific source pointer/reference available; its message is explanatory rather than an identifier.
+
+`GeneratedBody | None` distinguishes no body from a present body whose JSON value is `null`: `None` means the generated request has no body, while `GeneratedBody(media_type="application/json", value=None)` means an explicit JSON `null` body. The latter is a positive candidate only when the selected media/schema contract permits null.
+
+`ResponseExpectation` preserves the declared status key and media-type/schema contract, not an assertion that a particular response will occur. `schemas_by_media_type` maps each response media type to its `Schema` when present, retaining raw schema keywords and nested reference edges; `None` means that media type declares no schema. `response_reference_uri` preserves a top-level response edge when the expectation came from a referenced Response Object. A later execution engine matches the observed status against exact, class (`2XX`), or `default` response definitions and evaluates the matching contract.
 
 The suite should preserve operation and variant order deterministically. `case_id` must be derived from stable input values and variant identifiers, never process hash values or random numbers. Duplicate `operationId` values must not collide; path plus method is the canonical endpoint identity.
 
@@ -157,8 +183,13 @@ For the MVP, one baseline and a bounded, explicit set of negative variants are p
 - Use fixed, documented baseline values (for example a fixed string, integer, boolean, array, and object) and canonical ordering of schema properties and component maps.
 - Preserve declared array order where OpenAPI gives it meaning: enum order, composition branch order, security alternatives, and scope tuples.
 - Do not depend on Python’s randomized hash ordering, wall-clock time, UUID generation, environment variables, network responses, or random libraries.
-- Define precedence among candidate sources: use a schema’s valid `const`/`enum` candidates first; then use explicit examples/default only when the supported local evaluator confirms they satisfy the implemented subset; otherwise use canonical constructed values. Examples/default are not guaranteed valid merely because they are present.
+- Use the following candidate precedence for a positive baseline, stopping at the first candidate that passes the supported schema-subset checks: (1) schema `const`; (2) schema `enum` values in declaration order; (3) a contextual example, if present; (4) schema `example`, then schema `examples` in array order; (5) schema `default`; (6) a canonical constructed fallback. `const` and `enum` jointly constrain eligibility: a `const` candidate must also satisfy `enum`, and every enumerated candidate must equal `const` when one is declared. A conflicting example/default is skipped.
+- For a Parameter, contextual examples are ordered as parameter-level `example`, then parameter-level `examples` by sorted example name. For a request/response Media Type, use media-level `example`, then named media `examples` by sorted name. When the candidate source is an Example Object, use its `value`; a reference must first be resolved locally under the reference policy. A candidate with no directly available value is skipped with a diagnostic if no later candidate succeeds. Treat an explicit JSON `null` as a candidate only when source presence is distinguishable from absence.
+- If both a Parameter and its schema provide candidates, apply the Parameter candidates before schema `example`/`examples`/`default`, but after the schema’s `const`/`enum` restrictions. If both a Media Type and its schema provide candidates, apply Media Type candidates at the same contextual-example position. Do not merge candidate sets implicitly.
+- Validate every selected candidate against all constraints in the supported schema subset before using it as a positive value. Examples and defaults are annotations and are not presumed valid. If an unevaluated assertion keyword could change validity, do not label the candidate schema-valid; emit an unsupported-schema diagnostic or generate only a clearly scoped case.
 - For invalid cases, alter exactly one property/constraint from a valid baseline where possible, so the intended failure is attributable.
+
+**Current presence limitation:** `Parameter.example` and `MediaType.example` are typed as `JsonValue | None`, and the API Model contract expects field-set information to distinguish absent from explicit JSON `null`. However, the current Normalizer passes `source.get("example")` for both absent and present fields, so both arrive as explicitly set `None`. Before the generator relies on this distinction, the Normalizer must preserve source presence (for example, pass the field only when the key exists) or the contract must choose a different representation. Until then, treat these `None` values as absent; explicit-null candidates remain available in raw `Schema` and named Example Object `value` fields where their presence can be preserved.
 
 ### MVP-supported schema subset
 

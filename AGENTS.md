@@ -345,47 +345,19 @@ Do not implement security-sensitive behavior based on assumptions. Raise concern
 
 ## 12. Current Development Status
 
-The following is the last known project status as of 2026-10-31. Always verify it against the actual repository and current Git state.
+The following is the current project status as of 2026-10-31. Always verify it against the actual repository and current Git state.
 
 ### Completed or implemented
 
-- Initial FastAPI project structure.
-- OpenAPI document parsing and validation.
-- JSON and YAML input handling.
-- OpenAPI 3.0.x and 3.1.x support in the parser/validation stage.
-- Initial API Model implementation.
-- Typed representations for core API structures.
-- Local reference representation.
-- Initial serialization and deserialization coverage.
-- Tests for major API Model invariants.
+- Initial FastAPI project structure and health endpoints.
+- OpenAPI Parser: JSON/YAML parsing, safety limits, and OpenAPI 3.0.x/3.1.x validation.
+- API Model: strict Pydantic v2 representations, schema preservation, references, and serialization behavior.
+- API Model Normalizer: validated document to `NormalizationResult`, including components, endpoints, parameter merging, and diagnostics; implementation is covered by tests.
+- Phase 3 — OpenAPI Processing: completed.
 
 ### Current work
 
-The API Model is undergoing a final focused audit.
-
-The `Components.other` registry received additional tests covering:
-
-- `examples`
-- `headers`
-- `links`
-- `callbacks`
-- `pathItems`
-- JSON-compatible object preservation.
-- Local reference preservation.
-- Serialization and reconstruction.
-- Rejection of unsupported fields.
-
-A serialization round-trip issue was identified: reference models could be reconstructed as ordinary dictionaries. A targeted validator was introduced to restore `LocalReference` instances.
-
-The latest proposed refinement to that validator is still subject to review. Do not assume that the latest local changes have been committed or pushed.
-
-### Next planned stage
-
-After the API Model audit is completed, proceed to the API Model Normalizer.
-
-Use `docs/API_MODEL_NORMALIZER_PROPOSAL.md` and the current API Model contract as the starting point.
-
-Do not begin implementing the deterministic test generator before the normalized API representation is sufficiently defined.
+Phase 4 — Deterministic Test Generation Engine is the current development phase. The architecture proposal is in `docs/TEST_GENERATION_ENGINE_PROPOSAL.md`; the generator itself has not been implemented. Keep it separate from parsing, normalization, execution, scheduling, and AI functionality.
 
 ## 13. Git and Change Management
 

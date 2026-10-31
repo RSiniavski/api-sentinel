@@ -1,5 +1,7 @@
 # API Model / Normalizer — architecture proposal
 
+> **Historical status:** This document records the original pre-implementation design proposal. The OpenAPI Normalizer is now implemented; see `backend/app/services/openapi/normalizer.py` and the current implementation status in `docs/API_MODEL_CONTRACT.md`. The proposal content below is preserved as historical context.
+
 **Scope:** This is a design review only. No files were modified and no dependencies were installed. Findings below are based on the local repository files; they distinguish implemented behavior from documented plans.
 
 ## 1. Summary of the current implementation
