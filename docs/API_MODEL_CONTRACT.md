@@ -1,12 +1,12 @@
 # API Sentinel — API Model Contract
 
-**Status:** Approved API Model contract. The OpenAPI Parser and API Model are implemented; the Normalizer is not yet implemented.
+**Status:** Approved API Model contract. The OpenAPI Parser, API Model, and API Model Normalizer are implemented. Phase 3 — OpenAPI Processing is complete; Phase 4 — Deterministic Test Generation Engine is in progress.
 
 ## 1. Model overview
 
-The API Model is the typed, deterministic boundary between the OpenAPI Parser and a future Normalizer and Deterministic Test Generator. The Parser interface remains `parse_openapi_document(content: str, filename: str) -> dict[str, Any]` and returns a parsed and validated dictionary. The API Model is implemented using Pydantic v2; the Normalizer has not yet been implemented.
+The API Model is the typed, deterministic representation produced by the OpenAPI Normalizer from the parsed and validated dictionary returned by `parse_openapi_document(content: str, filename: str) -> dict[str, Any]`. The API Model is implemented using Pydantic v2. The Deterministic Test Generation Engine is the next consumer and has not yet been implemented.
 
-The Normalizer will accept that validated dictionary and return a `NormalizationResult`, whose `api` field contains the model below and whose `diagnostics` field reports parameter overrides. The model is not a replacement for the source document and does not perform parsing, specification validation, network access, or HTTP execution. It preserves the source information needed for test generation, especially full JSON-compatible Schema Objects and their reference edges.
+The implemented Normalizer accepts that validated dictionary and returns a `NormalizationResult`, whose `api` field contains the model below and whose `diagnostics` field reports parameter overrides. The model is not a replacement for the source document and does not perform parsing, specification validation, network access, or HTTP execution. It preserves the source information needed for test generation, especially full JSON-compatible Schema Objects and their reference edges.
 
 Use Pydantic v2 models with strict validation, `extra="forbid"` on the model contract, and `frozen=True` as a shallow mutation guard. Use tuples for semantically ordered lists such as endpoint order, parameters, media content entries if represented as pairs, and security alternatives. Use dictionaries where names or status keys are meaningful lookup keys. Do not sort arrays whose order is significant; where a map is serialized, define canonical key ordering at serialization time rather than relying on input file order.
 
@@ -17,14 +17,15 @@ The API Model is intentionally not a byte-for-byte copy of the source document. 
 - The implemented Parser exposes `parse_openapi_document(content, filename) -> dict[str, Any]`.
 - The Parser accepts JSON and YAML, imposes a 5 MiB content limit, rejects unsupported extensions and YAML aliases, uses a safe YAML loader, and validates supported OpenAPI 3.0.x and 3.1.x documents.
 - The shared `uri_references.py` helper validates local `$ref` URI syntax. The Parser's OpenAPI validator uses that helper and performs OpenAPI specification validation with `openapi-spec-validator`, which may resolve local references internally. The API Model validates `LocalReference.uri` with the shared helper and retains references as reference edges without expanding or inlining them.
-- The Parser returns the validated dictionary. It does not extract endpoints, build a component registry for consumers, or produce model entities. The Normalizer has not been implemented.
+- The Parser returns the validated dictionary. The implemented Normalizer extracts API metadata, component registries, endpoints, effective parameters and override diagnostics into `NormalizationResult`; it retains local reference edges and does not fetch or expand them. Path Item `$ref` under `paths` is rejected with a normalization error.
 - The API Model is implemented in `models.py` using Pydantic v2. Its model configuration is strict, forbids extra fields, and is frozen as a shallow mutation guard. Schema preservation and reference behavior follow this contract.
+- The current pipeline is Parser → validated dictionary → Normalizer → `NormalizationResult`/`ApiModel` → future Deterministic Test Generation Engine. Phase 3 — OpenAPI Processing is complete; Phase 4 is in progress.
 
 - `requirements.txt` directly pins `pydantic==2.14.2`; `pydantic-settings==2.16.2` remains pinned separately.
 - `openapi-spec-validator==0.9.0` provides OpenAPI specification validation, not model extraction. `PyYAML==6.0.3` provides YAML parsing. FastAPI and HTTPX are not needed by the API Model itself.
-- Tests cover Parser behavior, API Model behavior, and health endpoints. The latest verified full run was **77 passed, 2 warnings**; the warnings are Pydantic notices for the contract-required `schema` fields on `Parameter` and `MediaType`.
+- Tests cover Parser behavior, API Model behavior, Normalizer behavior, and health endpoints. Test files include `test_openapi_parser.py`, `test_api_model.py`, `test_openapi_normalizer.py`, and `test_health.py`.
 
-See [the architecture proposal](API_MODEL_NORMALIZER_PROPOSAL.md), [the Parser](../backend/app/services/openapi/parser.py), [the validator](../backend/app/services/openapi/validator.py), [the shared URI validation module](../backend/app/services/openapi/uri_references.py), [the API Model](../backend/app/services/openapi/models.py), [the requirements](../requirements.txt), [the Parser tests](../tests/test_openapi_parser.py), [the API Model tests](../tests/test_api_model.py), and [the health tests](../tests/test_health.py).
+See [the historical Normalizer proposal](API_MODEL_NORMALIZER_PROPOSAL.md), [the Generator proposal](TEST_GENERATION_ENGINE_PROPOSAL.md), [the Parser](../backend/app/services/openapi/parser.py), [the validator](../backend/app/services/openapi/validator.py), [the Normalizer](../backend/app/services/openapi/normalizer.py), [the shared URI validation module](../backend/app/services/openapi/uri_references.py), [the API Model](../backend/app/services/openapi/models.py), [the requirements](../requirements.txt), [the Parser tests](../tests/test_openapi_parser.py), [the API Model tests](../tests/test_api_model.py), [the Normalizer tests](../tests/test_openapi_normalizer.py), and [the health tests](../tests/test_health.py).
 
 ## 3. Design rules
 
@@ -455,9 +456,12 @@ This keeps the MVP typed around concepts the first Generator needs while prevent
 | `LocalReference.uri` | `str` | Required | Exact local URI reference string; no target content is embedded. |
 | `LocalReference.summary` | `str \| None` | `None` | Reference Object override or schema sibling annotation when present. |
 | `LocalReference.description` | `str \| None` | `None` | Reference Object override or schema sibling annotation when present. |
+| `LocalReference.extensions` | `dict[str, JsonValue]` | `{}` | `x-*` reference-level metadata, preserved separately from the reference URI and summary/description. |
 | `ParameterReference.reference` | `LocalReference` | Required | Generic local reference data, nested to keep parameter metadata out of all other reference types. |
 | `ParameterReference` | Model | — | Parameter-only wrapper around a reference edge; used only by `ParameterEntry`. |
 | `ParameterReference.source_scope` | `ParameterScope` | Required | Declaration scope: `path`, `operation`, or `component`. |
+
+When normalizing a reference-shaped object, preserve `$ref`, supported `summary` and `description` metadata, and all `x-*` fields in `LocalReference.extensions`. Reject other unsupported fields instead of discarding them. Extensions do not cause reference resolution or expansion. This model capability does not imply that such fields are valid on every OpenAPI Reference Object: the OpenAPI 3.1.1 specification says Reference Objects cannot be extended with additional properties, and the current `openapi-spec-validator` rejects `x-*` fields there. The Normalizer can preserve them when they are supplied by an extension-tolerant upstream or caller. For ordinary OpenAPI 3.0 references, summary/description siblings and reference-level extension fields are not expected, so the model metadata remains empty.
 
 ### Normalization result and override diagnostics
 

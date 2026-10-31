@@ -15,3 +15,7 @@ class UnsupportedOpenAPIVersionError(OpenAPIParserError):
 
 class OpenAPIValidationError(OpenAPIParserError):
     """Raised when a parsed document does not satisfy OpenAPI requirements."""
+
+
+class OpenAPINormalizationError(OpenAPIParserError):
+    """Raised when validated OpenAPI data cannot be represented by the API Model."""
