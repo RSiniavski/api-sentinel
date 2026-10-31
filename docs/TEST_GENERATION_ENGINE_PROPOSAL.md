@@ -56,7 +56,7 @@ JSON/YAML text
 
 ### Documentation discrepancy
 
-The current `docs/API_MODEL_CONTRACT.md` introduction and “Current repository facts” still say that the Normalizer has not been implemented. The current source contains `normalizer.py`, exports `normalize_openapi_document`, and has endpoint-normalization tests. The initial `docs/API_MODEL_NORMALIZER_PROPOSAL.md` likewise describes a pre-model state and its early proposed package/interface. Those documents are historical design material and do not accurately state the current implementation status. This proposal uses the source and tests as current evidence and does not modify the existing documents.
+`docs/API_MODEL_CONTRACT.md` and the current implementation status are synchronized: the Normalizer is implemented and covered by endpoint-normalization tests. `docs/API_MODEL_NORMALIZER_PROPOSAL.md` is an earlier, pre-implementation design proposal; retain it as historical context, not as a description of current implementation. This proposal uses the source and tests as current evidence.
 
 ## 3. Proposed architecture and processing pipeline
 
@@ -321,6 +321,6 @@ Each stage should have isolated tests and preserve the same input contract. Do n
 - `format` and `pattern` are preserved but no deterministic support registry exists. Start with a small explicit set or report them unsupported.
 - Response definitions represent possible contracts, not guaranteed status outcomes. The execution layer must match actual status to exact/range/default keys and perform assertions.
 - Target server selection and credential provisioning are intentionally absent. The generator should emit logical cases independent of environment and target secrets.
-- Existing architecture docs contain stale Normalizer status/interface language. Correcting those documents is a separate documentation task; this proposal does not silently revise their approved content.
+- `API_MODEL_NORMALIZER_PROPOSAL.md` records the historical pre-implementation design; current implementation facts are in the Normalizer source, API Model contract, and tests.
 
 Recommended next step: approve the generated suite/case contract and the initial supported schema subset, then implement stages 1–3 with deterministic fixtures before adding reference-heavy and negative-case logic.
