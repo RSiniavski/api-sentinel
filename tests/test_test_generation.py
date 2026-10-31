@@ -7,6 +7,7 @@ import json
 import pytest
 from pydantic import ValidationError
 
+import app.services.test_generation.generator as generator_module
 from app.services.openapi.models import (
     ApiInfo,
     ApiModel,
@@ -752,6 +753,383 @@ def test_optional_or_absent_request_body_has_no_omission_case(
     assert len(suite.cases) == 1
     assert suite.cases[0].category == "positive"
     assert all(case.violated_constraint != "required_request_body" for case in suite.cases)
+
+
+def test_enum_property_generates_same_type_candidate_outside_enum() -> None:
+    endpoint = make_endpoint(
+        "/enum-negative",
+        "post",
+        request_body=RequestBody(
+            required=True,
+            content={
+                "application/json": MediaType(
+                    schema=Schema(
+                        raw={
+                            "type": "object",
+                            "required": ["color", "count"],
+                            "properties": {
+                                "color": {
+                                    "type": "string",
+                                    "enum": ["sentinel"],
+                                },
+                                "count": {"type": "integer", "const": 3},
+                            },
+                        }
+                    )
+                )
+            },
+        ),
+        responses={"400": Response(description="Invalid request")},
+    )
+    result = make_result(endpoint)
+    original = result.model_dump_json()
+
+    suite = generate_test_suite(result)
+    positive = next(case for case in suite.cases if case.category == "positive")
+    enum_case = next(case for case in suite.cases if case.violated_constraint == "enum")
+    const_case = next(case for case in suite.cases if case.violated_constraint == "const")
+
+    assert positive.request_body.value == {"color": "sentinel", "count": 3}
+    assert enum_case.request_body.value == {"color": "", "count": 3}
+    assert enum_case.affected_property == "/color"
+    assert enum_case.provenance[-3:] == (
+        "/paths/~1enum-negative/post/requestBody/content/application~1json/schema/properties/color",
+        "/paths/~1enum-negative/post/requestBody/content/application~1json/schema/properties/color/enum",
+        "violated_constraint:enum:/color",
+    )
+    assert const_case.request_body.value == {"color": "sentinel", "count": 0}
+    assert const_case.affected_property == "/count"
+    assert enum_case.category == const_case.category == "negative"
+    assert enum_case.expected_outcome == const_case.expected_outcome == (
+        "request_rejection_status_unspecified"
+    )
+    assert enum_case.request_body.value["count"] == positive.request_body.value["count"]
+    assert const_case.request_body.value["color"] == positive.request_body.value["color"]
+    assert enum_case.request_body.value is not positive.request_body.value
+    assert const_case.request_body.value is not positive.request_body.value
+    assert suite.diagnostics == ()
+    assert result.model_dump_json() == original
+
+
+@pytest.mark.parametrize(
+    ("property_schema", "expected_constraint", "expected_candidate", "expected_type"),
+    [
+        ({"type": "boolean", "enum": [True]}, "enum", False, bool),
+        ({"type": "number", "const": 2.5}, "const", 0.0, float),
+        ({"type": "null", "const": None}, None, None, type(None)),
+    ],
+)
+def test_enum_const_candidates_preserve_boolean_number_and_null_types(
+    property_schema: dict[str, object],
+    expected_constraint: str | None,
+    expected_candidate: object,
+    expected_type: type,
+) -> None:
+    endpoint = make_endpoint(
+        "/enum-const-types",
+        "post",
+        request_body=RequestBody(
+            required=True,
+            content={
+                "application/json": MediaType(
+                    schema=Schema(
+                        raw={
+                            "type": "object",
+                            "required": ["value"],
+                            "properties": {"value": property_schema},
+                        }
+                    )
+                )
+            },
+        ),
+        responses={"400": Response(description="Invalid request")},
+    )
+
+    suite = generate_test_suite(make_result(endpoint))
+    matching = [
+        case for case in suite.cases if case.violated_constraint == expected_constraint
+    ] if expected_constraint is not None else []
+
+    if expected_constraint is None:
+        assert not any(case.violated_constraint in {"enum", "const"} for case in suite.cases)
+        assert suite.diagnostics[0].code == "enum_const_candidate_unavailable"
+    else:
+        assert len(matching) == 1
+        value = matching[0].request_body.value["value"]
+        assert value == expected_candidate
+        assert type(value) is expected_type
+
+
+def test_nested_enum_case_preserves_other_payload_and_metadata_deterministically() -> None:
+    endpoint = Endpoint(
+        path="/nested-enum",
+        method="post",
+        parameters=(
+            Parameter(
+                name="trace",
+                location="query",
+                required=True,
+                schema=Schema(raw={"type": "string", "example": "trace-value"}),
+                source_scope="operation",
+            ),
+        ),
+        request_body=RequestBody(
+            required=True,
+            content={
+                "application/json": MediaType(
+                    schema=Schema(
+                        raw={
+                            "type": "object",
+                            "required": ["details", "active"],
+                            "properties": {
+                                "details": {
+                                    "type": "object",
+                                    "required": ["code", "note"],
+                                    "properties": {
+                                        "code": {"type": "integer", "enum": [4]},
+                                        "note": {"type": "string", "example": "keep"},
+                                    },
+                                },
+                                "active": {"type": "boolean"},
+                            },
+                        }
+                    )
+                )
+            },
+        ),
+        security=(SecurityRequirement(schemes={"oauth": ("write",)}),),
+        responses={"400": Response(description="Invalid request")},
+    )
+    result = make_result(endpoint)
+    original = result.model_dump_json()
+
+    first = generate_test_suite(result)
+    second = generate_test_suite(result)
+    positive = next(case for case in first.cases if case.category == "positive")
+    negative = next(case for case in first.cases if case.violated_constraint == "enum")
+
+    assert first.model_dump_json() == second.model_dump_json()
+    assert negative.case_id == build_case_id(
+        "negative", endpoint.path, endpoint.method, "enum-violation:/details/code"
+    )
+    assert negative.affected_property == "/details/code"
+    assert negative.request_body.value == {
+        "details": {"code": 0, "note": "keep"},
+        "active": False,
+    }
+    assert negative.parameters == positive.parameters
+    assert negative.security == positive.security
+    assert negative.response_expectations == positive.response_expectations
+    assert (negative.path, negative.method) == (positive.path, positive.method)
+    assert negative.provenance[-3:] == (
+        "/paths/~1nested-enum/post/requestBody/content/application~1json/schema/properties/details/properties/code",
+        "/paths/~1nested-enum/post/requestBody/content/application~1json/schema/properties/details/properties/code/enum",
+        "violated_constraint:enum:/details/code",
+    )
+    assert negative.request_body.value is not positive.request_body.value
+    assert negative.request_body.value["details"] is not positive.request_body.value["details"]
+    negative.request_body.value["details"]["note"] = "changed"
+    assert positive.request_body.value["details"]["note"] == "keep"
+    assert result.model_dump_json() == original
+
+
+def test_combined_enum_and_const_only_emit_independently_valid_const_violation() -> None:
+    endpoint = make_endpoint(
+        "/enum-const",
+        "post",
+        request_body=RequestBody(
+            required=True,
+            content={
+                "application/json": MediaType(
+                    schema=Schema(
+                        raw={
+                            "type": "object",
+                            "required": ["choice"],
+                            "properties": {
+                                "choice": {
+                                    "type": "string",
+                                    "enum": ["selected", "alternate"],
+                                    "const": "selected",
+                                }
+                            },
+                        }
+                    )
+                )
+            },
+        ),
+        responses={"400": Response(description="Invalid request")},
+    )
+
+    suite = generate_test_suite(make_result(endpoint))
+
+    negatives = [
+        case for case in suite.cases if case.violated_constraint in {"enum", "const"}
+    ]
+    assert [(case.violated_constraint, case.request_body.value) for case in negatives] == [
+        ("const", {"choice": "alternate"})
+    ]
+    assert len(suite.diagnostics) == 1
+    diagnostic = suite.diagnostics[0]
+    assert diagnostic.code == "enum_const_candidate_unavailable"
+    assert diagnostic.source_pointer.endswith("/properties/choice/enum")
+    assert "satisfying the other supported constraints" in diagnostic.message
+
+
+def test_const_candidate_search_includes_enum_values_after_index_100(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    enum_values = list(range(101)) + [103, 101]
+    match_checks: list[tuple[dict[str, object], int]] = []
+    original_matches = generator_module._matches
+
+    def record_candidate_validation(
+        schema: dict[str, object], value: object, version: str, direction: str, depth: int
+    ) -> bool:
+        if type(value) is int and value in (103, 101) and "const" not in schema:
+            match_checks.append((dict(schema), value))  # type: ignore[arg-type]
+        return original_matches(schema, value, version, direction, depth)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(generator_module, "_matches", record_candidate_validation)
+    endpoint = make_endpoint(
+        "/const-enum-tail",
+        "post",
+        request_body=RequestBody(
+            required=True,
+            content={
+                "application/json": MediaType(
+                    schema=Schema(
+                        raw={
+                            "type": "object",
+                            "required": ["count"],
+                            "properties": {
+                                "count": {
+                                    "type": "integer",
+                                    "minimum": 100,
+                                    "maximum": 101,
+                                    "enum": enum_values,
+                                    "const": 100,
+                                }
+                            },
+                        }
+                    )
+                )
+            },
+        ),
+        responses={"400": Response(description="Invalid request")},
+    )
+
+    suite = generate_test_suite(make_result(endpoint))
+
+    const_case = next(
+        case for case in suite.cases if case.violated_constraint == "const"
+    )
+    candidate = const_case.request_body.value["count"]
+    assert candidate == 101
+    assert candidate in enum_values
+    assert candidate >= 100
+    assert candidate <= 101
+    assert candidate != 100
+    assert [(value, "enum" in schema) for schema, value in match_checks] == [
+        (103, False),
+        (101, False),
+    ]
+    assert all(schema.get("minimum") == 100 for schema, _ in match_checks)
+    assert all(schema.get("maximum") == 101 for schema, _ in match_checks)
+    assert 103 > 101  # The first tail candidate is rejected by maximum.
+    assert const_case.case_id == build_case_id(
+        "negative", endpoint.path, endpoint.method, "const-violation:/count"
+    )
+
+
+def test_bounded_primitive_search_diagnostic_describes_candidate_set() -> None:
+    endpoint = make_endpoint(
+        "/bounded-enum-search",
+        "post",
+        request_body=RequestBody(
+            required=True,
+            content={
+                "application/json": MediaType(
+                    schema=Schema(
+                        raw={
+                            "type": "object",
+                            "required": ["label"],
+                            "properties": {
+                                "label": {
+                                    "type": "string",
+                                    "enum": [
+                                        "seed",
+                                        "",
+                                        "sentinel",
+                                        "negative",
+                                        "enum-negative",
+                                        "seedx",
+                                        "seed_negative",
+                                    ],
+                                }
+                            },
+                        }
+                    )
+                )
+            },
+        ),
+        responses={"400": Response(description="Invalid request")},
+    )
+
+    suite = generate_test_suite(make_result(endpoint))
+
+    assert not any(case.violated_constraint == "enum" for case in suite.cases)
+    diagnostic = next(
+        item
+        for item in suite.diagnostics
+        if item.code == "enum_const_candidate_unavailable"
+    )
+    assert diagnostic.source_pointer.endswith("/properties/label/enum")
+    assert diagnostic.message == (
+        "No candidate was found in the deterministic same-type candidate set "
+        "that violates enum while satisfying the other supported constraints."
+    )
+
+
+def test_unavailable_enum_and_const_candidates_produce_diagnostics_without_cases() -> None:
+    endpoint = make_endpoint(
+        "/enum-const-unavailable",
+        "post",
+        request_body=RequestBody(
+            required=True,
+            content={
+                "application/json": MediaType(
+                    schema=Schema(
+                        raw={
+                            "type": "object",
+                            "required": ["choice"],
+                            "properties": {
+                                "choice": {
+                                    "type": "string",
+                                    "enum": ["x"],
+                                    "const": "x",
+                                }
+                            },
+                        }
+                    )
+                )
+            },
+        ),
+        responses={"400": Response(description="Invalid request")},
+    )
+
+    suite = generate_test_suite(make_result(endpoint))
+
+    assert not any(
+        case.violated_constraint in {"enum", "const"} for case in suite.cases
+    )
+    assert [item.source_pointer.rsplit("/", 1)[-1] for item in suite.diagnostics] == [
+        "enum",
+        "const",
+    ]
+    assert all(item.code == "enum_const_candidate_unavailable" for item in suite.diagnostics)
+    assert "No candidate was found in the deterministic same-type candidate set" in (
+        suite.diagnostics[0].message
+    )
 
 
 def test_generates_distinct_cases_for_different_methods_and_paths() -> None:

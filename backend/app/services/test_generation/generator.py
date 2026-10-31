@@ -101,6 +101,11 @@ def generate_test_suite(result: NormalizationResult) -> GeneratedTestSuite:
             request_body_case = _required_request_body_negative_case(endpoint, positive)
             if request_body_case is not None:
                 cases.append(request_body_case)
+            enum_const_cases, enum_const_diagnostics = _enum_const_negative_cases(
+                endpoint, positive, result.api.openapi_version
+            )
+            cases.extend(enum_const_cases)
+            diagnostics.extend(enum_const_diagnostics)
         except _UnsupportedOperation as issue:
             diagnostics.append(
                 GenerationDiagnostic(
@@ -437,6 +442,218 @@ def _wrong_type_negative_cases(
         )
 
     return tuple(cases), tuple(diagnostics)
+
+
+def _enum_const_negative_cases(
+    endpoint: Endpoint, positive: GeneratedTestCase, version: str
+) -> tuple[tuple[GeneratedTestCase, ...], tuple[GenerationDiagnostic, ...]]:
+    """Violate enum/const on present primitive request-body properties."""
+    request_body = endpoint.request_body
+    if not isinstance(request_body, RequestBody) or positive.request_body is None:
+        return (), ()
+    if set(request_body.content) != {"application/json"}:
+        return (), ()
+    media = request_body.content["application/json"]
+    if media.schema is None or not isinstance(media.schema.raw, dict):
+        return (), ()
+
+    body_schema_pointer = _child(
+        _endpoint_pointer(endpoint), "requestBody", "content", "application/json", "schema"
+    )
+    body_value = positive.request_body.value
+    targets: list[tuple[tuple[str, ...], str, str, Any]] = []
+    diagnostics: list[GenerationDiagnostic] = []
+
+    def add_diagnostic(
+        code: str, message: str, pointer: str, reference_uri: str | None = None
+    ) -> None:
+        diagnostics.append(
+            GenerationDiagnostic(
+                code=code,
+                message=message,
+                endpoint_path=endpoint.path,
+                endpoint_method=endpoint.method,
+                source_pointer=pointer,
+                reference_uri=reference_uri,
+            )
+        )
+
+    def visit(
+        schema: Any,
+        value: Any,
+        path: tuple[str, ...],
+        pointer: str,
+        depth: int,
+    ) -> None:
+        if not isinstance(schema, dict) or not isinstance(value, dict):
+            return
+        if depth > _MAX_DEPTH:
+            add_diagnostic(
+                "enum_const_unsupported_schema",
+                "Schema nesting exceeds the supported depth; enum/const cases were skipped.",
+                pointer,
+            )
+            return
+        properties = schema.get("properties")
+        if not isinstance(properties, dict):
+            return
+
+        for name in sorted(properties):
+            if name not in value:
+                continue
+            child_schema = properties[name]
+            child_value = value[name]
+            child_pointer = _child(pointer, "properties", name)
+            child_path = (*path, name)
+            if not isinstance(child_schema, dict):
+                continue
+            if child_schema.get("readOnly") is True:
+                continue
+
+            constraints = tuple(
+                keyword for keyword in ("enum", "const") if keyword in child_schema
+            )
+            if constraints:
+                try:
+                    checked_schema = _check_schema(
+                        child_schema, version, child_pointer, "request", depth + 1
+                    )
+                except _UnsupportedOperation as issue:
+                    add_diagnostic(
+                        "enum_const_unsupported_schema",
+                        str(issue),
+                        issue.pointer,
+                        issue.reference_uri,
+                    )
+                else:
+                    if not _is_json_primitive_value(child_value):
+                        for keyword in constraints:
+                            add_diagnostic(
+                                "enum_const_unsupported_value",
+                                "Only primitive property values are supported for enum/const negative cases.",
+                                _child(child_pointer, keyword),
+                            )
+                    elif isinstance(checked_schema, dict):
+                        for keyword in constraints:
+                            candidate = _enum_const_candidate(
+                                checked_schema,
+                                child_value,
+                                keyword,
+                                version,
+                                child_pointer,
+                            )
+                            if candidate is None:
+                                add_diagnostic(
+                                    "enum_const_candidate_unavailable",
+                                    f"No candidate was found in the deterministic same-type candidate set that violates {keyword} while satisfying the other supported constraints.",
+                                    _child(child_pointer, keyword),
+                                )
+                            else:
+                                targets.append(
+                                    (child_path, child_pointer, keyword, candidate)
+                                )
+
+            if isinstance(child_value, dict):
+                visit(child_schema, child_value, child_path, child_pointer, depth + 1)
+
+    visit(media.schema.raw, body_value, (), body_schema_pointer, 0)
+
+    cases: list[GeneratedTestCase] = []
+    for path, schema_pointer, keyword, candidate in targets:
+        generated_value = deepcopy(body_value)
+        parent = generated_value
+        for name in path[:-1]:
+            parent = parent[name]
+        parent[path[-1]] = candidate
+
+        property_pointer = _json_pointer(path)
+        keyword_pointer = _child(schema_pointer, keyword)
+        cases.append(
+            GeneratedTestCase(
+                case_id=build_case_id(
+                    "negative",
+                    endpoint.path,
+                    endpoint.method,
+                    f"{keyword}-violation:{property_pointer}",
+                ),
+                category="negative",
+                path=positive.path,
+                method=positive.method,
+                parameters=deepcopy(positive.parameters),
+                request_body=GeneratedBody(
+                    media_type=positive.request_body.media_type,
+                    value=generated_value,
+                ),
+                security=deepcopy(positive.security),
+                response_expectations=deepcopy(positive.response_expectations),
+                provenance=(
+                    *positive.provenance,
+                    schema_pointer,
+                    keyword_pointer,
+                    f"violated_constraint:{keyword}:{property_pointer}",
+                ),
+                expected_outcome="request_rejection_status_unspecified",
+                violated_constraint=keyword,
+                affected_property=property_pointer,
+            )
+        )
+
+    return tuple(cases), tuple(diagnostics)
+
+
+def _is_json_primitive_value(value: Any) -> bool:
+    """Whether value is a JSON scalar, excluding Python-only numeric types."""
+    return value is None or type(value) in {str, bool, int, float}
+
+
+def _enum_const_candidate(
+    schema: dict[str, Any],
+    original: Any,
+    keyword: str,
+    version: str,
+    pointer: str,
+) -> Any | None:
+    """Find a bounded deterministic same-type candidate violating one keyword."""
+    candidate_schema = dict(schema)
+    candidate_schema.pop(keyword, None)
+
+    if keyword == "const" and isinstance(schema.get("enum"), list):
+        # Every candidate below is sourced directly from enum, so membership is
+        # already established; avoid _matches() rescanning the enum each time.
+        candidate_schema.pop("enum", None)
+        candidates = schema["enum"]
+    else:
+        candidates = _same_type_candidates(original)
+
+    targeted_values = schema.get("enum") if keyword == "enum" else schema.get("const")
+    for candidate in candidates:
+        if type(candidate) is not type(original):
+            continue
+        if keyword == "enum" and isinstance(targeted_values, list) and any(
+            _equal(candidate, item) for item in targeted_values
+        ):
+            continue
+        if keyword == "const" and _equal(candidate, targeted_values):
+            continue
+        try:
+            if _matches(candidate_schema, candidate, version, "request", 0):
+                return candidate
+        except _UnsupportedOperation:
+            return None
+    return None
+
+
+def _same_type_candidates(value: Any) -> tuple[Any, ...]:
+    """Return a small stable candidate set with the exact Python JSON type."""
+    if type(value) is str:
+        return ("", "sentinel", "negative", "enum-negative", value + "x", value + "_negative")
+    if type(value) is bool:
+        return (not value,)
+    if type(value) is int:
+        return (0, 1, -1, 2, -2, value + 1, value - 1)
+    if type(value) is float:
+        return (0.0, 1.0, -1.0, 0.5, -0.5, value + 1.0, value - 1.0)
+    return ()
 
 
 def _wrong_type_candidate(allowed_types: tuple[str, ...]) -> Any | None:
