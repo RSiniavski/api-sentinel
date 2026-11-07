@@ -7,6 +7,7 @@ import math
 from decimal import Decimal, InvalidOperation, localcontext
 from hashlib import sha256
 from typing import Any
+from urllib.parse import unquote
 
 from app.services.openapi.models import (
     ApiModel,
@@ -96,7 +97,9 @@ def generate_test_suite(result: NormalizationResult) -> GeneratedTestSuite:
             )
             cases.extend(string_cases)
             diagnostics.extend(string_diagnostics)
-            parameter_cases = _required_parameter_negative_cases(endpoint, positive)
+            parameter_cases = _required_parameter_negative_cases(
+                endpoint, positive, result.api
+            )
             cases.extend(parameter_cases)
             request_body_case = _required_request_body_negative_case(endpoint, positive)
             if request_body_case is not None:
@@ -128,17 +131,16 @@ def generate_test_suite(result: NormalizationResult) -> GeneratedTestSuite:
 
 
 def _required_parameter_negative_cases(
-    endpoint: Endpoint, positive: GeneratedTestCase
+    endpoint: Endpoint, positive: GeneratedTestCase, api: ApiModel
 ) -> tuple[GeneratedTestCase, ...]:
     """Omit each generated required non-path parameter once, in declaration order."""
     root = _endpoint_pointer(endpoint)
     cases: list[GeneratedTestCase] = []
-    for index, entry in enumerate(endpoint.parameters):
-        if (
-            not isinstance(entry, Parameter)
-            or not entry.required
-            or entry.location not in {"query", "header", "cookie"}
-        ):
+    for index, endpoint_entry in enumerate(endpoint.parameters):
+        pointer = _child(root, "parameters", str(index))
+        # The positive baseline already resolved every entry successfully.
+        entry, _, followed = _resolve_parameter(endpoint_entry, api, pointer)
+        if not entry.required or entry.location not in {"query", "header", "cookie"}:
             continue
 
         # Only omit a parameter that was represented in the positive baseline.
@@ -151,7 +153,6 @@ def _required_parameter_negative_cases(
         if len(matches) != 1:
             continue
 
-        pointer = _child(root, "parameters", str(index))
         remaining = tuple(
             deepcopy(value)
             for value in positive.parameters
@@ -171,6 +172,7 @@ def _required_parameter_negative_cases(
                 provenance=(
                     *positive.provenance,
                     pointer,
+                    *followed,
                     f"violated_constraint:required_parameter:{entry.location}:{entry.name}",
                 ),
                 expected_outcome="request_rejection_status_unspecified",
@@ -1495,24 +1497,72 @@ def _declares_client_error(status: str) -> bool:
     )
 
 
+_PARAMETER_REFERENCE_PREFIX = "#/components/parameters/"
+
+
+def _resolve_parameter(
+    entry: Parameter | ParameterReference, api: ApiModel, pointer: str
+) -> tuple[Parameter, str, tuple[str, ...]]:
+    """Follow local component parameter references to a concrete Parameter.
+
+    Returns the Parameter, the pointer of its declaration (the endpoint entry
+    for an inline parameter, the component for a referenced one) and the
+    reference URIs followed, in order.
+    """
+    if isinstance(entry, Parameter):
+        return entry, pointer, ()
+
+    followed: list[str] = []
+    declaration = pointer
+    current: Parameter | ParameterReference = entry
+    while isinstance(current, ParameterReference):
+        uri = current.reference.uri
+        if uri in followed:
+            raise _UnsupportedOperation(
+                "unsupported_parameter_reference",
+                "Parameter reference cycle.",
+                pointer,
+                uri,
+            )
+        followed.append(uri)
+        segment = uri[len(_PARAMETER_REFERENCE_PREFIX) :]
+        if (
+            not uri.startswith(_PARAMETER_REFERENCE_PREFIX)
+            or not segment
+            or "/" in segment
+        ):
+            raise _UnsupportedOperation(
+                "unsupported_parameter_reference",
+                "Only #/components/parameters/<name> references are supported.",
+                pointer,
+                uri,
+            )
+        name = unquote(segment).replace("~1", "/").replace("~0", "~")
+        target = api.components.parameters.get(name)
+        if target is None:
+            raise _UnsupportedOperation(
+                "unsupported_parameter_reference",
+                "Parameter reference target was not found.",
+                pointer,
+                uri,
+            )
+        declaration = _pointer("components", "parameters", name)
+        current = target
+    return current, declaration, tuple(followed)
+
+
 def _generate_endpoint(endpoint: Endpoint, api: ApiModel) -> GeneratedTestCase:
     root = _endpoint_pointer(endpoint)
     parameters: list[GeneratedParameterValue] = []
     path_names: set[str] = set()
 
-    for index, entry in enumerate(endpoint.parameters):
+    for index, endpoint_entry in enumerate(endpoint.parameters):
         pointer = _child(root, "parameters", str(index))
-        if isinstance(entry, ParameterReference):
-            raise _UnsupportedOperation(
-                "unsupported_parameter_reference",
-                "This stage supports concrete inline parameters only.",
-                pointer,
-                entry.reference.uri,
-            )
-        if not isinstance(entry, Parameter):
+        if not isinstance(endpoint_entry, (Parameter, ParameterReference)):
             raise _UnsupportedOperation(
                 "unsupported_parameter", "Unsupported parameter entry.", pointer
             )
+        entry, declaration, followed = _resolve_parameter(endpoint_entry, api, pointer)
         if entry.schema is None or entry.content is not None:
             raise _UnsupportedOperation(
                 "unsupported_parameter_schema",
@@ -1520,7 +1570,7 @@ def _generate_endpoint(endpoint: Endpoint, api: ApiModel) -> GeneratedTestCase:
                 pointer,
             )
 
-        schema_pointer = _child(pointer, "schema")
+        schema_pointer = _child(declaration, "schema")
         raw = entry.schema.raw
         if not _is_primitive_schema(raw, api.openapi_version, schema_pointer):
             raise _UnsupportedOperation(
@@ -1532,7 +1582,7 @@ def _generate_endpoint(endpoint: Endpoint, api: ApiModel) -> GeneratedTestCase:
         value, candidate_pointer = _select_value(
             raw,
             api.openapi_version,
-            _parameter_examples(entry, pointer),
+            _parameter_examples(entry, declaration),
             schema_pointer,
             direction="request",
         )
@@ -1542,7 +1592,9 @@ def _generate_endpoint(endpoint: Endpoint, api: ApiModel) -> GeneratedTestCase:
                     name=entry.name,
                     location=entry.location,
                     value=deepcopy(value),
-                    provenance=tuple(dict.fromkeys((pointer, schema_pointer, candidate_pointer))),
+                    provenance=tuple(
+                        dict.fromkeys((pointer, *followed, schema_pointer, candidate_pointer))
+                    ),
                 )
             )
             if entry.location == "path":

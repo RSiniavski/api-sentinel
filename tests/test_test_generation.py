@@ -11,6 +11,7 @@ import app.services.test_generation.generator as generator_module
 from app.services.openapi.models import (
     ApiInfo,
     ApiModel,
+    Components,
     Endpoint,
     LocalReference,
     MediaType,
@@ -3083,3 +3084,230 @@ def test_contradictory_string_length_interval_has_no_positive_or_negative_case()
 
     assert suite.cases == ()
     assert suite.diagnostics[0].code == "no_positive_schema_value"
+
+
+def make_result_with_parameters(
+    endpoint: Endpoint, parameters: dict[str, Parameter | ParameterReference]
+) -> NormalizationResult:
+    return NormalizationResult(
+        api=ApiModel(
+            openapi_version="3.1.1",
+            info=ApiInfo(title="Generated API", version="1.0"),
+            endpoints=(endpoint,),
+            components=Components(parameters=parameters),
+        )
+    )
+
+
+def parameter_reference(name: str) -> ParameterReference:
+    return ParameterReference(
+        reference=LocalReference(uri=f"#/components/parameters/{name}"),
+        source_scope="operation",
+    )
+
+
+def test_parameter_reference_resolves_to_component_parameter() -> None:
+    endpoint = make_endpoint("/items", parameters=(parameter_reference("Limit"),))
+    result = make_result_with_parameters(
+        endpoint,
+        {
+            "Limit": Parameter(
+                name="limit",
+                location="query",
+                required=True,
+                schema=Schema(raw={"type": "integer", "example": 7}),
+                source_scope="component",
+            )
+        },
+    )
+
+    suite = generate_test_suite(result)
+
+    assert suite.diagnostics == ()
+    parameter = suite.cases[0].parameters[0]
+    assert (parameter.name, parameter.location, parameter.value) == ("limit", "query", 7)
+    assert parameter.provenance[:3] == (
+        "/paths/~1items/get/parameters/0",
+        "#/components/parameters/Limit",
+        "/components/parameters/Limit/schema",
+    )
+
+
+def test_parameter_reference_alias_chain_records_every_followed_reference() -> None:
+    endpoint = make_endpoint("/items", parameters=(parameter_reference("Alias"),))
+    result = make_result_with_parameters(
+        endpoint,
+        {
+            "Alias": parameter_reference("Limit"),
+            "Limit": Parameter(
+                name="limit",
+                location="query",
+                required=True,
+                schema=Schema(raw={"type": "integer", "example": 7}),
+                source_scope="component",
+            ),
+        },
+    )
+
+    suite = generate_test_suite(result)
+
+    assert suite.diagnostics == ()
+    assert suite.cases[0].parameters[0].provenance[:3] == (
+        "/paths/~1items/get/parameters/0",
+        "#/components/parameters/Alias",
+        "#/components/parameters/Limit",
+    )
+
+
+def test_referenced_path_parameter_satisfies_path_placeholder() -> None:
+    endpoint = make_endpoint(
+        "/items/{item_id}", parameters=(parameter_reference("ItemId"),)
+    )
+    result = make_result_with_parameters(
+        endpoint,
+        {
+            "ItemId": Parameter(
+                name="item_id",
+                location="path",
+                required=True,
+                schema=Schema(raw={"type": "string", "example": "item-1"}),
+                source_scope="component",
+            )
+        },
+    )
+
+    suite = generate_test_suite(result)
+
+    assert suite.diagnostics == ()
+    assert suite.cases[0].parameters[0].name == "item_id"
+    assert suite.cases[0].parameters[0].value == "item-1"
+
+
+def test_parameter_reference_cycle_emits_diagnostic_without_case() -> None:
+    endpoint = make_endpoint("/items", parameters=(parameter_reference("A"),))
+    result = make_result_with_parameters(
+        endpoint,
+        {"A": parameter_reference("B"), "B": parameter_reference("A")},
+    )
+
+    suite = generate_test_suite(result)
+
+    assert suite.cases == ()
+    assert len(suite.diagnostics) == 1
+    assert suite.diagnostics[0].code == "unsupported_parameter_reference"
+    assert suite.diagnostics[0].reference_uri == "#/components/parameters/A"
+
+
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "#/components/schemas/Limit",
+        "#/components/parameters/Limit/schema",
+        "#/components/parameters/",
+    ],
+)
+def test_unsupported_parameter_reference_forms_emit_diagnostic(uri: str) -> None:
+    endpoint = make_endpoint(
+        "/items",
+        parameters=(
+            ParameterReference(
+                reference=LocalReference(uri=uri), source_scope="operation"
+            ),
+        ),
+    )
+
+    suite = generate_test_suite(make_result(endpoint))
+
+    assert suite.cases == ()
+    assert len(suite.diagnostics) == 1
+    assert suite.diagnostics[0].code == "unsupported_parameter_reference"
+    assert suite.diagnostics[0].reference_uri == uri
+
+
+def test_referenced_required_parameter_gets_omission_case() -> None:
+    endpoint = make_endpoint("/items", parameters=(parameter_reference("Limit"),))
+    result = make_result_with_parameters(
+        endpoint,
+        {
+            "Limit": Parameter(
+                name="limit",
+                location="query",
+                required=True,
+                schema=Schema(raw={"type": "integer", "example": 7}),
+                source_scope="component",
+            )
+        },
+    )
+
+    suite = generate_test_suite(result)
+
+    assert suite.diagnostics == ()
+    assert [case.category for case in suite.cases] == ["positive", "negative"]
+    negative = suite.cases[1]
+    assert negative.violated_constraint == "required_parameter"
+    assert negative.parameters == ()
+    assert negative.case_id == build_case_id(
+        "negative", "/items", "get", "required-parameter:query:5:limit"
+    )
+    assert negative.provenance[-3:] == (
+        "/paths/~1items/get/parameters/0",
+        "#/components/parameters/Limit",
+        "violated_constraint:required_parameter:query:limit",
+    )
+
+
+def test_referenced_parameter_alias_chain_omission_records_followed_references() -> None:
+    endpoint = make_endpoint("/items", parameters=(parameter_reference("Alias"),))
+    result = make_result_with_parameters(
+        endpoint,
+        {
+            "Alias": parameter_reference("Limit"),
+            "Limit": Parameter(
+                name="limit",
+                location="header",
+                required=True,
+                schema=Schema(raw={"type": "integer", "example": 7}),
+                source_scope="component",
+            ),
+        },
+    )
+
+    negative = generate_test_suite(result).cases[1]
+
+    assert negative.provenance[-4:] == (
+        "/paths/~1items/get/parameters/0",
+        "#/components/parameters/Alias",
+        "#/components/parameters/Limit",
+        "violated_constraint:required_parameter:header:limit",
+    )
+
+
+def test_referenced_optional_and_path_parameters_get_no_omission_case() -> None:
+    endpoint = make_endpoint(
+        "/items/{item_id}",
+        parameters=(parameter_reference("ItemId"), parameter_reference("Verbose")),
+    )
+    result = make_result_with_parameters(
+        endpoint,
+        {
+            "ItemId": Parameter(
+                name="item_id",
+                location="path",
+                required=True,
+                schema=Schema(raw={"type": "string", "example": "item-1"}),
+                source_scope="component",
+            ),
+            "Verbose": Parameter(
+                name="verbose",
+                location="query",
+                required=False,
+                schema=Schema(raw={"type": "boolean"}),
+                source_scope="component",
+            ),
+        },
+    )
+
+    suite = generate_test_suite(result)
+
+    assert suite.diagnostics == ()
+    assert [case.category for case in suite.cases] == ["positive"]
