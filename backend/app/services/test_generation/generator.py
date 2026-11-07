@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from contextvars import ContextVar
 from copy import deepcopy
 import math
 from decimal import Decimal, InvalidOperation, localcontext
 from hashlib import sha256
+from types import MappingProxyType
 from typing import Any
 from urllib.parse import unquote
 
@@ -42,6 +45,14 @@ _SCHEMA_KEYS = {
 _COMPOSITIONS = {"allOf", "oneOf", "anyOf", "not"}
 _MAX_DEPTH = 32
 _MAX_COLLECTION_SIZE = 100
+_SCHEMA_REFERENCE_PREFIX = "#/components/schemas/"
+_SCHEMA_REFERENCE_ANNOTATIONS = {"description", "title", "summary"}
+# Component schemas for the generation call in progress. Set by
+# generate_test_suite so the private schema helpers can follow local references
+# lazily without changing their signatures.
+_SCHEMA_COMPONENTS: ContextVar[Mapping[str, Schema]] = ContextVar(
+    "_SCHEMA_COMPONENTS", default=MappingProxyType({})
+)
 
 
 class _UnsupportedOperation(Exception):
@@ -71,6 +82,14 @@ def generate_test_suite(result: NormalizationResult) -> GeneratedTestSuite:
     if not isinstance(result, NormalizationResult):
         raise TypeError("result must be a NormalizationResult")
 
+    token = _SCHEMA_COMPONENTS.set(result.api.components.schemas)
+    try:
+        return _generate_suite(result)
+    finally:
+        _SCHEMA_COMPONENTS.reset(token)
+
+
+def _generate_suite(result: NormalizationResult) -> GeneratedTestSuite:
     cases: list[GeneratedTestCase] = []
     diagnostics: list[GenerationDiagnostic] = []
     for endpoint in result.api.endpoints:
@@ -1584,19 +1603,21 @@ def _generate_endpoint(endpoint: Endpoint, api: ApiModel) -> GeneratedTestCase:
             )
 
         schema_pointer = _child(declaration, "schema")
-        raw = entry.schema.raw
-        if not _is_primitive_schema(raw, api.openapi_version, schema_pointer):
+        raw, resolved_pointer, schema_followed = _follow_schema_reference(
+            entry.schema.raw, schema_pointer
+        )
+        if not _is_primitive_schema(raw, api.openapi_version, resolved_pointer):
             raise _UnsupportedOperation(
                 "unsupported_parameter_schema",
                 "This stage supports direct primitive parameter schemas only.",
-                schema_pointer,
+                resolved_pointer,
                 _reference_uri(raw),
             )
         value, candidate_pointer = _select_value(
             raw,
             api.openapi_version,
             _parameter_examples(entry, declaration),
-            schema_pointer,
+            resolved_pointer,
             direction="request",
         )
         if entry.required or entry.location == "path":
@@ -1606,7 +1627,16 @@ def _generate_endpoint(endpoint: Endpoint, api: ApiModel) -> GeneratedTestCase:
                     location=entry.location,
                     value=deepcopy(value),
                     provenance=tuple(
-                        dict.fromkeys((pointer, *followed, schema_pointer, candidate_pointer))
+                        dict.fromkeys(
+                            (
+                                pointer,
+                                *followed,
+                                schema_pointer,
+                                *schema_followed,
+                                resolved_pointer,
+                                candidate_pointer,
+                            )
+                        )
                     ),
                 )
             )
@@ -1716,25 +1746,27 @@ def _generate_body(
         )
     schema_pointer = _child(media_pointer, "schema")
     raw = media.schema.raw if media.schema is not None else {}
-    if _reference_uri(raw):
-        raise _UnsupportedOperation(
-            "unsupported_schema_reference",
-            "Schema references are not resolved in this stage.",
-            schema_pointer,
-            _reference_uri(raw),
-        )
+    raw, resolved_pointer, schema_followed = _follow_schema_reference(raw, schema_pointer)
     value, candidate_pointer = _select_value(
         raw,
         version,
         _media_examples(media, media_pointer),
-        schema_pointer,
+        resolved_pointer,
         direction="request",
     )
     return (
         GeneratedBody(media_type="application/json", value=deepcopy(value)),
         tuple(
             dict.fromkeys(
-                (endpoint_body_pointer, *followed, pointer, schema_pointer, candidate_pointer)
+                (
+                    endpoint_body_pointer,
+                    *followed,
+                    pointer,
+                    schema_pointer,
+                    *schema_followed,
+                    resolved_pointer,
+                    candidate_pointer,
+                )
             )
         ),
     )
@@ -1807,6 +1839,66 @@ def _example_value(example: Any, pointer: str) -> tuple[Any, str]:
     return example["value"], _child(pointer, "value")
 
 
+def _follow_schema_reference(raw: Any, pointer: str) -> tuple[Any, str, tuple[str, ...]]:
+    """Follow local #/components/schemas references to a non-reference schema.
+
+    Returns the schema, the pointer of its declaration and the reference URIs
+    followed, in order. A schema without $ref is returned unchanged. Only
+    annotation keywords may sit next to $ref.
+    """
+    followed: list[str] = []
+    components = _SCHEMA_COMPONENTS.get()
+    current_pointer = pointer
+    while (uri := _reference_uri(raw)) is not None:
+        if uri in followed:
+            raise _UnsupportedOperation(
+                "unsupported_schema_reference", "Schema reference cycle.", current_pointer, uri
+            )
+        followed.append(uri)
+        siblings = sorted(
+            key
+            for key in raw
+            if key != "$ref"
+            and key not in _SCHEMA_REFERENCE_ANNOTATIONS
+            and not key.startswith("x-")
+        )
+        if siblings:
+            raise _UnsupportedOperation(
+                "unsupported_schema_reference_siblings",
+                "Only description, title, summary and x- keywords are supported next to $ref.",
+                _child(current_pointer, siblings[0]),
+                uri,
+            )
+        segment = uri[len(_SCHEMA_REFERENCE_PREFIX) :]
+        if not uri.startswith(_SCHEMA_REFERENCE_PREFIX) or not segment or "/" in segment:
+            raise _UnsupportedOperation(
+                "unsupported_schema_reference",
+                "Only #/components/schemas/<name> references are supported.",
+                current_pointer,
+                uri,
+            )
+        name = unquote(segment).replace("~1", "/").replace("~0", "~")
+        target = components.get(name)
+        if target is None:
+            raise _UnsupportedOperation(
+                "unsupported_schema_reference",
+                "Schema reference target was not found.",
+                current_pointer,
+                uri,
+            )
+        raw = target.raw
+        current_pointer = _pointer("components", "schemas", name)
+    return raw, current_pointer, tuple(followed)
+
+
+def _is_request_read_only(child: Any, direction: str, pointer: str) -> bool:
+    """Report whether a property schema, after following $ref, is readOnly in a request."""
+    if direction != "request":
+        return False
+    resolved, _, _ = _follow_schema_reference(child, pointer)
+    return isinstance(resolved, dict) and resolved.get("readOnly") is True
+
+
 def _select_value(
     raw: Any,
     version: str,
@@ -1815,6 +1907,7 @@ def _select_value(
     *,
     direction: str,
 ) -> tuple[Any, str]:
+    raw, pointer, _ = _follow_schema_reference(raw, pointer)
     schema = _check_schema(raw, version, pointer, direction, 0)
     if schema is True:
         return None, pointer
@@ -1878,11 +1971,9 @@ def _check_schema(
         return raw
     if not isinstance(raw, dict):
         raise _UnsupportedOperation("unsupported_schema_form", "Schema must be an object or boolean.", pointer)
-    reference = _reference_uri(raw)
-    if reference:
-        raise _UnsupportedOperation(
-            "unsupported_schema_reference", "Schema references are not resolved in this stage.", pointer, reference
-        )
+    if _reference_uri(raw):
+        target, target_pointer, _ = _follow_schema_reference(raw, pointer)
+        return _check_schema(target, version, target_pointer, direction, depth + 1)
     composition = _COMPOSITIONS.intersection(raw)
     if composition:
         key = sorted(composition)[0]
@@ -1955,7 +2046,7 @@ def _check_schema(
             # report that no targeted omission case can be derived for it.
             continue
         child = properties[name]
-        if direction == "request" and isinstance(child, dict) and child.get("readOnly") is True:
+        if _is_request_read_only(child, direction, _child(pointer, "properties", name)):
             continue
         _check_schema(child, version, _child(pointer, "properties", name), direction, depth + 1)
     if "items" in raw and raw.get("minItems", 0) > 0:
@@ -2026,7 +2117,7 @@ def _matches(schema: dict[str, Any], value: Any, version: str, direction: str, d
         required = schema.get("required", [])
         for name in required:
             child = properties.get(name)
-            if direction == "request" and isinstance(child, dict) and child.get("readOnly") is True:
+            if _is_request_read_only(child, direction, f"/properties/{name}"):
                 continue
             if name not in value:
                 return False
@@ -2034,7 +2125,7 @@ def _matches(schema: dict[str, Any], value: Any, version: str, direction: str, d
             child = properties.get(name)
             if child is None:
                 continue
-            if direction == "request" and isinstance(child, dict) and child.get("readOnly") is True:
+            if _is_request_read_only(child, direction, f"/properties/{name}"):
                 return False
             child_schema = _check_schema(child, version, f"/properties/{name}", direction, depth + 1)
             if child_schema is False or (isinstance(child_schema, dict) and not _matches(child_schema, child_value, version, direction, depth + 1)):
@@ -2131,7 +2222,7 @@ def _fallback_values(schema: dict[str, Any], version: str, pointer: str, directi
                 value[name] = None
                 continue
             child = properties[name]
-            if direction == "request" and isinstance(child, dict) and child.get("readOnly") is True:
+            if _is_request_read_only(child, direction, _child(pointer, "properties", name)):
                 continue
             child_value, _ = _select_value(
                 child, version, [], _child(pointer, "properties", name), direction=direction

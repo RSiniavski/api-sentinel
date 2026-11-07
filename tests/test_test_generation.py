@@ -3507,3 +3507,284 @@ def test_alias_chain_request_body_gets_negative_cases_with_followed_references()
     assert suite.diagnostics == ()
     assert "#/components/requestBodies/Alias" in omission.provenance
     assert "#/components/requestBodies/NewItem" in omission.provenance
+
+
+def make_result_with_schemas(
+    endpoint: Endpoint, schemas: dict[str, object]
+) -> NormalizationResult:
+    return NormalizationResult(
+        api=ApiModel(
+            openapi_version="3.1.1",
+            info=ApiInfo(title="Generated API", version="1.0"),
+            endpoints=(endpoint,),
+            components=Components(
+                schemas={name: Schema(raw=raw) for name, raw in schemas.items()}
+            ),
+        )
+    )
+
+
+def schema_reference(name: str) -> dict[str, object]:
+    return {"$ref": f"#/components/schemas/{name}"}
+
+
+def body_with_schema(raw_schema: object) -> RequestBody:
+    return RequestBody(
+        required=True,
+        content={"application/json": MediaType(schema=Schema(raw=raw_schema))},
+    )
+
+
+STATUS_SCHEMA: dict[str, object] = {"type": "string", "enum": ["new", "old"]}
+
+
+def test_parameter_schema_reference_resolves_to_component_schema() -> None:
+    endpoint = make_endpoint(
+        "/items",
+        parameters=(
+            Parameter(
+                name="status",
+                location="query",
+                required=True,
+                schema=Schema(raw=schema_reference("Status")),
+                source_scope="operation",
+            ),
+        ),
+        responses=BAD_REQUEST,
+    )
+
+    suite = generate_test_suite(make_result_with_schemas(endpoint, {"Status": STATUS_SCHEMA}))
+
+    assert suite.diagnostics == ()
+    parameter = suite.cases[0].parameters[0]
+    assert parameter.value == "new"
+    assert parameter.provenance == (
+        "/paths/~1items/get/parameters/0",
+        "/paths/~1items/get/parameters/0/schema",
+        "#/components/schemas/Status",
+        "/components/schemas/Status",
+        "/components/schemas/Status/enum/0",
+    )
+
+
+def test_schema_reference_alias_chain_records_every_followed_reference() -> None:
+    endpoint = make_endpoint(
+        "/items",
+        parameters=(
+            Parameter(
+                name="status",
+                location="query",
+                required=True,
+                schema=Schema(raw=schema_reference("Alias")),
+                source_scope="operation",
+            ),
+        ),
+        responses=BAD_REQUEST,
+    )
+
+    suite = generate_test_suite(
+        make_result_with_schemas(
+            endpoint, {"Alias": schema_reference("Status"), "Status": STATUS_SCHEMA}
+        )
+    )
+
+    assert suite.diagnostics == ()
+    assert suite.cases[0].parameters[0].provenance[2:5] == (
+        "#/components/schemas/Alias",
+        "#/components/schemas/Status",
+        "/components/schemas/Status",
+    )
+
+
+def test_request_body_schema_reference_resolves_to_component_schema() -> None:
+    item = {
+        "type": "object",
+        "required": ["name", "qty"],
+        "properties": {
+            "name": {"type": "string", "example": "widget"},
+            "qty": {"type": "integer", "minimum": 1, "maximum": 9, "example": 3},
+        },
+    }
+    endpoint = make_endpoint(
+        "/items",
+        "post",
+        request_body=body_with_schema(schema_reference("Item")),
+        responses=BAD_REQUEST,
+    )
+
+    suite = generate_test_suite(make_result_with_schemas(endpoint, {"Item": item}))
+
+    inline = generate_test_suite(
+        make_result(
+            make_endpoint("/items", "post", request_body=body_with_schema(item), responses=BAD_REQUEST)
+        )
+    )
+    positive = suite.cases[0]
+    assert positive.request_body is not None
+    assert positive.request_body.value == {"name": "widget", "qty": 3}
+    assert positive.request_body == inline.cases[0].request_body
+    assert positive.provenance[-3:] == (
+        "/paths/~1items/post/requestBody/content/application~1json/schema",
+        "#/components/schemas/Item",
+        "/components/schemas/Item",
+    )
+
+
+def test_nested_schema_references_are_followed_and_read_only_target_is_skipped() -> None:
+    body = {
+        "type": "object",
+        "required": ["id", "name", "tags"],
+        "properties": {
+            "id": schema_reference("Id"),
+            "name": schema_reference("Name"),
+            "tags": {"type": "array", "minItems": 1, "items": schema_reference("Name")},
+        },
+    }
+    endpoint = make_endpoint(
+        "/items", "post", request_body=body_with_schema(body), responses=BAD_REQUEST
+    )
+
+    suite = generate_test_suite(
+        make_result_with_schemas(
+            endpoint,
+            {
+                "Id": {"type": "integer", "readOnly": True},
+                "Name": {"type": "string", "example": "widget"},
+            },
+        )
+    )
+
+    positive = suite.cases[0]
+    assert positive.request_body is not None
+    assert positive.request_body.value == {"name": "widget", "tags": ["widget"]}
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [{"description": "A status"}, {"title": "Status", "summary": "s"}, {"x-note": 1}],
+)
+def test_annotation_keywords_next_to_schema_reference_are_allowed(
+    extra: dict[str, object],
+) -> None:
+    endpoint = make_endpoint(
+        "/items",
+        "post",
+        request_body=body_with_schema({**schema_reference("Status"), **extra}),
+        responses=BAD_REQUEST,
+    )
+
+    suite = generate_test_suite(make_result_with_schemas(endpoint, {"Status": STATUS_SCHEMA}))
+
+    assert suite.diagnostics == ()
+    assert suite.cases[0].request_body is not None
+    assert suite.cases[0].request_body.value == "new"
+
+
+def test_other_keywords_next_to_schema_reference_emit_diagnostic_without_case() -> None:
+    endpoint = make_endpoint(
+        "/items",
+        "post",
+        request_body=body_with_schema({**schema_reference("Status"), "maxLength": 2}),
+        responses=BAD_REQUEST,
+    )
+
+    suite = generate_test_suite(make_result_with_schemas(endpoint, {"Status": STATUS_SCHEMA}))
+
+    assert suite.cases == ()
+    assert len(suite.diagnostics) == 1
+    diagnostic = suite.diagnostics[0]
+    assert diagnostic.code == "unsupported_schema_reference_siblings"
+    assert diagnostic.reference_uri == "#/components/schemas/Status"
+    assert diagnostic.source_pointer is not None
+    assert diagnostic.source_pointer.endswith("/schema/maxLength")
+
+
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "#/components/schemas/Missing",
+        "#/components/parameters/Status",
+        "#/components/schemas/Status/enum",
+        "#/components/schemas/",
+    ],
+)
+def test_unsupported_schema_reference_forms_emit_diagnostic_without_case(uri: str) -> None:
+    endpoint = make_endpoint(
+        "/items",
+        "post",
+        request_body=body_with_schema({"$ref": uri}),
+        responses=BAD_REQUEST,
+    )
+
+    suite = generate_test_suite(make_result_with_schemas(endpoint, {"Status": STATUS_SCHEMA}))
+
+    assert suite.cases == ()
+    assert [item.code for item in suite.diagnostics] == ["unsupported_schema_reference"]
+    assert suite.diagnostics[0].reference_uri == uri
+
+
+def test_schema_reference_alias_cycle_emits_diagnostic_without_case() -> None:
+    endpoint = make_endpoint(
+        "/items",
+        "post",
+        request_body=body_with_schema(schema_reference("A")),
+        responses=BAD_REQUEST,
+    )
+
+    suite = generate_test_suite(
+        make_result_with_schemas(
+            endpoint, {"A": schema_reference("B"), "B": schema_reference("A")}
+        )
+    )
+
+    assert suite.cases == ()
+    assert [item.code for item in suite.diagnostics] == ["unsupported_schema_reference"]
+    assert suite.diagnostics[0].reference_uri == "#/components/schemas/A"
+
+
+def test_optional_recursive_schema_generates_and_required_recursion_is_reported() -> None:
+    optional = {
+        "type": "object",
+        "properties": {"next": schema_reference("Node")},
+    }
+    required = {
+        "type": "object",
+        "required": ["next"],
+        "properties": {"next": schema_reference("Node")},
+    }
+    endpoint = make_endpoint(
+        "/items",
+        "post",
+        request_body=body_with_schema(schema_reference("Node")),
+        responses=BAD_REQUEST,
+    )
+
+    optional_suite = generate_test_suite(make_result_with_schemas(endpoint, {"Node": optional}))
+    required_suite = generate_test_suite(make_result_with_schemas(endpoint, {"Node": required}))
+
+    assert optional_suite.diagnostics == ()
+    assert optional_suite.cases[0].request_body is not None
+    assert optional_suite.cases[0].request_body.value == {}
+    assert required_suite.cases == ()
+    assert [item.code for item in required_suite.diagnostics] == ["schema_depth_limit"]
+
+
+def test_schema_components_do_not_leak_between_generation_calls() -> None:
+    endpoint = make_endpoint(
+        "/items",
+        "post",
+        request_body=body_with_schema(schema_reference("Status")),
+        responses=BAD_REQUEST,
+    )
+
+    with_component = generate_test_suite(
+        make_result_with_schemas(endpoint, {"Status": STATUS_SCHEMA})
+    )
+    without_component = generate_test_suite(make_result_with_schemas(endpoint, {}))
+
+    assert with_component.cases[0].request_body is not None
+    assert without_component.cases == ()
+    assert [item.code for item in without_component.diagnostics] == [
+        "unsupported_schema_reference"
+    ]
+    assert dict(generator_module._SCHEMA_COMPONENTS.get()) == {}
