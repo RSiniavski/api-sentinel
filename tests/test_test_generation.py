@@ -3417,3 +3417,93 @@ def test_unsupported_request_body_reference_forms_emit_diagnostic(uri: str) -> N
     assert len(suite.diagnostics) == 1
     assert suite.diagnostics[0].code == "unsupported_request_body_reference"
     assert suite.diagnostics[0].reference_uri == uri
+
+
+BAD_REQUEST: dict[str, Response | LocalReference] = {"400": Response(description="Invalid request")}
+
+
+REFERENCED_BODY_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "required": ["name", "kind", "qty"],
+    "properties": {
+        "name": {"type": "string", "minLength": 2, "maxLength": 10, "example": "widget"},
+        "kind": {"type": "string", "enum": ["a", "b"]},
+        "qty": {"type": "integer", "minimum": 1, "maximum": 9, "example": 3},
+    },
+}
+
+
+def required_json_request_body() -> RequestBody:
+    return RequestBody(
+        required=True,
+        content={"application/json": MediaType(schema=Schema(raw=REFERENCED_BODY_SCHEMA))},
+    )
+
+
+def test_referenced_request_body_generates_same_negative_cases_as_inline_body() -> None:
+    inline = generate_test_suite(
+        make_result(
+            make_endpoint("/items", "post", request_body=required_json_request_body(), responses=BAD_REQUEST)
+        )
+    )
+    referenced = generate_test_suite(
+        make_result_with_request_bodies(
+            make_endpoint("/items", "post", request_body=request_body_reference("NewItem"), responses=BAD_REQUEST),
+            {"NewItem": required_json_request_body()},
+        )
+    )
+
+    def summary(suite: GeneratedTestSuite) -> list[tuple[object, ...]]:
+        return [
+            (case.case_id, case.category, case.violated_constraint, case.request_body)
+            for case in suite.cases
+        ]
+
+    assert inline.diagnostics == referenced.diagnostics == ()
+    assert len(inline.cases) > 5
+    assert summary(referenced) == summary(inline)
+
+
+def test_referenced_request_body_negative_cases_point_to_the_component() -> None:
+    suite = generate_test_suite(
+        make_result_with_request_bodies(
+            make_endpoint("/items", "post", request_body=request_body_reference("NewItem"), responses=BAD_REQUEST),
+            {"NewItem": required_json_request_body()},
+        )
+    )
+
+    omission = next(
+        case for case in suite.cases if case.violated_constraint == "required_request_body"
+    )
+    assert omission.provenance[-2:] == (
+        "/components/requestBodies/NewItem",
+        "violated_constraint:required_request_body",
+    )
+    schema_prefix = "/components/requestBodies/NewItem/content/application~1json/schema"
+    for case in suite.cases:
+        if case.violated_constraint in {None, "required_parameter", "required_request_body"}:
+            continue
+        assert any(item.startswith(schema_prefix) for item in case.provenance), case
+        assert not any(
+            item.startswith("/paths/~1items/post/requestBody/content")
+            for item in case.provenance
+        ), case
+
+
+def test_alias_chain_request_body_gets_negative_cases_with_followed_references() -> None:
+    suite = generate_test_suite(
+        make_result_with_request_bodies(
+            make_endpoint("/items", "post", request_body=request_body_reference("Alias"), responses=BAD_REQUEST),
+            {
+                "Alias": request_body_reference("NewItem"),
+                "NewItem": required_json_request_body(),
+            },
+        )
+    )
+
+    omission = next(
+        case for case in suite.cases if case.violated_constraint == "required_request_body"
+    )
+    assert suite.diagnostics == ()
+    assert "#/components/requestBodies/Alias" in omission.provenance
+    assert "#/components/requestBodies/NewItem" in omission.provenance

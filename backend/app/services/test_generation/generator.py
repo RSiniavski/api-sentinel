@@ -78,22 +78,22 @@ def generate_test_suite(result: NormalizationResult) -> GeneratedTestSuite:
             positive = _generate_endpoint(endpoint, result.api)
             cases.append(positive)
             negative_cases, negative_diagnostics = _required_property_negative_cases(
-                endpoint, positive
+                endpoint, positive, result.api
             )
             cases.extend(negative_cases)
             diagnostics.extend(negative_diagnostics)
             numeric_cases, numeric_diagnostics = _numeric_boundary_negative_cases(
-                endpoint, positive, result.api.openapi_version
+                endpoint, positive, result.api
             )
             cases.extend(numeric_cases)
             diagnostics.extend(numeric_diagnostics)
             wrong_type_cases, wrong_type_diagnostics = _wrong_type_negative_cases(
-                endpoint, positive, result.api.openapi_version
+                endpoint, positive, result.api
             )
             cases.extend(wrong_type_cases)
             diagnostics.extend(wrong_type_diagnostics)
             string_cases, string_diagnostics = _string_boundary_negative_cases(
-                endpoint, positive, result.api.openapi_version
+                endpoint, positive, result.api
             )
             cases.extend(string_cases)
             diagnostics.extend(string_diagnostics)
@@ -101,11 +101,13 @@ def generate_test_suite(result: NormalizationResult) -> GeneratedTestSuite:
                 endpoint, positive, result.api
             )
             cases.extend(parameter_cases)
-            request_body_case = _required_request_body_negative_case(endpoint, positive)
+            request_body_case = _required_request_body_negative_case(
+                endpoint, positive, result.api
+            )
             if request_body_case is not None:
                 cases.append(request_body_case)
             enum_const_cases, enum_const_diagnostics = _enum_const_negative_cases(
-                endpoint, positive, result.api.openapi_version
+                endpoint, positive, result.api
             )
             cases.extend(enum_const_cases)
             diagnostics.extend(enum_const_diagnostics)
@@ -128,6 +130,26 @@ def generate_test_suite(result: NormalizationResult) -> GeneratedTestSuite:
         cases=tuple(cases),
         diagnostics=tuple(diagnostics),
     )
+
+
+def _resolved_request_body(
+    endpoint: Endpoint, api: ApiModel
+) -> tuple[RequestBody, str] | None:
+    """Resolve the endpoint request body for negative-case generation.
+
+    Returns the RequestBody and the pointer of its declaration, or None when
+    the endpoint has no body or it cannot be resolved. The positive baseline
+    has already reported any resolution problem.
+    """
+    entry = endpoint.request_body
+    if entry is None:
+        return None
+    pointer = _child(_endpoint_pointer(endpoint), "requestBody")
+    try:
+        resolved, declaration, _ = _resolve_request_body(entry, api, pointer)
+    except _UnsupportedOperation:
+        return None
+    return resolved, declaration
 
 
 def _required_parameter_negative_cases(
@@ -183,18 +205,14 @@ def _required_parameter_negative_cases(
 
 
 def _required_request_body_negative_case(
-    endpoint: Endpoint, positive: GeneratedTestCase
+    endpoint: Endpoint, positive: GeneratedTestCase, api: ApiModel
 ) -> GeneratedTestCase | None:
     """Omit a required request body when the positive baseline generated one."""
-    request_body = endpoint.request_body
-    if (
-        not isinstance(request_body, RequestBody)
-        or not request_body.required
-        or positive.request_body is None
-    ):
+    resolved = _resolved_request_body(endpoint, api)
+    if resolved is None or not resolved[0].required or positive.request_body is None:
         return None
 
-    pointer = _child(_endpoint_pointer(endpoint), "requestBody")
+    pointer = resolved[1]
     return GeneratedTestCase(
         case_id=build_case_id(
             "negative", endpoint.path, endpoint.method, "required-request-body"
@@ -217,12 +235,13 @@ def _required_request_body_negative_case(
 
 
 def _required_property_negative_cases(
-    endpoint: Endpoint, positive: GeneratedTestCase
+    endpoint: Endpoint, positive: GeneratedTestCase, api: ApiModel
 ) -> tuple[tuple[GeneratedTestCase, ...], tuple[GenerationDiagnostic, ...]]:
     """Omit each required writable object property from its positive body."""
-    request_body = endpoint.request_body
-    if not isinstance(request_body, RequestBody):
+    resolved = _resolved_request_body(endpoint, api)
+    if resolved is None:
         return (), ()
+    request_body, body_pointer = resolved
     if set(request_body.content) != {"application/json"}:
         return (), ()
     media = request_body.content["application/json"]
@@ -232,13 +251,7 @@ def _required_property_negative_cases(
         return (), ()
 
     raw_schema = media.schema.raw
-    schema_pointer = _child(
-        _endpoint_pointer(endpoint),
-        "requestBody",
-        "content",
-        "application/json",
-        "schema",
-    )
+    schema_pointer = _child(body_pointer, "content", "application/json", "schema")
     property_paths, undeclared_required = _required_writable_property_paths(
         raw_schema, positive.request_body.value, schema_pointer=schema_pointer
     )
@@ -315,21 +328,21 @@ def _required_property_negative_cases(
 
 
 def _wrong_type_negative_cases(
-    endpoint: Endpoint, positive: GeneratedTestCase, version: str
+    endpoint: Endpoint, positive: GeneratedTestCase, api: ApiModel
 ) -> tuple[tuple[GeneratedTestCase, ...], tuple[GenerationDiagnostic, ...]]:
     """Replace one present body property with a deterministic incompatible type."""
-    request_body = endpoint.request_body
-    if not isinstance(request_body, RequestBody) or positive.request_body is None:
+    version = api.openapi_version
+    resolved = _resolved_request_body(endpoint, api)
+    if resolved is None or positive.request_body is None:
         return (), ()
+    request_body, body_pointer = resolved
     if set(request_body.content) != {"application/json"}:
         return (), ()
     media = request_body.content["application/json"]
     if media.schema is None or not isinstance(media.schema.raw, dict):
         return (), ()
 
-    root_pointer = _child(
-        _endpoint_pointer(endpoint), "requestBody", "content", "application/json", "schema"
-    )
+    root_pointer = _child(body_pointer, "content", "application/json", "schema")
     raw_schema = media.schema.raw
     body_value = positive.request_body.value
     targets: list[tuple[tuple[str, ...], tuple[str, ...], Any, str]] = []
@@ -447,21 +460,21 @@ def _wrong_type_negative_cases(
 
 
 def _enum_const_negative_cases(
-    endpoint: Endpoint, positive: GeneratedTestCase, version: str
+    endpoint: Endpoint, positive: GeneratedTestCase, api: ApiModel
 ) -> tuple[tuple[GeneratedTestCase, ...], tuple[GenerationDiagnostic, ...]]:
     """Violate enum/const on present primitive request-body properties."""
-    request_body = endpoint.request_body
-    if not isinstance(request_body, RequestBody) or positive.request_body is None:
+    version = api.openapi_version
+    resolved = _resolved_request_body(endpoint, api)
+    if resolved is None or positive.request_body is None:
         return (), ()
+    request_body, body_pointer = resolved
     if set(request_body.content) != {"application/json"}:
         return (), ()
     media = request_body.content["application/json"]
     if media.schema is None or not isinstance(media.schema.raw, dict):
         return (), ()
 
-    body_schema_pointer = _child(
-        _endpoint_pointer(endpoint), "requestBody", "content", "application/json", "schema"
-    )
+    body_schema_pointer = _child(body_pointer, "content", "application/json", "schema")
     body_value = positive.request_body.value
     targets: list[tuple[tuple[str, ...], str, str, Any]] = []
     diagnostics: list[GenerationDiagnostic] = []
@@ -688,21 +701,21 @@ def _json_value_type(value: Any) -> str:
 
 
 def _string_boundary_negative_cases(
-    endpoint: Endpoint, positive: GeneratedTestCase, version: str
+    endpoint: Endpoint, positive: GeneratedTestCase, api: ApiModel
 ) -> tuple[tuple[GeneratedTestCase, ...], tuple[GenerationDiagnostic, ...]]:
     """Generate safe minLength and maxLength violations for present properties."""
-    request_body = endpoint.request_body
-    if not isinstance(request_body, RequestBody) or positive.request_body is None:
+    version = api.openapi_version
+    resolved = _resolved_request_body(endpoint, api)
+    if resolved is None or positive.request_body is None:
         return (), ()
+    request_body, body_pointer = resolved
     if set(request_body.content) != {"application/json"}:
         return (), ()
     media = request_body.content["application/json"]
     if media.schema is None or not isinstance(media.schema.raw, dict):
         return (), ()
 
-    root_pointer = _child(
-        _endpoint_pointer(endpoint), "requestBody", "content", "application/json", "schema"
-    )
+    root_pointer = _child(body_pointer, "content", "application/json", "schema")
     targets: list[tuple[tuple[str, ...], str, str, str]] = []
     diagnostics: list[GenerationDiagnostic] = []
 
@@ -888,12 +901,14 @@ def _string_boundary_diagnostic(
 
 
 def _numeric_boundary_negative_cases(
-    endpoint: Endpoint, positive: GeneratedTestCase, version: str
+    endpoint: Endpoint, positive: GeneratedTestCase, api: ApiModel
 ) -> tuple[tuple[GeneratedTestCase, ...], tuple[GenerationDiagnostic, ...]]:
     """Generate one negative body candidate per safely targetable numeric bound."""
-    request_body = endpoint.request_body
-    if not isinstance(request_body, RequestBody) or positive.request_body is None:
+    version = api.openapi_version
+    resolved = _resolved_request_body(endpoint, api)
+    if resolved is None or positive.request_body is None:
         return (), ()
+    request_body, body_pointer = resolved
     if set(request_body.content) != {"application/json"}:
         return (), ()
     media = request_body.content["application/json"]
@@ -901,9 +916,7 @@ def _numeric_boundary_negative_cases(
         return (), ()
 
     schema = media.schema.raw
-    root_pointer = _child(
-        _endpoint_pointer(endpoint), "requestBody", "content", "application/json", "schema"
-    )
+    root_pointer = _child(body_pointer, "content", "application/json", "schema")
     body_value = positive.request_body.value
     targets: list[tuple[tuple[str, ...], dict[str, Any], str, str]] = []
     _collect_numeric_targets(schema, (), root_pointer, targets)
