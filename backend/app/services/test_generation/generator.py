@@ -1601,7 +1601,7 @@ def _generate_endpoint(endpoint: Endpoint, api: ApiModel) -> GeneratedTestCase:
                 path_names.add(entry.name)
 
     _check_path_placeholders(endpoint.path, path_names, _child(root, "parameters"))
-    body, body_provenance = _generate_body(endpoint, api.openapi_version, root)
+    body, body_provenance = _generate_body(endpoint, api, root)
     expectations = _response_expectations(endpoint, root)
     security = endpoint.security if endpoint.security is not None else api.security
 
@@ -1618,22 +1618,74 @@ def _generate_endpoint(endpoint: Endpoint, api: ApiModel) -> GeneratedTestCase:
     )
 
 
+_REQUEST_BODY_REFERENCE_PREFIX = "#/components/requestBodies/"
+
+
+def _resolve_request_body(
+    entry: RequestBody | LocalReference, api: ApiModel, pointer: str
+) -> tuple[RequestBody, str, tuple[str, ...]]:
+    """Follow local component request body references to a concrete RequestBody.
+
+    Returns the RequestBody, the pointer of its declaration and the reference
+    URIs followed, in order.
+    """
+    if isinstance(entry, RequestBody):
+        return entry, pointer, ()
+
+    followed: list[str] = []
+    declaration = pointer
+    current: RequestBody | LocalReference = entry
+    while isinstance(current, LocalReference):
+        uri = current.uri
+        if uri in followed:
+            raise _UnsupportedOperation(
+                "unsupported_request_body_reference",
+                "Request body reference cycle.",
+                pointer,
+                uri,
+            )
+        followed.append(uri)
+        segment = uri[len(_REQUEST_BODY_REFERENCE_PREFIX) :]
+        if (
+            not uri.startswith(_REQUEST_BODY_REFERENCE_PREFIX)
+            or not segment
+            or "/" in segment
+        ):
+            raise _UnsupportedOperation(
+                "unsupported_request_body_reference",
+                "Only #/components/requestBodies/<name> references are supported.",
+                pointer,
+                uri,
+            )
+        name = unquote(segment).replace("~1", "/").replace("~0", "~")
+        target = api.components.request_bodies.get(name)
+        if target is None:
+            raise _UnsupportedOperation(
+                "unsupported_request_body_reference",
+                "Request body reference target was not found.",
+                pointer,
+                uri,
+            )
+        declaration = _pointer("components", "requestBodies", name)
+        current = target
+    return current, declaration, tuple(followed)
+
+
 def _generate_body(
-    endpoint: Endpoint, version: str, endpoint_pointer: str
+    endpoint: Endpoint, api: ApiModel, endpoint_pointer: str
 ) -> tuple[GeneratedBody | None, tuple[str, ...]]:
-    entry = endpoint.request_body
-    if entry is None:
+    version = api.openapi_version
+    endpoint_entry = endpoint.request_body
+    if endpoint_entry is None:
         return None, ()
-    pointer = _child(endpoint_pointer, "requestBody")
-    if isinstance(entry, LocalReference):
+    endpoint_body_pointer = _child(endpoint_pointer, "requestBody")
+    if not isinstance(endpoint_entry, (RequestBody, LocalReference)):
         raise _UnsupportedOperation(
-            "unsupported_request_body_reference",
-            "Request Body references are not resolved in this stage.",
-            pointer,
-            entry.uri,
+            "unsupported_request_body", "Unsupported request body entry.", endpoint_body_pointer
         )
-    if not isinstance(entry, RequestBody):
-        raise _UnsupportedOperation("unsupported_request_body", "Unsupported request body entry.", pointer)
+    entry, pointer, followed = _resolve_request_body(
+        endpoint_entry, api, endpoint_body_pointer
+    )
     if set(entry.content) != {"application/json"}:
         raise _UnsupportedOperation(
             "unsupported_request_media_type",
@@ -1667,7 +1719,11 @@ def _generate_body(
     )
     return (
         GeneratedBody(media_type="application/json", value=deepcopy(value)),
-        tuple(dict.fromkeys((pointer, schema_pointer, candidate_pointer))),
+        tuple(
+            dict.fromkeys(
+                (endpoint_body_pointer, *followed, pointer, schema_pointer, candidate_pointer)
+            )
+        ),
     )
 
 

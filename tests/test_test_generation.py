@@ -3311,3 +3311,109 @@ def test_referenced_optional_and_path_parameters_get_no_omission_case() -> None:
 
     assert suite.diagnostics == ()
     assert [case.category for case in suite.cases] == ["positive"]
+
+
+def make_result_with_request_bodies(
+    endpoint: Endpoint, request_bodies: dict[str, RequestBody | LocalReference]
+) -> NormalizationResult:
+    return NormalizationResult(
+        api=ApiModel(
+            openapi_version="3.1.1",
+            info=ApiInfo(title="Generated API", version="1.0"),
+            endpoints=(endpoint,),
+            components=Components(request_bodies=request_bodies),
+        )
+    )
+
+
+def request_body_reference(name: str) -> LocalReference:
+    return LocalReference(uri=f"#/components/requestBodies/{name}")
+
+
+def json_request_body(raw_schema: dict[str, object]) -> RequestBody:
+    return RequestBody(
+        required=False,
+        content={"application/json": MediaType(schema=Schema(raw=raw_schema))},
+    )
+
+
+def test_request_body_reference_resolves_to_component_request_body() -> None:
+    endpoint = make_endpoint(
+        "/items", "post", request_body=request_body_reference("NewItem")
+    )
+    result = make_result_with_request_bodies(
+        endpoint,
+        {"NewItem": json_request_body({"type": "string", "example": "widget"})},
+    )
+
+    suite = generate_test_suite(result)
+
+    assert suite.diagnostics == ()
+    body = suite.cases[0].request_body
+    assert body is not None
+    assert (body.media_type, body.value) == ("application/json", "widget")
+    assert suite.cases[0].provenance[-5:] == (
+        "/paths/~1items/post/requestBody",
+        "#/components/requestBodies/NewItem",
+        "/components/requestBodies/NewItem",
+        "/components/requestBodies/NewItem/content/application~1json/schema",
+        "/components/requestBodies/NewItem/content/application~1json/schema/example",
+    )
+
+
+def test_request_body_reference_alias_chain_records_every_followed_reference() -> None:
+    endpoint = make_endpoint(
+        "/items", "post", request_body=request_body_reference("Alias")
+    )
+    result = make_result_with_request_bodies(
+        endpoint,
+        {
+            "Alias": request_body_reference("NewItem"),
+            "NewItem": json_request_body({"type": "string", "example": "widget"}),
+        },
+    )
+
+    suite = generate_test_suite(result)
+
+    assert suite.diagnostics == ()
+    assert suite.cases[0].provenance[1:4] == (
+        "/paths/~1items/post/requestBody",
+        "#/components/requestBodies/Alias",
+        "#/components/requestBodies/NewItem",
+    )
+
+
+def test_request_body_reference_cycle_emits_diagnostic_without_case() -> None:
+    endpoint = make_endpoint("/items", "post", request_body=request_body_reference("A"))
+    result = make_result_with_request_bodies(
+        endpoint,
+        {"A": request_body_reference("B"), "B": request_body_reference("A")},
+    )
+
+    suite = generate_test_suite(result)
+
+    assert suite.cases == ()
+    assert len(suite.diagnostics) == 1
+    assert suite.diagnostics[0].code == "unsupported_request_body_reference"
+    assert suite.diagnostics[0].reference_uri == "#/components/requestBodies/A"
+
+
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "#/components/schemas/NewItem",
+        "#/components/requestBodies/NewItem/content",
+        "#/components/requestBodies/",
+    ],
+)
+def test_unsupported_request_body_reference_forms_emit_diagnostic(uri: str) -> None:
+    endpoint = make_endpoint(
+        "/items", "post", request_body=LocalReference(uri=uri)
+    )
+
+    suite = generate_test_suite(make_result(endpoint))
+
+    assert suite.cases == ()
+    assert len(suite.diagnostics) == 1
+    assert suite.diagnostics[0].code == "unsupported_request_body_reference"
+    assert suite.diagnostics[0].reference_uri == uri
