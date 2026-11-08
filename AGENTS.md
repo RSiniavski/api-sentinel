@@ -345,7 +345,7 @@ Do not implement security-sensitive behavior based on assumptions. Raise concern
 
 ## 12. Current Development Status
 
-The following is the current project status as of 2026-10-31. Always verify it against the actual repository and current Git state.
+The following is the current project status as of 2026-11-08. Always verify it against the actual repository and current Git state.
 
 ### Completed or implemented
 
@@ -354,10 +354,27 @@ The following is the current project status as of 2026-10-31. Always verify it a
 - API Model: strict Pydantic v2 representations, schema preservation, references, and serialization behavior.
 - API Model Normalizer: validated document to `NormalizationResult`, including components, endpoints, parameter merging, and diagnostics; implementation is covered by tests.
 - Phase 3 — OpenAPI Processing: completed.
+- Deterministic Test Generator (Phase 4, partially implemented): `generate_test_suite()` in `backend/app/services/test_generation/` turns a `NormalizationResult` into a `GeneratedTestSuite` of declarative test cases and `GenerationDiagnostic` values. It does not execute requests. It is covered by `tests/test_test_generation.py`. Implemented:
+  - Positive baseline case per operation: parameters with direct primitive schemas, an `application/json` request body, effective security, and declared inline response expectations.
+  - Negative cases: required parameter omission, required request body omission, required object property omission, wrong JSON type, enum/const violation, string length bounds (`minLength`/`maxLength`), and numeric bounds (`minimum`/`maximum`/exclusive bounds). Negative cases do not assert an HTTP status (`request_rejection_status_unspecified`).
+  - Lazy local reference resolution for `#/components/parameters/`, `#/components/requestBodies/` and `#/components/schemas/`, including alias chains. Unsupported, missing, invalid, and cyclic references produce diagnostics with the source pointer and reference URI; no case is generated from an unusable reference. Recursive required schemas are bounded by `schema_depth_limit`.
+  - `$ref` siblings: only `description`, `title`, `summary` and `x-` keywords are allowed next to a schema `$ref`; any other sibling gives `unsupported_schema_reference_siblings`.
+  - Numeric boundary cases for properties reached through nested local schema references.
+  - Deterministic generation budgets (private constants in `generator.py`, counted work only, no time or memory limits): 10,000 resolved `$ref` expansions per endpoint and 100,000 per suite; 1,000 cases per endpoint and 50,000 per suite; 100 diagnostics per endpoint and 5,000 per suite. Exhausting an expansion or case budget drops the running generation step as a whole and stops the endpoint (or the suite) with `generation_expansion_budget_exceeded` or `generation_case_budget_exceeded`. Excess ordinary diagnostics are replaced by one `generation_diagnostic_budget_exceeded` summary.
+  - Failure isolation: each generation step is all-or-nothing. An unsupported schema in one negative step is reported as a diagnostic and the next negative steps for the endpoint still run. A failing positive baseline skips the endpoint.
 
 ### Current work
 
-Phase 4 — Deterministic Test Generation Engine is the current development phase. The architecture proposal is in `docs/TEST_GENERATION_ENGINE_PROPOSAL.md`; the generator itself has not been implemented. Keep it separate from parsing, normalization, execution, scheduling, and AI functionality.
+Phase 4 — Deterministic Test Generation Engine is the current development phase and is partially implemented (see above). The architecture proposal is in `docs/TEST_GENERATION_ENGINE_PROPOSAL.md`. Keep it separate from parsing, normalization, execution, scheduling, and AI functionality.
+
+Planned, not yet implemented in the generator:
+
+- Referenced responses (`#/components/responses/`): a response `$ref` currently produces `unsupported_response_reference` and no cases for the operation. Response schemas in `ResponseExpectation` are retained as declared and are not resolved.
+- Negative cases for array bounds (`minItems`, `maxItems`, `uniqueItems`). Positive generation respects these keywords, but no array-bound violation cases are generated.
+- Schema keywords outside the supported set (for example `pattern` and `format`) and composition keywords (`allOf`, `oneOf`, `anyOf`, `not`); they produce diagnostics and no cases.
+- Request media types other than `application/json`, media type `encoding`, non-primitive parameter schemas, and parameter `content`.
+- References outside `#/components/{parameters,requestBodies,schemas}/` (external references, `$defs`, anchors).
+- Contract validation of responses, which belongs to the later Test Execution Engine.
 
 ## 13. Git and Change Management
 

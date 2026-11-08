@@ -1,7 +1,7 @@
 # API Sentinel — Development Roadmap
 
 **Document status:** Initial proposal  
-**Last updated:** 2026-10-30
+**Last updated:** 2026-11-08
 
 ## 1. Development Strategy
 
@@ -82,6 +82,8 @@ Users can upload an OpenAPI document and explore its API structure.
 
 ## 5. Phase 4 — Test Generation Engine
 
+**Status:** In progress
+
 Objectives:
 
 - Define internal test representation.
@@ -95,6 +97,24 @@ Objectives:
 Expected result:
 
 API Sentinel can generate structured and reproducible API test definitions from an OpenAPI specification.
+
+Implemented so far:
+
+- Internal test representation: strict, frozen output models (`GeneratedTestSuite`, `GeneratedTestCase`, `GenerationDiagnostic`).
+- Positive test generation: one baseline case per operation for the supported schema subset.
+- Negative test generation: required parameter, request body and property omission; wrong JSON type; enum/const violation.
+- Boundary test generation: string length bounds and numeric bounds, including properties reached through nested local `$ref`.
+- Local reference resolution for parameters, request bodies and schemas, with diagnostics for unsupported, missing, invalid and cyclic references and the `$ref` sibling policy (annotations only).
+- Deterministic resource budgets for reference expansions, generated cases and diagnostics, with stable budget diagnostics.
+- Failure isolation: an unsupported schema in one negative step does not stop the other negative steps of the endpoint.
+
+Still planned:
+
+- Referenced response support (`ResponseExpectation` for `#/components/responses/` references).
+- Array bound negative cases (`minItems`, `maxItems`).
+- Support for further schema keywords (for example `pattern`, `format`) and compositions.
+- Request media types other than `application/json`.
+- Contract validation of responses, together with the Test Execution Engine (Phase 5).
 
 ## 6. Phase 5 — Test Execution Engine
 
