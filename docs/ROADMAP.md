@@ -106,11 +106,11 @@ Implemented so far:
 - Boundary test generation: string length bounds and numeric bounds, including properties reached through nested local `$ref`.
 - Local reference resolution for parameters, request bodies and schemas, with diagnostics for unsupported, missing, invalid and cyclic references and the `$ref` sibling policy (annotations only).
 - Deterministic resource budgets for reference expansions, generated cases and diagnostics, with stable budget diagnostics.
+- Referenced responses: local `#/components/responses/` references, including alias chains, resolved into `ResponseExpectation`.
 - Failure isolation: an unsupported schema in one negative step does not stop the other negative steps of the endpoint.
 
 Still planned:
 
-- Referenced response support (`ResponseExpectation` for `#/components/responses/` references).
 - Array bound negative cases (`minItems`, `maxItems`).
 - Support for further schema keywords (for example `pattern`, `format`) and compositions.
 - Request media types other than `application/json`.

@@ -1982,7 +1982,7 @@ def _generate_endpoint(endpoint: Endpoint, api: ApiModel) -> GeneratedTestCase:
 
     _check_path_placeholders(endpoint.path, path_names, _child(root, "parameters"))
     body, body_provenance = _generate_body(endpoint, api, root)
-    expectations = _response_expectations(endpoint, root)
+    expectations = _response_expectations(endpoint, root, api)
     security = endpoint.security if endpoint.security is not None else api.security
 
     return _counted_case(
@@ -2109,22 +2109,72 @@ def _generate_body(
     )
 
 
+_RESPONSE_REFERENCE_PREFIX = "#/components/responses/"
+
+
+def _resolve_response(
+    entry: Response | LocalReference, api: ApiModel, pointer: str
+) -> tuple[Response, tuple[str, ...]]:
+    """Follow local component response references to a concrete Response.
+
+    Returns the Response and the reference URIs followed, in order. Every
+    resolved hop is charged to the expansion budget.
+    """
+    if isinstance(entry, Response):
+        return entry, ()
+
+    followed: list[str] = []
+    current: Response | LocalReference = entry
+    while isinstance(current, LocalReference):
+        uri = current.uri
+        if uri in followed:
+            raise _UnsupportedOperation(
+                "unsupported_response_reference",
+                "Response reference cycle.",
+                pointer,
+                uri,
+            )
+        followed.append(uri)
+        segment = uri[len(_RESPONSE_REFERENCE_PREFIX) :]
+        if (
+            not uri.startswith(_RESPONSE_REFERENCE_PREFIX)
+            or not segment
+            or "/" in segment
+        ):
+            raise _UnsupportedOperation(
+                "unsupported_response_reference",
+                "Only #/components/responses/<name> references are supported.",
+                pointer,
+                uri,
+            )
+        name = unquote(segment).replace("~1", "/").replace("~0", "~")
+        target = api.components.responses.get(name)
+        if target is None:
+            raise _UnsupportedOperation(
+                "unsupported_response_reference",
+                "Response reference target was not found.",
+                pointer,
+                uri,
+            )
+        _charge_expansion(pointer, uri)
+        current = target
+    if not isinstance(current, Response):
+        raise _UnsupportedOperation(
+            "unsupported_response", "Unsupported response entry.", pointer
+        )
+    return current, tuple(followed)
+
+
 def _response_expectations(
-    endpoint: Endpoint, endpoint_pointer: str
+    endpoint: Endpoint, endpoint_pointer: str, api: ApiModel
 ) -> tuple[ResponseExpectation, ...]:
     expectations: list[ResponseExpectation] = []
     for status in sorted(endpoint.responses):
         pointer = _child(endpoint_pointer, "responses", status)
-        response = endpoint.responses[status]
-        if isinstance(response, LocalReference):
-            raise _UnsupportedOperation(
-                "unsupported_response_reference",
-                "Response references are not resolved in this stage.",
-                pointer,
-                response.uri,
-            )
-        if not isinstance(response, Response):
+        entry = endpoint.responses[status]
+        if not isinstance(entry, (Response, LocalReference)):
             raise _UnsupportedOperation("unsupported_response", "Unsupported response entry.", pointer)
+        response, followed = _resolve_response(entry, api, pointer)
         media_types = tuple(sorted(response.content))
         expectations.append(
             ResponseExpectation(
@@ -2134,7 +2184,7 @@ def _response_expectations(
                     media_type: deepcopy(response.content[media_type].schema)
                     for media_type in media_types
                 },
-                response_reference_uri=None,
+                response_reference_uri=followed[0] if followed else None,
             )
         )
     return tuple(expectations)

@@ -4580,3 +4580,392 @@ def test_unsupported_negative_step_does_not_stop_later_negative_steps(
     assert suite.diagnostics[0].source_pointer == "/paths/~1items/post"
     expected = [case for case in reference.cases if case.violated_constraint not in {"minimum", "maximum"}]
     assert list(suite.cases) == expected
+
+
+def make_result_with_responses(
+    endpoints: tuple[Endpoint, ...], responses: dict[str, Response | LocalReference]
+) -> NormalizationResult:
+    return NormalizationResult(
+        api=ApiModel(
+            openapi_version="3.1.1",
+            info=ApiInfo(title="Generated API", version="1.0"),
+            endpoints=endpoints,
+            components=Components(responses=responses),
+        )
+    )
+
+
+def response_reference(name: str) -> LocalReference:
+    return LocalReference(uri=f"#/components/responses/{name}")
+
+
+NOT_FOUND_RESPONSE = Response(
+    description="Not found",
+    content={
+        "application/problem+json": MediaType(),
+        "application/json": MediaType(
+            schema=Schema(raw={"$ref": "#/components/schemas/Problem"})
+        ),
+    },
+)
+OK_RESPONSE = Response(description="OK")
+RESPONSE_REFERENCE_POINTER = "/paths/~1items/get/responses/404"
+
+
+def get_with_responses(
+    responses: dict[str, Response | LocalReference], path: str = "/items"
+) -> Endpoint:
+    return make_endpoint(path, responses=responses)
+
+
+def expectation_for(suite: GeneratedTestSuite, status: str) -> ResponseExpectation:
+    return next(
+        item for item in suite.cases[0].response_expectations if item.status_key == status
+    )
+
+
+def test_direct_response_reference_is_resolved_into_the_expectation() -> None:
+    suite = generate_test_suite(
+        make_result_with_responses(
+            (get_with_responses({"200": OK_RESPONSE, "404": response_reference("NotFound")}),),
+            {"NotFound": NOT_FOUND_RESPONSE},
+        )
+    )
+
+    assert suite.diagnostics == ()
+    assert expectation_for(suite, "404") == ResponseExpectation(
+        status_key="404",
+        media_types=("application/json", "application/problem+json"),
+        schemas_by_media_type={
+            "application/json": Schema(raw={"$ref": "#/components/schemas/Problem"}),
+            "application/problem+json": None,
+        },
+        response_reference_uri="#/components/responses/NotFound",
+    )
+    assert expectation_for(suite, "200").response_reference_uri is None
+
+
+def test_response_alias_chain_keeps_the_operation_level_reference_uri() -> None:
+    suite = generate_test_suite(
+        make_result_with_responses(
+            (get_with_responses({"404": response_reference("NotFound")}),),
+            {"NotFound": response_reference("Shared"), "Shared": NOT_FOUND_RESPONSE},
+        )
+    )
+
+    assert suite.diagnostics == ()
+    expectation = expectation_for(suite, "404")
+    assert expectation.response_reference_uri == "#/components/responses/NotFound"
+    assert expectation.media_types == ("application/json", "application/problem+json")
+
+
+def test_mixed_inline_and_referenced_responses_keep_status_order() -> None:
+    suite = generate_test_suite(
+        make_result_with_responses(
+            (
+                get_with_responses(
+                    {
+                        "default": response_reference("NotFound"),
+                        "404": response_reference("NotFound"),
+                        "400": OK_RESPONSE,
+                        "200": OK_RESPONSE,
+                    }
+                ),
+            ),
+            {"NotFound": NOT_FOUND_RESPONSE},
+        )
+    )
+
+    expectations = suite.cases[0].response_expectations
+    assert [item.status_key for item in expectations] == ["200", "400", "404", "default"]
+    assert [item.response_reference_uri for item in expectations] == [
+        None,
+        None,
+        "#/components/responses/NotFound",
+        "#/components/responses/NotFound",
+    ]
+
+
+def single_response_reference_suite(
+    entry: LocalReference, responses: dict[str, Response | LocalReference]
+) -> GeneratedTestSuite:
+    return generate_test_suite(
+        make_result_with_responses((get_with_responses({"404": entry}),), responses)
+    )
+
+
+def assert_response_reference_failure(
+    suite: GeneratedTestSuite, reference_uri: str, message_part: str
+) -> None:
+    assert suite.cases == ()
+    assert len(suite.diagnostics) == 1
+    diagnostic = suite.diagnostics[0]
+    assert diagnostic.code == "unsupported_response_reference"
+    assert diagnostic.endpoint_path == "/items"
+    assert diagnostic.endpoint_method == "get"
+    assert diagnostic.source_pointer == RESPONSE_REFERENCE_POINTER
+    assert diagnostic.reference_uri == reference_uri
+    assert message_part in diagnostic.message
+
+
+def test_missing_response_reference_target_is_diagnosed() -> None:
+    suite = single_response_reference_suite(response_reference("Nope"), {})
+
+    assert_response_reference_failure(
+        suite, "#/components/responses/Nope", "target was not found"
+    )
+
+
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "#/paths/~1items/get/responses/200",
+        "#/components/schemas/NotFound",
+        "#/components/requestBodies/NotFound",
+        "#Anchor",
+        "#",
+        "#/components/responses",
+        "#/components/responses/",
+        "#/components/responses/NotFound/content",
+        "#/components/responsesX/NotFound",
+    ],
+)
+def test_unsupported_response_reference_locations_are_diagnosed(uri: str) -> None:
+    suite = single_response_reference_suite(
+        LocalReference(uri=uri), {"NotFound": NOT_FOUND_RESPONSE}
+    )
+
+    assert_response_reference_failure(
+        suite, uri, "Only #/components/responses/<name> references are supported"
+    )
+
+
+@pytest.mark.parametrize("uri", ["https://example.test/r.json#/Ok", "not a reference"])
+def test_hand_built_external_or_invalid_response_reference_is_diagnosed(uri: str) -> None:
+    with pytest.raises(ValidationError):
+        LocalReference(uri=uri)
+    bypassed = LocalReference.model_construct(uri=uri)
+
+    suite = single_response_reference_suite(bypassed, {})
+
+    assert_response_reference_failure(
+        suite, uri, "Only #/components/responses/<name> references are supported"
+    )
+
+
+def test_response_reference_cycles_are_diagnosed() -> None:
+    cycle = single_response_reference_suite(
+        response_reference("A"),
+        {"A": response_reference("B"), "B": response_reference("A")},
+    )
+    self_reference = single_response_reference_suite(
+        response_reference("A"), {"A": response_reference("A")}
+    )
+
+    assert_response_reference_failure(cycle, "#/components/responses/A", "cycle")
+    assert_response_reference_failure(self_reference, "#/components/responses/A", "cycle")
+
+
+def test_broken_alias_chain_reports_the_failing_hop() -> None:
+    suite = single_response_reference_suite(
+        response_reference("A"), {"A": response_reference("Missing")}
+    )
+
+    assert_response_reference_failure(
+        suite, "#/components/responses/Missing", "target was not found"
+    )
+
+
+@pytest.mark.parametrize(
+    ("component_name", "uri_segment"),
+    [("a/b", "a~1b"), ("a~b", "a~0b"), ("a b", "a%20b"), ("a~1b", "a~01b")],
+)
+def test_response_reference_names_follow_pointer_and_percent_conventions(
+    component_name: str, uri_segment: str
+) -> None:
+    uri = f"#/components/responses/{uri_segment}"
+
+    suite = single_response_reference_suite(
+        LocalReference(uri=uri), {component_name: NOT_FOUND_RESPONSE}
+    )
+
+    assert suite.diagnostics == ()
+    assert expectation_for(suite, "404").response_reference_uri == uri
+    assert expectation_for(suite, "404").media_types == (
+        "application/json",
+        "application/problem+json",
+    )
+
+
+def referenced_response_post_endpoint() -> Endpoint:
+    return make_endpoint(
+        "/items",
+        "post",
+        request_body=body_with_schema(
+            {
+                "type": "object",
+                "required": ["name"],
+                "properties": {"name": {"type": "string", "example": "x"}},
+            }
+        ),
+        responses={"400": response_reference("NotFound")},
+    )
+
+
+def test_referenced_response_endpoint_gets_positive_and_negative_cases() -> None:
+    suite = generate_test_suite(
+        make_result_with_responses(
+            (referenced_response_post_endpoint(),), {"NotFound": NOT_FOUND_RESPONSE}
+        )
+    )
+
+    assert suite.diagnostics == ()
+    assert [case.category for case in suite.cases][0] == "positive"
+    assert any(case.category == "negative" for case in suite.cases)
+    positive_expectations = suite.cases[0].response_expectations
+    assert positive_expectations[0].response_reference_uri == "#/components/responses/NotFound"
+    assert all(case.response_expectations == positive_expectations for case in suite.cases)
+
+
+def test_referenced_client_error_response_satisfies_the_negative_response_contract() -> None:
+    referenced = generate_test_suite(
+        make_result_with_responses(
+            (referenced_response_post_endpoint(),), {"NotFound": NOT_FOUND_RESPONSE}
+        )
+    )
+    inline_success_only = generate_test_suite(
+        make_result_with_responses(
+            (
+                make_endpoint(
+                    "/items",
+                    "post",
+                    request_body=referenced_response_post_endpoint().request_body,
+                    responses={"200": OK_RESPONSE},
+                ),
+            ),
+            {},
+        )
+    )
+
+    assert "negative_response_contract_unavailable" not in [
+        item.code for item in referenced.diagnostics
+    ]
+    assert "negative_response_contract_unavailable" in [
+        item.code for item in inline_success_only.diagnostics
+    ]
+
+
+def test_failing_response_reference_skips_only_its_own_endpoint() -> None:
+    suite = generate_test_suite(
+        make_result_with_responses(
+            (
+                get_with_responses({"200": OK_RESPONSE, "404": response_reference("Nope")}, "/bad"),
+                get_with_responses({"404": response_reference("NotFound")}, "/good-ref"),
+                get_with_responses({"200": OK_RESPONSE}, "/good-inline"),
+            ),
+            {"NotFound": NOT_FOUND_RESPONSE},
+        )
+    )
+
+    assert [case.path for case in suite.cases] == ["/good-ref", "/good-inline"]
+    assert [item.endpoint_path for item in suite.diagnostics] == ["/bad"]
+    assert [item.code for item in suite.diagnostics] == ["unsupported_response_reference"]
+
+
+def test_referenced_response_generation_is_deterministic() -> None:
+    def build() -> NormalizationResult:
+        return make_result_with_responses(
+            (referenced_response_post_endpoint(), get_with_responses({"404": response_reference("Alias")}, "/other")),
+            {"NotFound": NOT_FOUND_RESPONSE, "Alias": response_reference("NotFound")},
+        )
+
+    first = generate_test_suite(build())
+    second = generate_test_suite(build())
+
+    assert first == second
+    assert first.model_dump_json() == second.model_dump_json()
+
+
+@pytest.mark.parametrize("version", ["3.0.3", "3.1.1"])
+def test_normalized_response_reference_with_annotations_generates_cases(version: str) -> None:
+    from app.services.openapi import normalize_openapi_document
+
+    document = {
+        "openapi": version,
+        "info": {"title": "T", "version": "1"},
+        "paths": {
+            "/items": {
+                "get": {
+                    "responses": {
+                        "200": {"description": "OK"},
+                        "404": {
+                            "$ref": "#/components/responses/NotFound",
+                            "summary": "Not found",
+                            "description": "Override",
+                            "x-note": 1,
+                        },
+                    }
+                }
+            }
+        },
+        "components": {"responses": {"NotFound": {"description": "Not found"}}},
+    }
+
+    suite = generate_test_suite(normalize_openapi_document(document))
+
+    assert suite.diagnostics == ()
+    assert expectation_for(suite, "404").response_reference_uri == "#/components/responses/NotFound"
+
+
+def alias_chain_result(extra: tuple[Endpoint, ...] = ()) -> NormalizationResult:
+    return make_result_with_responses(
+        (get_with_responses({"404": response_reference("A")}), *extra),
+        {
+            "A": response_reference("B"),
+            "B": response_reference("C"),
+            "C": NOT_FOUND_RESPONSE,
+        },
+    )
+
+
+def test_response_reference_hops_are_charged_to_the_endpoint_expansion_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert count_expansions(alias_chain_result()) == 3
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_EXPANSIONS", 2)
+
+    suite = generate_test_suite(
+        alias_chain_result((get_with_responses({"200": OK_RESPONSE}, "/inline"),))
+    )
+
+    assert [case.path for case in suite.cases] == ["/inline"]
+    assert [item.code for item in suite.diagnostics] == [
+        "generation_expansion_budget_exceeded"
+    ]
+    diagnostic = suite.diagnostics[0]
+    assert diagnostic.endpoint_path == "/items"
+    assert diagnostic.source_pointer == RESPONSE_REFERENCE_POINTER
+    assert diagnostic.reference_uri == "#/components/responses/C"
+    assert "per-endpoint limit of 2" in diagnostic.message
+
+
+def test_response_reference_hops_are_charged_to_the_suite_expansion_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(generator_module, "_MAX_SUITE_EXPANSIONS", 2)
+    endpoints = tuple(
+        get_with_responses({"404": response_reference("NotFound")}, f"/e{index}")
+        for index in range(4)
+    )
+
+    suite = generate_test_suite(
+        make_result_with_responses(endpoints, {"NotFound": NOT_FOUND_RESPONSE})
+    )
+
+    assert [case.path for case in suite.cases] == ["/e0", "/e1"]
+    assert [item.code for item in suite.diagnostics] == [
+        "generation_expansion_budget_exceeded"
+    ]
+    assert suite.diagnostics[0].endpoint_path == "/e2"
+    assert "per-suite limit of 2" in suite.diagnostics[0].message
+    assert "1 following endpoint(s)" in suite.diagnostics[0].message
