@@ -55,6 +55,123 @@ _SCHEMA_COMPONENTS: ContextVar[Mapping[str, Schema]] = ContextVar(
 )
 
 
+# Deterministic resource limits. They count work, never time or memory, so the
+# same input always produces the same output. Expansions are resolved local
+# schema references, which are the only way a small document can describe an
+# exponentially large schema graph.
+_MAX_ENDPOINT_EXPANSIONS = 10_000
+_MAX_SUITE_EXPANSIONS = 100_000
+_MAX_ENDPOINT_CASES = 1_000
+_MAX_SUITE_CASES = 50_000
+_MAX_ENDPOINT_DIAGNOSTICS = 100
+_MAX_SUITE_DIAGNOSTICS = 5_000
+_EXPANSION_BUDGET_CODE = "generation_expansion_budget_exceeded"
+_CASE_BUDGET_CODE = "generation_case_budget_exceeded"
+_DIAGNOSTIC_BUDGET_CODE = "generation_diagnostic_budget_exceeded"
+
+
+class _GenerationBudget:
+    """Mutable counters for exactly one generate_test_suite call."""
+
+    def __init__(self) -> None:
+        self.suite_expansions = 0
+        self.suite_cases = 0
+        self.suite_diagnostics = 0
+        self.suite_suppressed = 0
+        self.begin_endpoint()
+
+    def begin_endpoint(self) -> None:
+        self.endpoint_expansions = 0
+        self.endpoint_cases = 0
+        self.endpoint_diagnostics = 0
+        self.endpoint_suppressed = 0
+
+    def charge_expansion(self, pointer: str, reference_uri: str) -> None:
+        self.endpoint_expansions += 1
+        self.suite_expansions += 1
+        if self.endpoint_expansions > _MAX_ENDPOINT_EXPANSIONS:
+            raise _BudgetExhausted(
+                _EXPANSION_BUDGET_CODE, "endpoint", _MAX_ENDPOINT_EXPANSIONS,
+                pointer, reference_uri,
+            )
+        if self.suite_expansions > _MAX_SUITE_EXPANSIONS:
+            raise _BudgetExhausted(
+                _EXPANSION_BUDGET_CODE, "suite", _MAX_SUITE_EXPANSIONS,
+                pointer, reference_uri,
+            )
+
+    def charge_case(self) -> None:
+        self.endpoint_cases += 1
+        self.suite_cases += 1
+        if self.endpoint_cases > _MAX_ENDPOINT_CASES:
+            raise _BudgetExhausted(
+                _CASE_BUDGET_CODE, "endpoint", _MAX_ENDPOINT_CASES, None, None
+            )
+        if self.suite_cases > _MAX_SUITE_CASES:
+            raise _BudgetExhausted(
+                _CASE_BUDGET_CODE, "suite", _MAX_SUITE_CASES, None, None
+            )
+
+    def case_counts(self) -> tuple[int, int]:
+        return self.endpoint_cases, self.suite_cases
+
+    def restore_case_counts(self, counts: tuple[int, int]) -> None:
+        """Give back the cases of a discarded step; expansion work stays counted."""
+        self.endpoint_cases, self.suite_cases = counts
+
+    def admit(self, diagnostics: Any) -> list[GenerationDiagnostic]:
+        """Keep ordinary diagnostics up to the limits and count the rest."""
+        admitted: list[GenerationDiagnostic] = []
+        for diagnostic in diagnostics:
+            if self.endpoint_diagnostics >= _MAX_ENDPOINT_DIAGNOSTICS:
+                self.endpoint_suppressed += 1
+            elif self.suite_diagnostics >= _MAX_SUITE_DIAGNOSTICS:
+                self.suite_suppressed += 1
+            else:
+                self.endpoint_diagnostics += 1
+                self.suite_diagnostics += 1
+                admitted.append(diagnostic)
+        return admitted
+
+
+class _BudgetExhausted(Exception):
+    """A deterministic resource limit was reached; the running step is dropped."""
+
+    def __init__(
+        self,
+        code: str,
+        scope: str,
+        limit: int,
+        pointer: str | None,
+        reference_uri: str | None,
+    ) -> None:
+        super().__init__(code)
+        self.code = code
+        self.scope = scope
+        self.limit = limit
+        self.pointer = pointer
+        self.reference_uri = reference_uri
+
+
+# Budget of the generate_test_suite call in progress. None outside such a call,
+# so the private helpers stay usable on their own without any limit.
+_BUDGET: ContextVar[_GenerationBudget | None] = ContextVar("_BUDGET", default=None)
+
+
+def _charge_expansion(pointer: str, reference_uri: str) -> None:
+    budget = _BUDGET.get()
+    if budget is not None:
+        budget.charge_expansion(pointer, reference_uri)
+
+
+def _counted_case(**fields: Any) -> GeneratedTestCase:
+    """Build a test case after charging the case budget."""
+    budget = _BUDGET.get()
+    if budget is not None:
+        budget.charge_case()
+    return GeneratedTestCase(**fields)
+
+
 class _UnsupportedOperation(Exception):
     """An operation cannot safely produce a positive baseline in this stage."""
 
@@ -82,65 +199,135 @@ def generate_test_suite(result: NormalizationResult) -> GeneratedTestSuite:
     if not isinstance(result, NormalizationResult):
         raise TypeError("result must be a NormalizationResult")
 
-    token = _SCHEMA_COMPONENTS.set(result.api.components.schemas)
+    components_token = _SCHEMA_COMPONENTS.set(result.api.components.schemas)
     try:
-        return _generate_suite(result)
+        budget = _GenerationBudget()
+        budget_token = _BUDGET.set(budget)
+        try:
+            return _generate_suite(result, budget)
+        finally:
+            _BUDGET.reset(budget_token)
     finally:
-        _SCHEMA_COMPONENTS.reset(token)
+        _SCHEMA_COMPONENTS.reset(components_token)
 
 
-def _generate_suite(result: NormalizationResult) -> GeneratedTestSuite:
+def _run_step(
+    budget: _GenerationBudget, step: Callable[[], Any]
+) -> tuple[Any, _BudgetExhausted | None]:
+    """Run one generation step all-or-nothing.
+
+    A step returns its whole result at once. If a limit is reached, or the step
+    fails, nothing it built is kept and its cases are not counted.
+    """
+    counts = budget.case_counts()
+    try:
+        return step(), None
+    except _BudgetExhausted as exhausted:
+        budget.restore_case_counts(counts)
+        return None, exhausted
+    except _UnsupportedOperation:
+        budget.restore_case_counts(counts)
+        raise
+
+
+def _negative_steps(
+    endpoint: Endpoint, positive: GeneratedTestCase, api: ApiModel
+) -> tuple[tuple[str, Callable[[], Any]], ...]:
+    """The negative generation steps in their fixed order."""
+
+    def required_request_body() -> tuple[tuple[GeneratedTestCase, ...], tuple[()]]:
+        case = _required_request_body_negative_case(endpoint, positive, api)
+        return ((case,) if case is not None else ()), ()
+
+    return (
+        ("required_property", lambda: _required_property_negative_cases(endpoint, positive, api)),
+        ("numeric_boundary", lambda: _numeric_boundary_negative_cases(endpoint, positive, api)),
+        ("wrong_type", lambda: _wrong_type_negative_cases(endpoint, positive, api)),
+        ("string_boundary", lambda: _string_boundary_negative_cases(endpoint, positive, api)),
+        (
+            "required_parameter",
+            lambda: (_required_parameter_negative_cases(endpoint, positive, api), ()),
+        ),
+        ("required_request_body", required_request_body),
+        ("enum_const", lambda: _enum_const_negative_cases(endpoint, positive, api)),
+    )
+
+
+def _generate_suite(result: NormalizationResult, budget: _GenerationBudget) -> GeneratedTestSuite:
     cases: list[GeneratedTestCase] = []
     diagnostics: list[GenerationDiagnostic] = []
-    for endpoint in result.api.endpoints:
+    endpoints = result.api.endpoints
+    for index, endpoint in enumerate(endpoints):
+        budget.begin_endpoint()
+        step_name = "positive_baseline"
+        exhausted: _BudgetExhausted | None = None
         try:
-            positive = _generate_endpoint(endpoint, result.api)
-            cases.append(positive)
-            negative_cases, negative_diagnostics = _required_property_negative_cases(
-                endpoint, positive, result.api
+            positive, exhausted = _run_step(
+                budget, lambda: _generate_endpoint(endpoint, result.api)
             )
-            cases.extend(negative_cases)
-            diagnostics.extend(negative_diagnostics)
-            numeric_cases, numeric_diagnostics = _numeric_boundary_negative_cases(
-                endpoint, positive, result.api
-            )
-            cases.extend(numeric_cases)
-            diagnostics.extend(numeric_diagnostics)
-            wrong_type_cases, wrong_type_diagnostics = _wrong_type_negative_cases(
-                endpoint, positive, result.api
-            )
-            cases.extend(wrong_type_cases)
-            diagnostics.extend(wrong_type_diagnostics)
-            string_cases, string_diagnostics = _string_boundary_negative_cases(
-                endpoint, positive, result.api
-            )
-            cases.extend(string_cases)
-            diagnostics.extend(string_diagnostics)
-            parameter_cases = _required_parameter_negative_cases(
-                endpoint, positive, result.api
-            )
-            cases.extend(parameter_cases)
-            request_body_case = _required_request_body_negative_case(
-                endpoint, positive, result.api
-            )
-            if request_body_case is not None:
-                cases.append(request_body_case)
-            enum_const_cases, enum_const_diagnostics = _enum_const_negative_cases(
-                endpoint, positive, result.api
-            )
-            cases.extend(enum_const_cases)
-            diagnostics.extend(enum_const_diagnostics)
+            if exhausted is None:
+                cases.append(positive)
+                for step_name, step in _negative_steps(endpoint, positive, result.api):
+                    step_result, exhausted = _run_step(budget, step)
+                    if exhausted is not None:
+                        break
+                    step_cases, step_diagnostics = step_result
+                    cases.extend(step_cases)
+                    diagnostics.extend(budget.admit(step_diagnostics))
         except _UnsupportedOperation as issue:
-            diagnostics.append(
-                GenerationDiagnostic(
-                    code=issue.code,
-                    message=str(issue),
-                    endpoint_path=endpoint.path,
-                    endpoint_method=endpoint.method,
-                    source_pointer=issue.pointer,
-                    reference_uri=issue.reference_uri,
+            diagnostics.extend(
+                budget.admit(
+                    [
+                        GenerationDiagnostic(
+                            code=issue.code,
+                            message=str(issue),
+                            endpoint_path=endpoint.path,
+                            endpoint_method=endpoint.method,
+                            source_pointer=issue.pointer,
+                            reference_uri=issue.reference_uri,
+                        )
+                    ]
                 )
             )
+        if exhausted is not None:
+            diagnostics.append(
+                _budget_diagnostic(
+                    exhausted, step_name, endpoint, len(endpoints) - index - 1
+                )
+            )
+        if budget.endpoint_suppressed:
+            diagnostics.append(
+                GenerationDiagnostic(
+                    code=_DIAGNOSTIC_BUDGET_CODE,
+                    message=(
+                        f"The per-endpoint limit of {_MAX_ENDPOINT_DIAGNOSTICS} "
+                        f"diagnostics was reached; {budget.endpoint_suppressed} "
+                        "further diagnostics were not reported."
+                    ),
+                    endpoint_path=endpoint.path,
+                    endpoint_method=endpoint.method,
+                    source_pointer=_endpoint_pointer(endpoint),
+                    reference_uri=None,
+                )
+            )
+        if exhausted is not None and exhausted.scope == "suite":
+            break
+
+    if budget.suite_suppressed:
+        diagnostics.append(
+            GenerationDiagnostic(
+                code=_DIAGNOSTIC_BUDGET_CODE,
+                message=(
+                    f"The per-suite limit of {_MAX_SUITE_DIAGNOSTICS} diagnostics "
+                    f"was reached; {budget.suite_suppressed} further diagnostics "
+                    "were not reported."
+                ),
+                endpoint_path=None,
+                endpoint_method=None,
+                source_pointer=None,
+                reference_uri=None,
+            )
+        )
 
     return GeneratedTestSuite(
         api_title=result.api.info.title,
@@ -148,6 +335,37 @@ def _generate_suite(result: NormalizationResult) -> GeneratedTestSuite:
         openapi_version=result.api.openapi_version,
         cases=tuple(cases),
         diagnostics=tuple(diagnostics),
+    )
+
+
+def _budget_diagnostic(
+    exhausted: _BudgetExhausted, step: str, endpoint: Endpoint, remaining: int
+) -> GenerationDiagnostic:
+    what = (
+        "schema reference expansions"
+        if exhausted.code == _EXPANSION_BUDGET_CODE
+        else "generated test cases"
+    )
+    if exhausted.scope == "endpoint":
+        message = (
+            f"The per-endpoint limit of {exhausted.limit} {what} was reached during "
+            f"the '{step}' step. That step produced no cases and the remaining "
+            "steps for this endpoint were skipped."
+        )
+    else:
+        message = (
+            f"The per-suite limit of {exhausted.limit} {what} was reached during "
+            f"the '{step}' step of this endpoint. That step produced no cases; the "
+            f"remaining steps of this endpoint and {remaining} following "
+            "endpoint(s) were not generated."
+        )
+    return GenerationDiagnostic(
+        code=exhausted.code,
+        message=message,
+        endpoint_path=endpoint.path,
+        endpoint_method=endpoint.method,
+        source_pointer=exhausted.pointer or _endpoint_pointer(endpoint),
+        reference_uri=exhausted.reference_uri,
     )
 
 
@@ -201,7 +419,7 @@ def _required_parameter_negative_cases(
         )
         variant = f"required-parameter:{entry.location}:{len(entry.name)}:{entry.name}"
         cases.append(
-            GeneratedTestCase(
+            _counted_case(
                 case_id=build_case_id("negative", endpoint.path, endpoint.method, variant),
                 category="negative",
                 path=positive.path,
@@ -232,7 +450,7 @@ def _required_request_body_negative_case(
         return None
 
     pointer = resolved[1]
-    return GeneratedTestCase(
+    return _counted_case(
         case_id=build_case_id(
             "negative", endpoint.path, endpoint.method, "required-request-body"
         ),
@@ -288,7 +506,7 @@ def _required_property_negative_cases(
 
         property_reference = _json_pointer(property_path)
         cases.append(
-            GeneratedTestCase(
+            _counted_case(
                 case_id=build_case_id(
                     "negative",
                     endpoint.path,
@@ -471,7 +689,7 @@ def _wrong_type_negative_cases(
         property_pointer = _json_pointer(path)
         type_pointer = _child(schema_pointer, "type")
         cases.append(
-            GeneratedTestCase(
+            _counted_case(
                 case_id=build_case_id(
                     "negative", endpoint.path, endpoint.method, f"wrong-type:{property_pointer}"
                 ),
@@ -641,7 +859,7 @@ def _enum_const_negative_cases(
         property_pointer = _json_pointer(path)
         keyword_pointer = _child(schema_pointer, keyword)
         cases.append(
-            GeneratedTestCase(
+            _counted_case(
                 case_id=build_case_id(
                     "negative",
                     endpoint.path,
@@ -887,7 +1105,7 @@ def _string_boundary_negative_cases(
         property_pointer = _json_pointer(path)
         constraint_pointer = _child(schema_pointer, constraint)
         cases.append(
-            GeneratedTestCase(
+            _counted_case(
                 case_id=build_case_id(
                     "negative",
                     endpoint.path,
@@ -1053,7 +1271,23 @@ def _numeric_boundary_negative_cases(
         current_schema_pointer = root_pointer
         parent_issue: _UnsupportedOperation | None = None
         for name in path[:-1]:
-            child_schema = current_schema.get("properties", {}).get(name)
+            try:
+                current_schema, current_schema_pointer, _ = _follow_schema_reference(
+                    current_schema, current_schema_pointer
+                )
+                properties = (
+                    current_schema.get("properties")
+                    if isinstance(current_schema, dict)
+                    else None
+                )
+                child_schema, child_pointer, _ = _follow_schema_reference(
+                    properties.get(name) if isinstance(properties, dict) else None,
+                    _child(current_schema_pointer, "properties", name),
+                )
+            except _UnsupportedOperation as issue:
+                parent_issue = issue
+                parent = None
+                break
             if not isinstance(child_schema, dict) or not isinstance(parent, dict):
                 parent = None
                 break
@@ -1063,7 +1297,7 @@ def _numeric_boundary_negative_cases(
                         child_schema,
                         version,
                         [],
-                        _child(current_schema_pointer, "properties", name),
+                        child_pointer,
                         direction="request",
                     )
                 except _UnsupportedOperation as issue:
@@ -1079,7 +1313,7 @@ def _numeric_boundary_negative_cases(
                 break
             parent = parent[name]
             current_schema = child_schema
-            current_schema_pointer = _child(current_schema_pointer, "properties", name)
+            current_schema_pointer = child_pointer
         if path and parent is None:
             if parent_issue is not None:
                 diagnostics.append(
@@ -1114,7 +1348,7 @@ def _numeric_boundary_negative_cases(
 
         property_pointer = _json_pointer(path) if path else ""
         cases.append(
-            GeneratedTestCase(
+            _counted_case(
                 case_id=build_case_id(
                     "negative",
                     endpoint.path,
@@ -1741,7 +1975,7 @@ def _generate_endpoint(endpoint: Endpoint, api: ApiModel) -> GeneratedTestCase:
     expectations = _response_expectations(endpoint, root)
     security = endpoint.security if endpoint.security is not None else api.security
 
-    return GeneratedTestCase(
+    return _counted_case(
         case_id=build_case_id("positive", endpoint.path, endpoint.method, "baseline"),
         category="positive",
         path=endpoint.path,
@@ -1979,6 +2213,7 @@ def _follow_schema_reference(raw: Any, pointer: str) -> tuple[Any, str, tuple[st
                 current_pointer,
                 uri,
             )
+        _charge_expansion(current_pointer, uri)
         raw = target.raw
         current_pointer = _pointer("components", "schemas", name)
     return raw, current_pointer, tuple(followed)

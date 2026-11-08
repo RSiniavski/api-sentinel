@@ -4012,3 +4012,513 @@ def test_unusable_optional_property_reference_does_not_stop_other_negative_cases
     assert suite.cases[1].violated_constraint == "required_request_body"
     assert [item.code for item in suite.diagnostics] == ["unsupported_schema_reference"]
     assert suite.diagnostics[0].reference_uri == "#/components/schemas/Missing"
+
+
+def make_result_with_endpoints(
+    endpoints: tuple[Endpoint, ...], schemas: dict[str, object]
+) -> NormalizationResult:
+    return NormalizationResult(
+        api=ApiModel(
+            openapi_version="3.1.1",
+            info=ApiInfo(title="Generated API", version="1.0"),
+            endpoints=endpoints,
+            components=Components(
+                schemas={name: Schema(raw=raw) for name, raw in schemas.items()}
+            ),
+        )
+    )
+
+
+def post_endpoint(raw_schema: object, path: str = "/items") -> Endpoint:
+    return make_endpoint(
+        path,
+        "post",
+        request_body=body_with_schema(raw_schema),
+        responses=BAD_REQUEST,
+    )
+
+
+def numeric_summary(suite: GeneratedTestSuite) -> list[tuple[object, ...]]:
+    return [
+        (case.case_id, case.affected_property, case.violated_constraint, case.request_body)
+        for case in suite.cases
+        if case.violated_constraint in {"minimum", "maximum"}
+    ]
+
+
+BUDGET_CODES = {
+    "generation_expansion_budget_exceeded",
+    "generation_case_budget_exceeded",
+    "generation_diagnostic_budget_exceeded",
+}
+QTY_LEAF: dict[str, object] = {"type": "integer", "minimum": 1, "maximum": 9, "example": 3}
+
+
+def test_numeric_boundaries_through_root_reference_with_one_nested_hop() -> None:
+    nested = {
+        "type": "object",
+        "properties": {"a": {"type": "object", "properties": {"qty": QTY_LEAF}}},
+    }
+    through_ref = generate_test_suite(
+        make_result_with_schemas(post_endpoint(schema_reference("Root")), {"Root": nested})
+    )
+    inline = generate_test_suite(make_result(post_endpoint(nested)))
+
+    assert numeric_summary(through_ref) != []
+    assert numeric_summary(through_ref) == numeric_summary(inline)
+    assert through_ref.diagnostics == ()
+    assert any(case.affected_property == "/a/qty" for case in through_ref.cases)
+
+
+def test_numeric_boundaries_through_multiple_nested_reference_levels() -> None:
+    components: dict[str, object] = {
+        "Root": {"type": "object", "properties": {"a": schema_reference("A")}},
+        "A": {"type": "object", "properties": {"b": schema_reference("B")}},
+        "B": {"type": "object", "properties": {"c": schema_reference("C")}},
+        "C": {"type": "object", "properties": {"qty": schema_reference("Qty")}},
+        "Qty": QTY_LEAF,
+    }
+    inline = {
+        "type": "object",
+        "properties": {
+            "a": {
+                "type": "object",
+                "properties": {
+                    "b": {
+                        "type": "object",
+                        "properties": {
+                            "c": {"type": "object", "properties": {"qty": QTY_LEAF}}
+                        },
+                    }
+                },
+            }
+        },
+    }
+    through_ref = generate_test_suite(
+        make_result_with_schemas(post_endpoint(schema_reference("Root")), components)
+    )
+    inline_suite = generate_test_suite(make_result(post_endpoint(inline)))
+
+    assert through_ref.diagnostics == ()
+    assert numeric_summary(through_ref) == numeric_summary(inline_suite)
+    assert [item[1] for item in numeric_summary(through_ref)] == ["/a/b/c/qty"] * 2
+    body = numeric_summary(through_ref)[0][3]
+    assert body.value == {"a": {"b": {"c": {"qty": 0}}}}
+
+
+def test_numeric_boundaries_through_inline_root_with_referenced_parents() -> None:
+    components: dict[str, object] = {
+        "A": {"type": "object", "properties": {"b": schema_reference("B")}},
+        "B": {"type": "object", "properties": {"qty": QTY_LEAF}},
+    }
+    suite = generate_test_suite(
+        make_result_with_schemas(
+            post_endpoint({"type": "object", "properties": {"a": schema_reference("A")}}),
+            components,
+        )
+    )
+
+    assert suite.diagnostics == ()
+    assert [item[1] for item in numeric_summary(suite)] == ["/a/b/qty"] * 2
+
+
+def test_shared_component_is_expanded_for_each_independent_use() -> None:
+    zip_schema = {"type": "object", "properties": {"zip": QTY_LEAF}}
+    suite = generate_test_suite(
+        make_result_with_schemas(
+            post_endpoint(
+                {
+                    "type": "object",
+                    "properties": {
+                        "billing": schema_reference("Address"),
+                        "shipping": schema_reference("Address"),
+                    },
+                }
+            ),
+            {"Address": zip_schema},
+        )
+    )
+
+    assert suite.diagnostics == ()
+    assert [item[1] for item in numeric_summary(suite)] == [
+        "/billing/zip",
+        "/billing/zip",
+        "/shipping/zip",
+        "/shipping/zip",
+    ]
+
+
+def diamond_components(levels: int, *, required: bool) -> dict[str, object]:
+    components: dict[str, object] = {}
+    for level in range(levels):
+        next_ref = schema_reference(f"L{level + 1}")
+        level_schema: dict[str, object] = {
+            "type": "object",
+            "properties": {"left": next_ref, "right": next_ref},
+        }
+        if required:
+            level_schema["required"] = ["left", "right"]
+        components[f"L{level}"] = level_schema
+    leaf: dict[str, object] = {"type": "object", "properties": {"qty": QTY_LEAF}}
+    if required:
+        leaf["required"] = ["qty"]
+    components[f"L{levels}"] = leaf
+    return components
+
+
+def test_small_required_diamond_generates_within_default_budgets() -> None:
+    suite = generate_test_suite(
+        make_result_with_schemas(
+            post_endpoint(schema_reference("L0")), diamond_components(3, required=True)
+        )
+    )
+
+    assert not BUDGET_CODES & {item.code for item in suite.diagnostics}
+    assert suite.cases[0].category == "positive"
+    assert len(suite.cases) > 1
+
+
+def test_small_optional_diamond_generates_numeric_cases_within_default_budgets() -> None:
+    suite = generate_test_suite(
+        make_result_with_schemas(
+            post_endpoint(schema_reference("L0")), diamond_components(3, required=False)
+        )
+    )
+
+    assert not BUDGET_CODES & {item.code for item in suite.diagnostics}
+    assert len(numeric_summary(suite)) > 0
+
+
+def test_large_required_diamond_stops_with_budget_diagnostic() -> None:
+    suite = generate_test_suite(
+        make_result_with_schemas(
+            post_endpoint(schema_reference("L0")), diamond_components(12, required=True)
+        )
+    )
+
+    assert suite.cases == ()
+    assert [item.code for item in suite.diagnostics] == [
+        "generation_expansion_budget_exceeded"
+    ]
+    assert "'positive_baseline'" in suite.diagnostics[0].message
+
+
+def test_required_diamond_case_budget_drops_the_whole_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_CASES", 5)
+
+    suite = generate_test_suite(
+        make_result_with_schemas(
+            post_endpoint(schema_reference("L0")), diamond_components(4, required=True)
+        )
+    )
+
+    assert [case.category for case in suite.cases] == ["positive"]
+    assert [item.code for item in suite.diagnostics] == ["generation_case_budget_exceeded"]
+    assert "'required_property'" in suite.diagnostics[0].message
+
+
+def test_large_optional_diamond_stops_with_one_budget_diagnostic() -> None:
+    suite = generate_test_suite(
+        make_result_with_schemas(
+            post_endpoint(schema_reference("L0")), diamond_components(20, required=False)
+        )
+    )
+
+    assert [item.code for item in suite.diagnostics] == [
+        "generation_expansion_budget_exceeded"
+    ]
+    assert "'numeric_boundary'" in suite.diagnostics[0].message
+    assert suite.cases[0].category == "positive"
+    assert numeric_summary(suite) == []
+
+
+def test_endpoint_expansion_budget_drops_the_step_and_stops_the_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_EXPANSIONS", 20)
+    broken = make_endpoint(
+        "/items",
+        "post",
+        parameters=(
+            Parameter(
+                name="q",
+                location="query",
+                required=True,
+                schema=Schema(raw={"type": "string", "example": "x"}),
+                source_scope="operation",
+            ),
+        ),
+        request_body=body_with_schema(schema_reference("L0")),
+        responses=BAD_REQUEST,
+    )
+    healthy = post_endpoint(QTY_LEAF, "/other")
+
+    suite = generate_test_suite(
+        make_result_with_endpoints(
+            (broken, healthy), diamond_components(6, required=False)
+        )
+    )
+
+    budget = [item for item in suite.diagnostics if item.code in BUDGET_CODES]
+    assert [item.code for item in budget] == ["generation_expansion_budget_exceeded"]
+    assert budget[0].endpoint_path == "/items"
+    assert budget[0].source_pointer is not None
+    assert budget[0].source_pointer.startswith("/components/schemas/L")
+    assert budget[0].reference_uri is not None
+    assert budget[0].reference_uri.startswith("#/components/schemas/L")
+    assert "per-endpoint limit of 20" in budget[0].message
+    broken_cases = [case for case in suite.cases if case.path == "/items"]
+    assert [case.category for case in broken_cases] == ["positive"]
+    assert any(case.path == "/other" and case.category == "negative" for case in suite.cases)
+
+
+def count_expansions(result: NormalizationResult) -> int:
+    counter = {"count": 0}
+    original = generator_module._GenerationBudget.charge_expansion
+
+    def counting(self: object, pointer: str, reference_uri: str) -> None:
+        counter["count"] += 1
+        original(self, pointer, reference_uri)  # type: ignore[arg-type]
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(generator_module._GenerationBudget, "charge_expansion", counting)
+        generate_test_suite(result)
+    return counter["count"]
+
+
+def test_suite_expansion_budget_stops_the_remaining_endpoints(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    schemas = {"Status": STATUS_SCHEMA}
+    endpoints = tuple(
+        post_endpoint(schema_reference("Status"), f"/items{index}") for index in range(3)
+    )
+    one_endpoint = count_expansions(make_result_with_endpoints(endpoints[:1], schemas))
+    assert one_endpoint > 0
+    monkeypatch.setattr(generator_module, "_MAX_SUITE_EXPANSIONS", one_endpoint)
+
+    suite = generate_test_suite(make_result_with_endpoints(endpoints, schemas))
+
+    assert {case.path for case in suite.cases} == {"/items0"}
+    assert [item.code for item in suite.diagnostics] == [
+        "generation_expansion_budget_exceeded"
+    ]
+    assert suite.diagnostics[0].endpoint_path == "/items1"
+    assert f"per-suite limit of {one_endpoint}" in suite.diagnostics[0].message
+    assert "1 following endpoint(s)" in suite.diagnostics[0].message
+
+
+def test_endpoint_case_budget_drops_the_whole_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_CASES", 2)
+    body = {
+        "type": "object",
+        "required": ["a", "b", "c"],
+        "properties": {name: {"type": "string", "example": "x"} for name in "abc"},
+    }
+
+    suite = generate_test_suite(make_result(post_endpoint(body)))
+
+    assert [case.category for case in suite.cases] == ["positive"]
+    assert [item.code for item in suite.diagnostics] == ["generation_case_budget_exceeded"]
+    assert "per-endpoint limit of 2" in suite.diagnostics[0].message
+    assert "'required_property'" in suite.diagnostics[0].message
+    assert suite.diagnostics[0].source_pointer == "/paths/~1items/post"
+
+
+def test_suite_case_budget_stops_the_remaining_endpoints(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(generator_module, "_MAX_SUITE_CASES", 3)
+    endpoints = tuple(make_endpoint(f"/e{index}") for index in range(5))
+
+    suite = generate_test_suite(make_result(*endpoints))
+
+    assert [case.path for case in suite.cases] == ["/e0", "/e1", "/e2"]
+    assert [item.code for item in suite.diagnostics] == ["generation_case_budget_exceeded"]
+    assert suite.diagnostics[0].endpoint_path == "/e3"
+    assert "per-suite limit of 3" in suite.diagnostics[0].message
+    assert "1 following endpoint(s)" in suite.diagnostics[0].message
+
+
+def test_dropped_step_cases_do_not_consume_the_suite_case_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_CASES", 2)
+    monkeypatch.setattr(generator_module, "_MAX_SUITE_CASES", 2)
+    body = {
+        "type": "object",
+        "required": ["a", "b", "c"],
+        "properties": {name: {"type": "string", "example": "x"} for name in "abc"},
+    }
+
+    suite = generate_test_suite(
+        make_result(post_endpoint(body), make_endpoint("/plain"))
+    )
+
+    assert [case.path for case in suite.cases] == ["/items", "/plain"]
+    assert [item.code for item in suite.diagnostics] == ["generation_case_budget_exceeded"]
+    assert "per-endpoint" in suite.diagnostics[0].message
+
+
+def missing_reference_body(count: int) -> dict[str, object]:
+    return {
+        "type": "object",
+        "properties": {
+            f"p{index}": schema_reference(f"Missing{index}") for index in range(count)
+        },
+    }
+
+
+def test_endpoint_diagnostic_budget_reports_a_summary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_DIAGNOSTICS", 2)
+
+    suite = generate_test_suite(make_result(post_endpoint(missing_reference_body(5))))
+
+    assert [item.code for item in suite.diagnostics] == [
+        "unsupported_schema_reference",
+        "unsupported_schema_reference",
+        "generation_diagnostic_budget_exceeded",
+    ]
+    assert "per-endpoint limit of 2" in suite.diagnostics[2].message
+    assert "3 further diagnostics" in suite.diagnostics[2].message
+    assert suite.cases[0].category == "positive"
+
+
+def test_suite_diagnostic_budget_reports_a_suite_summary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(generator_module, "_MAX_SUITE_DIAGNOSTICS", 3)
+
+    suite = generate_test_suite(
+        make_result(
+            post_endpoint(missing_reference_body(2), "/one"),
+            post_endpoint(missing_reference_body(2), "/two"),
+        )
+    )
+
+    assert [item.code for item in suite.diagnostics] == [
+        "unsupported_schema_reference",
+        "unsupported_schema_reference",
+        "unsupported_schema_reference",
+        "generation_diagnostic_budget_exceeded",
+    ]
+    summary = suite.diagnostics[-1]
+    assert summary.endpoint_path is None
+    assert summary.source_pointer is None
+    assert "per-suite limit of 3" in summary.message
+    assert "1 further diagnostics" in summary.message
+
+
+def test_budget_diagnostics_stay_visible_when_the_diagnostic_budget_is_used_up(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_DIAGNOSTICS", 1)
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_CASES", 2)
+    endpoint = make_endpoint(
+        "/items",
+        "post",
+        parameters=tuple(
+            Parameter(
+                name=f"q{index}",
+                location="query",
+                required=True,
+                schema=Schema(raw={"type": "string", "example": "x"}),
+                source_scope="operation",
+            )
+            for index in range(3)
+        ),
+        request_body=body_with_schema(missing_reference_body(4)),
+        responses=BAD_REQUEST,
+    )
+
+    suite = generate_test_suite(make_result(endpoint))
+
+    assert [item.code for item in suite.diagnostics] == [
+        "unsupported_schema_reference",
+        "generation_case_budget_exceeded",
+        "generation_diagnostic_budget_exceeded",
+    ]
+    assert [case.category for case in suite.cases] == ["positive"]
+
+
+def test_budget_exhaustion_output_is_deterministic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_EXPANSIONS", 40)
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_CASES", 6)
+
+    def build() -> NormalizationResult:
+        return make_result_with_endpoints(
+            (
+                post_endpoint(schema_reference("L0"), "/optional"),
+                post_endpoint(schema_reference("R0"), "/required"),
+            ),
+            {
+                **diamond_components(6, required=False),
+                **{
+                    name.replace("L", "R"): _rename_refs(raw)
+                    for name, raw in diamond_components(3, required=True).items()
+                },
+            },
+        )
+
+    first = generate_test_suite(build())
+    second = generate_test_suite(build())
+
+    assert first == second
+    assert first.model_dump_json() == second.model_dump_json()
+    assert BUDGET_CODES & {item.code for item in first.diagnostics}
+
+
+def _rename_refs(raw: object) -> object:
+    return json.loads(json.dumps(raw).replace("schemas/L", "schemas/R"))
+
+
+def test_each_generation_call_has_its_own_budget_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = generator_module._generate_suite
+    seen: list[object] = []
+    inner = make_result(make_endpoint("/inner"))
+
+    def wrapped(result: NormalizationResult, budget: object) -> GeneratedTestSuite:
+        seen.append(budget)
+        if len(seen) == 1:
+            generate_test_suite(inner)
+            assert generator_module._BUDGET.get() is budget
+        return original(result, budget)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(generator_module, "_generate_suite", wrapped)
+
+    generate_test_suite(make_result(make_endpoint("/outer")))
+
+    assert len(seen) == 2
+    assert seen[0] is not seen[1]
+    assert generator_module._BUDGET.get() is None
+
+
+def test_budget_state_is_restored_when_generation_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def failing(result: NormalizationResult, budget: object) -> GeneratedTestSuite:
+        assert generator_module._BUDGET.get() is budget
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(generator_module, "_generate_suite", failing)
+
+    with pytest.raises(RuntimeError):
+        generate_test_suite(make_result(make_endpoint("/items")))
+
+    assert generator_module._BUDGET.get() is None
+    assert dict(generator_module._SCHEMA_COMPONENTS.get()) == {}
+
+
+def test_helpers_outside_generation_have_no_budget_limit() -> None:
+    assert generator_module._BUDGET.get() is None
+    generator_module._charge_expansion("/components/schemas/A", "#/components/schemas/A")
