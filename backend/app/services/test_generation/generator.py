@@ -268,26 +268,23 @@ def _generate_suite(result: NormalizationResult, budget: _GenerationBudget) -> G
             if exhausted is None:
                 cases.append(positive)
                 for step_name, step in _negative_steps(endpoint, positive, result.api):
-                    step_result, exhausted = _run_step(budget, step)
+                    try:
+                        step_result, exhausted = _run_step(budget, step)
+                    except _UnsupportedOperation as issue:
+                        # The step is dropped as a whole; independent steps go on.
+                        diagnostics.extend(
+                            budget.admit([_unsupported_diagnostic(issue, endpoint)])
+                        )
+                        continue
                     if exhausted is not None:
                         break
                     step_cases, step_diagnostics = step_result
                     cases.extend(step_cases)
                     diagnostics.extend(budget.admit(step_diagnostics))
         except _UnsupportedOperation as issue:
+            # Only the positive baseline can fail here: the endpoint is skipped.
             diagnostics.extend(
-                budget.admit(
-                    [
-                        GenerationDiagnostic(
-                            code=issue.code,
-                            message=str(issue),
-                            endpoint_path=endpoint.path,
-                            endpoint_method=endpoint.method,
-                            source_pointer=issue.pointer,
-                            reference_uri=issue.reference_uri,
-                        )
-                    ]
-                )
+                budget.admit([_unsupported_diagnostic(issue, endpoint)])
             )
         if exhausted is not None:
             diagnostics.append(
@@ -335,6 +332,19 @@ def _generate_suite(result: NormalizationResult, budget: _GenerationBudget) -> G
         openapi_version=result.api.openapi_version,
         cases=tuple(cases),
         diagnostics=tuple(diagnostics),
+    )
+
+
+def _unsupported_diagnostic(
+    issue: _UnsupportedOperation, endpoint: Endpoint
+) -> GenerationDiagnostic:
+    return GenerationDiagnostic(
+        code=issue.code,
+        message=str(issue),
+        endpoint_path=endpoint.path,
+        endpoint_method=endpoint.method,
+        source_pointer=issue.pointer,
+        reference_uri=issue.reference_uri,
     )
 
 

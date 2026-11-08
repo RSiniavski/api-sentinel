@@ -4522,3 +4522,61 @@ def test_budget_state_is_restored_when_generation_fails(
 def test_helpers_outside_generation_have_no_budget_limit() -> None:
     assert generator_module._BUDGET.get() is None
     generator_module._charge_expansion("/components/schemas/A", "#/components/schemas/A")
+
+
+def test_unsupported_negative_step_does_not_stop_later_negative_steps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = {
+        "type": "object",
+        "required": ["name", "qty"],
+        "properties": {
+            "name": {"type": "string", "example": "x"},
+            "qty": {"type": "integer", "minimum": 1, "maximum": 9, "example": 3},
+        },
+    }
+
+    def build() -> NormalizationResult:
+        return make_result(post_endpoint(body))
+
+    reference = generate_test_suite(build())
+    assert any(case.violated_constraint == "minimum" for case in reference.cases)
+    assert any(case.violated_constraint == "type" for case in reference.cases)
+
+    entry_counts: dict[str, tuple[int, int]] = {}
+    original_wrong_type = generator_module._wrong_type_negative_cases
+
+    def failing_numeric(*args: object) -> object:
+        budget = generator_module._BUDGET.get()
+        assert budget is not None
+        entry_counts["failing"] = budget.case_counts()
+        budget.charge_case()
+        budget.charge_case()
+        raise generator_module._UnsupportedOperation(
+            "simulated_unsupported", "Simulated failure.", "/paths/~1items/post"
+        )
+
+    def spying_wrong_type(*args: object) -> object:
+        budget = generator_module._BUDGET.get()
+        assert budget is not None
+        entry_counts["next"] = budget.case_counts()
+        return original_wrong_type(*args)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(generator_module, "_numeric_boundary_negative_cases", failing_numeric)
+    monkeypatch.setattr(generator_module, "_wrong_type_negative_cases", spying_wrong_type)
+
+    suite = generate_test_suite(build())
+
+    # The failed step left no cases and gave its case counts back.
+    assert not any(case.violated_constraint in {"minimum", "maximum"} for case in suite.cases)
+    assert entry_counts["next"] == entry_counts["failing"]
+    # The next step still ran and produced the same cases as without the failure.
+    wrong_type = [case for case in suite.cases if case.violated_constraint == "type"]
+    assert wrong_type == [
+        case for case in reference.cases if case.violated_constraint == "type"
+    ]
+    assert [item.code for item in suite.diagnostics] == ["simulated_unsupported"]
+    assert suite.diagnostics[0].endpoint_path == "/items"
+    assert suite.diagnostics[0].source_pointer == "/paths/~1items/post"
+    expected = [case for case in reference.cases if case.violated_constraint not in {"minimum", "maximum"}]
+    assert list(suite.cases) == expected
