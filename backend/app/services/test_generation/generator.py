@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextvars import ContextVar
 from copy import deepcopy
 import math
@@ -367,7 +367,23 @@ def _wrong_type_negative_cases(
     targets: list[tuple[tuple[str, ...], tuple[str, ...], Any, str]] = []
     diagnostics: list[GenerationDiagnostic] = []
 
+    def report_issue(issue: _UnsupportedOperation) -> None:
+        diagnostics.append(
+            GenerationDiagnostic(
+                code="wrong_type_unsupported_schema",
+                message=str(issue),
+                endpoint_path=endpoint.path,
+                endpoint_method=endpoint.method,
+                source_pointer=issue.pointer,
+                reference_uri=issue.reference_uri,
+            )
+        )
+
     def visit(schema: Any, value: Any, path: tuple[str, ...], pointer: str) -> None:
+        followed = _follow_property_schema(schema, pointer, report_issue)
+        if followed is None:
+            return
+        schema, pointer = followed
         if not isinstance(schema, dict) or not isinstance(value, dict):
             return
         properties = schema.get("properties")
@@ -376,8 +392,13 @@ def _wrong_type_negative_cases(
         for name in sorted(properties):
             if name not in value:
                 continue
-            child_schema = properties[name]
             child_pointer = _child(pointer, "properties", name)
+            followed_child = _follow_property_schema(
+                properties[name], child_pointer, report_issue
+            )
+            if followed_child is None:
+                continue
+            child_schema, child_pointer = followed_child
             child_path = (*path, name)
             if not isinstance(child_schema, dict):
                 continue
@@ -512,6 +533,14 @@ def _enum_const_negative_cases(
             )
         )
 
+    def report_issue(issue: _UnsupportedOperation) -> None:
+        add_diagnostic(
+            "enum_const_unsupported_schema",
+            str(issue),
+            issue.pointer,
+            issue.reference_uri,
+        )
+
     def visit(
         schema: Any,
         value: Any,
@@ -519,6 +548,10 @@ def _enum_const_negative_cases(
         pointer: str,
         depth: int,
     ) -> None:
+        followed = _follow_property_schema(schema, pointer, report_issue)
+        if followed is None:
+            return
+        schema, pointer = followed
         if not isinstance(schema, dict) or not isinstance(value, dict):
             return
         if depth > _MAX_DEPTH:
@@ -535,9 +568,14 @@ def _enum_const_negative_cases(
         for name in sorted(properties):
             if name not in value:
                 continue
-            child_schema = properties[name]
             child_value = value[name]
             child_pointer = _child(pointer, "properties", name)
+            followed_child = _follow_property_schema(
+                properties[name], child_pointer, report_issue
+            )
+            if followed_child is None:
+                continue
+            child_schema, child_pointer = followed_child
             child_path = (*path, name)
             if not isinstance(child_schema, dict):
                 continue
@@ -738,7 +776,22 @@ def _string_boundary_negative_cases(
     targets: list[tuple[tuple[str, ...], str, str, str]] = []
     diagnostics: list[GenerationDiagnostic] = []
 
+    def report_issue(issue: _UnsupportedOperation) -> None:
+        diagnostics.append(
+            _string_boundary_diagnostic(
+                endpoint,
+                "string_boundary_unsupported_schema",
+                str(issue),
+                issue.pointer,
+                issue.reference_uri,
+            )
+        )
+
     def visit(schema: Any, value: Any, path: tuple[str, ...], pointer: str) -> None:
+        followed = _follow_property_schema(schema, pointer, report_issue)
+        if followed is None:
+            return
+        schema, pointer = followed
         if not isinstance(schema, dict) or not isinstance(value, dict):
             return
         properties = schema.get("properties")
@@ -747,8 +800,13 @@ def _string_boundary_negative_cases(
         for name in sorted(properties):
             if name not in value:
                 continue
-            child_schema = properties[name]
             child_pointer = _child(pointer, "properties", name)
+            followed_child = _follow_property_schema(
+                properties[name], child_pointer, report_issue
+            )
+            if followed_child is None:
+                continue
+            child_schema, child_pointer = followed_child
             child_path = (*path, name)
             if not isinstance(child_schema, dict):
                 continue
@@ -938,10 +996,21 @@ def _numeric_boundary_negative_cases(
     root_pointer = _child(body_pointer, "content", "application/json", "schema")
     body_value = positive.request_body.value
     targets: list[tuple[tuple[str, ...], dict[str, Any], str, str]] = []
-    _collect_numeric_targets(schema, (), root_pointer, targets)
+    issues: list[_UnsupportedOperation] = []
+    _collect_numeric_targets(schema, (), root_pointer, targets, issues)
 
     cases: list[GeneratedTestCase] = []
-    diagnostics: list[GenerationDiagnostic] = []
+    diagnostics: list[GenerationDiagnostic] = [
+        GenerationDiagnostic(
+            code=issue.code,
+            message=str(issue),
+            endpoint_path=endpoint.path,
+            endpoint_method=endpoint.method,
+            source_pointer=issue.pointer,
+            reference_uri=issue.reference_uri,
+        )
+        for issue in issues
+    ]
     for path, target_schema, schema_pointer, constraint in targets:
         keyword_pointer = _child(schema_pointer, constraint)
         try:
@@ -1081,9 +1150,19 @@ def _collect_numeric_targets(
     path: tuple[str, ...],
     pointer: str,
     targets: list[tuple[tuple[str, ...], dict[str, Any], str, str]],
+    issues: list[_UnsupportedOperation],
+    active: tuple[str, ...] = (),
 ) -> None:
-    """Walk object schemas in stable property order and collect numeric bounds."""
-    if not isinstance(schema, dict):
+    """Walk object schemas in stable property order and collect numeric bounds.
+
+    Unusable references are appended to issues. A schema already being expanded
+    (a recursive reference) is not expanded again.
+    """
+    followed = _follow_property_schema(schema, pointer, issues.append)
+    if followed is None:
+        return
+    schema, pointer = followed
+    if not isinstance(schema, dict) or pointer in active:
         return
     schema_type = schema.get("type")
     if schema_type in ("integer", "number"):
@@ -1104,13 +1183,16 @@ def _collect_numeric_targets(
     if not isinstance(properties, dict):
         return
     for name in sorted(properties):
-        child = properties[name]
+        child_pointer = _child(pointer, "properties", name)
+        followed_child = _follow_property_schema(properties[name], child_pointer, issues.append)
+        if followed_child is None:
+            continue
+        child, child_pointer = followed_child
         if not isinstance(child, dict):
             continue
         if child.get("readOnly") is True:
             continue
         child_path = (*path, name)
-        child_pointer = _child(pointer, "properties", name)
         if child.get("type") in ("integer", "number"):
             if child.get("readOnly") is True:
                 continue
@@ -1131,6 +1213,8 @@ def _collect_numeric_targets(
                 child_path,
                 child_pointer,
                 targets,
+                issues,
+                (*active, pointer),
             )
 
 
@@ -1481,6 +1565,10 @@ def _required_writable_property_paths(
     tuple[tuple[str, str], ...],
 ]:
     """Return supported omissions and required names lacking property schemas."""
+    followed_root = _follow_property_schema(schema, schema_pointer, _skip_issue)
+    if followed_root is None:
+        return (), ()
+    schema, schema_pointer = followed_root
     if not isinstance(schema, dict):
         return (), ()
     properties = schema.get("properties", {})
@@ -1496,13 +1584,18 @@ def _required_writable_property_paths(
                 (name, _child(schema_pointer, "required", str(required_index)))
             )
             continue
-        child_schema = properties[name]
+        property_schema_pointer = _child(schema_pointer, "properties", name)
+        followed_child = _follow_property_schema(
+            properties[name], property_schema_pointer, _skip_issue
+        )
+        if followed_child is None:
+            continue
+        child_schema, child_schema_pointer = followed_child
         if isinstance(child_schema, dict) and child_schema.get("readOnly") is True:
             continue
         if not isinstance(value, dict) or name not in value:
             continue
         property_path = (*path, name)
-        property_schema_pointer = _child(schema_pointer, "properties", name)
         found.append((property_path, property_schema_pointer))
         child_value = value[name]
         if isinstance(child_schema, dict) and isinstance(child_value, dict):
@@ -1510,7 +1603,7 @@ def _required_writable_property_paths(
                 child_schema,
                 child_value,
                 property_path,
-                schema_pointer=property_schema_pointer,
+                schema_pointer=child_schema_pointer,
             )
             found.extend(nested_found)
             undeclared.extend(nested_undeclared)
@@ -1897,6 +1990,26 @@ def _is_request_read_only(child: Any, direction: str, pointer: str) -> bool:
         return False
     resolved, _, _ = _follow_schema_reference(child, pointer)
     return isinstance(resolved, dict) and resolved.get("readOnly") is True
+
+
+def _follow_property_schema(
+    schema: Any, pointer: str, report: Callable[[_UnsupportedOperation], None]
+) -> tuple[Any, str] | None:
+    """Follow $ref for a negative-case walker.
+
+    An unusable reference is passed to report and the node is skipped, so one
+    bad reference does not stop the other negative cases of the endpoint.
+    """
+    try:
+        resolved, resolved_pointer, _ = _follow_schema_reference(schema, pointer)
+    except _UnsupportedOperation as issue:
+        report(issue)
+        return None
+    return resolved, resolved_pointer
+
+
+def _skip_issue(issue: _UnsupportedOperation) -> None:
+    """Ignore an unusable reference where no diagnostic channel exists."""
 
 
 def _select_value(

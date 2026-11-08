@@ -3788,3 +3788,227 @@ def test_schema_components_do_not_leak_between_generation_calls() -> None:
         "unsupported_schema_reference"
     ]
     assert dict(generator_module._SCHEMA_COMPONENTS.get()) == {}
+
+
+NAME_SCHEMA: dict[str, object] = {
+    "type": "string",
+    "minLength": 2,
+    "maxLength": 10,
+    "example": "widget",
+}
+KIND_SCHEMA: dict[str, object] = {"type": "string", "enum": ["a", "b"]}
+QTY_SCHEMA: dict[str, object] = {
+    "type": "integer",
+    "minimum": 1,
+    "maximum": 9,
+    "example": 3,
+}
+
+
+def case_summary(suite: GeneratedTestSuite) -> list[tuple[object, ...]]:
+    return [
+        (
+            case.case_id,
+            case.category,
+            case.violated_constraint,
+            case.affected_property,
+            case.request_body,
+        )
+        for case in suite.cases
+    ]
+
+
+def referenced_properties_body() -> dict[str, object]:
+    return {
+        "type": "object",
+        "required": ["name", "kind", "qty"],
+        "properties": {
+            "name": schema_reference("Name"),
+            "kind": schema_reference("Kind"),
+            "qty": schema_reference("Qty"),
+        },
+    }
+
+
+REFERENCED_PROPERTY_COMPONENTS: dict[str, object] = {
+    "Name": NAME_SCHEMA,
+    "Kind": KIND_SCHEMA,
+    "Qty": QTY_SCHEMA,
+}
+
+
+def test_top_level_schema_reference_body_generates_same_negative_cases_as_inline() -> None:
+    inline = generate_test_suite(
+        make_result(
+            make_endpoint(
+                "/items",
+                "post",
+                request_body=body_with_schema(REFERENCED_BODY_SCHEMA),
+                responses=BAD_REQUEST,
+            )
+        )
+    )
+    referenced = generate_test_suite(
+        make_result_with_schemas(
+            make_endpoint(
+                "/items",
+                "post",
+                request_body=body_with_schema(schema_reference("Item")),
+                responses=BAD_REQUEST,
+            ),
+            {"Item": REFERENCED_BODY_SCHEMA},
+        )
+    )
+
+    assert inline.diagnostics == referenced.diagnostics == ()
+    assert len(inline.cases) > 10
+    assert case_summary(referenced) == case_summary(inline)
+
+
+def test_referenced_properties_generate_same_negative_cases_as_inline_properties() -> None:
+    inline = generate_test_suite(
+        make_result(
+            make_endpoint(
+                "/items",
+                "post",
+                request_body=body_with_schema(REFERENCED_BODY_SCHEMA),
+                responses=BAD_REQUEST,
+            )
+        )
+    )
+    referenced = generate_test_suite(
+        make_result_with_schemas(
+            make_endpoint(
+                "/items",
+                "post",
+                request_body=body_with_schema(referenced_properties_body()),
+                responses=BAD_REQUEST,
+            ),
+            REFERENCED_PROPERTY_COMPONENTS,
+        )
+    )
+
+    assert referenced.diagnostics == ()
+    assert case_summary(referenced) == case_summary(inline)
+
+
+def test_negative_case_provenance_points_into_the_referenced_component() -> None:
+    suite = generate_test_suite(
+        make_result_with_schemas(
+            make_endpoint(
+                "/items",
+                "post",
+                request_body=body_with_schema(referenced_properties_body()),
+                responses=BAD_REQUEST,
+            ),
+            REFERENCED_PROPERTY_COMPONENTS,
+        )
+    )
+
+    def provenance(constraint: str, prop: str) -> tuple[str, ...]:
+        return next(
+            case.provenance
+            for case in suite.cases
+            if case.violated_constraint == constraint and case.affected_property == prop
+        )
+
+    assert provenance("enum", "/kind")[-3:] == (
+        "/components/schemas/Kind",
+        "/components/schemas/Kind/enum",
+        "violated_constraint:enum:/kind",
+    )
+    assert provenance("minimum", "/qty")[-3:] == (
+        "/components/schemas/Qty",
+        "/components/schemas/Qty/minimum",
+        "violated_constraint:minimum:/qty",
+    )
+    assert provenance("minLength", "/name")[-3:] == (
+        "/components/schemas/Name",
+        "/components/schemas/Name/minLength",
+        "violated_constraint:minLength:/name",
+    )
+    assert provenance("required_property", "/kind")[-2:] == (
+        "/paths/~1items/post/requestBody/content/application~1json/schema/properties/kind",
+        "violated_constraint:required_property:/kind",
+    )
+
+
+def test_read_only_property_behind_reference_gets_no_negative_cases() -> None:
+    body = {
+        "type": "object",
+        "required": ["id", "name"],
+        "properties": {
+            "id": schema_reference("Id"),
+            "name": schema_reference("Name"),
+        },
+    }
+
+    suite = generate_test_suite(
+        make_result_with_schemas(
+            make_endpoint(
+                "/items",
+                "post",
+                request_body=body_with_schema(body),
+                responses=BAD_REQUEST,
+            ),
+            {"Id": {"type": "integer", "readOnly": True, "minimum": 1}, "Name": NAME_SCHEMA},
+        )
+    )
+
+    assert suite.diagnostics == ()
+    assert not [case for case in suite.cases if case.affected_property == "/id"]
+    assert any(case.affected_property == "/name" for case in suite.cases)
+
+
+def test_recursive_optional_schema_expands_once_and_finishes() -> None:
+    tree = {
+        "type": "object",
+        "properties": {
+            "value": {"type": "integer", "minimum": 0, "maximum": 5, "example": 1},
+            "left": schema_reference("Tree"),
+            "right": schema_reference("Tree"),
+        },
+    }
+
+    suite = generate_test_suite(
+        make_result_with_schemas(
+            make_endpoint(
+                "/items",
+                "post",
+                request_body=body_with_schema(schema_reference("Tree")),
+                responses=BAD_REQUEST,
+            ),
+            {"Tree": tree},
+        )
+    )
+
+    assert suite.diagnostics == ()
+    numeric = [
+        case for case in suite.cases if case.violated_constraint in {"minimum", "maximum"}
+    ]
+    assert {case.affected_property for case in numeric} == {"/value"}
+    assert len(numeric) == 2
+
+
+def test_unusable_optional_property_reference_does_not_stop_other_negative_cases() -> None:
+    body = {
+        "type": "object",
+        "properties": {"ghost": schema_reference("Missing")},
+    }
+
+    suite = generate_test_suite(
+        make_result_with_schemas(
+            make_endpoint(
+                "/items",
+                "post",
+                request_body=body_with_schema(body),
+                responses=BAD_REQUEST,
+            ),
+            {},
+        )
+    )
+
+    assert [case.category for case in suite.cases] == ["positive", "negative"]
+    assert suite.cases[1].violated_constraint == "required_request_body"
+    assert [item.code for item in suite.diagnostics] == ["unsupported_schema_reference"]
+    assert suite.diagnostics[0].reference_uri == "#/components/schemas/Missing"
