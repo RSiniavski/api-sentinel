@@ -4,7 +4,7 @@
 
 ## 1. Model overview
 
-The API Model is the typed, deterministic representation produced by the OpenAPI Normalizer from the parsed and validated dictionary returned by `parse_openapi_document(content: str, filename: str) -> dict[str, Any]`. The API Model is implemented using Pydantic v2. The Deterministic Test Generation Engine is the next consumer and has not yet been implemented.
+The API Model is the typed, deterministic representation produced by the OpenAPI Normalizer from the parsed and validated dictionary returned by `parse_openapi_document(content: str, filename: str) -> dict[str, Any]`. The API Model is implemented using Pydantic v2. The Deterministic Test Generation Engine (`backend/app/services/test_generation/`) consumes this model. It is partially implemented (Steps 1–6.3); see `AGENTS.md` §12 and `docs/ROADMAP.md` for its current status.
 
 The implemented Normalizer accepts that validated dictionary and returns a `NormalizationResult`, whose `api` field contains the model below and whose `diagnostics` field reports parameter overrides. The model is not a replacement for the source document and does not perform parsing, specification validation, network access, or HTTP execution. It preserves the source information needed for test generation, especially full JSON-compatible Schema Objects and their reference edges.
 
@@ -19,13 +19,13 @@ The API Model is intentionally not a byte-for-byte copy of the source document. 
 - The shared `uri_references.py` helper validates local `$ref` URI syntax. The Parser's OpenAPI validator uses that helper and performs OpenAPI specification validation with `openapi-spec-validator`, which may resolve local references internally. The API Model validates `LocalReference.uri` with the shared helper and retains references as reference edges without expanding or inlining them.
 - The Parser returns the validated dictionary. The implemented Normalizer extracts API metadata, component registries, endpoints, effective parameters and override diagnostics into `NormalizationResult`; it retains local reference edges and does not fetch or expand them. Path Item `$ref` under `paths` is rejected with a normalization error.
 - The API Model is implemented in `models.py` using Pydantic v2. Its model configuration is strict, forbids extra fields, and is frozen as a shallow mutation guard. Schema preservation and reference behavior follow this contract.
-- The current pipeline is Parser → validated dictionary → Normalizer → `NormalizationResult`/`ApiModel` → future Deterministic Test Generation Engine. Phase 3 — OpenAPI Processing is complete; Phase 4 is in progress.
+- The current pipeline is Parser → validated dictionary → Normalizer → `NormalizationResult`/`ApiModel` → `generate_test_suite()` of the Deterministic Test Generation Engine (partially implemented). Phase 3 — OpenAPI Processing is complete; Phase 4 is in progress.
 
 - `requirements.txt` directly pins `pydantic==2.14.2`; `pydantic-settings==2.16.2` remains pinned separately.
 - `openapi-spec-validator==0.9.0` provides OpenAPI specification validation, not model extraction. `PyYAML==6.0.3` provides YAML parsing. FastAPI and HTTPX are not needed by the API Model itself.
-- Tests cover Parser behavior, API Model behavior, Normalizer behavior, and health endpoints. Test files include `test_openapi_parser.py`, `test_api_model.py`, `test_openapi_normalizer.py`, and `test_health.py`.
+- Tests cover Parser behavior, API Model behavior, Normalizer behavior, Generator behavior, and health endpoints. Test files include `test_openapi_parser.py`, `test_api_model.py`, `test_openapi_normalizer.py`, `test_test_generation.py`, and `test_health.py`.
 
-See [the historical Normalizer proposal](API_MODEL_NORMALIZER_PROPOSAL.md), [the Generator proposal](TEST_GENERATION_ENGINE_PROPOSAL.md), [the Parser](../backend/app/services/openapi/parser.py), [the validator](../backend/app/services/openapi/validator.py), [the Normalizer](../backend/app/services/openapi/normalizer.py), [the shared URI validation module](../backend/app/services/openapi/uri_references.py), [the API Model](../backend/app/services/openapi/models.py), [the requirements](../requirements.txt), [the Parser tests](../tests/test_openapi_parser.py), [the API Model tests](../tests/test_api_model.py), [the Normalizer tests](../tests/test_openapi_normalizer.py), and [the health tests](../tests/test_health.py).
+See [the historical Normalizer proposal](API_MODEL_NORMALIZER_PROPOSAL.md), [the Generator proposal](TEST_GENERATION_ENGINE_PROPOSAL.md), [the Parser](../backend/app/services/openapi/parser.py), [the validator](../backend/app/services/openapi/validator.py), [the Normalizer](../backend/app/services/openapi/normalizer.py), [the Generator](../backend/app/services/test_generation/generator.py), [the generated output models](../backend/app/services/test_generation/models.py), [the shared URI validation module](../backend/app/services/openapi/uri_references.py), [the API Model](../backend/app/services/openapi/models.py), [the requirements](../requirements.txt), [the Parser tests](../tests/test_openapi_parser.py), [the API Model tests](../tests/test_api_model.py), [the Normalizer tests](../tests/test_openapi_normalizer.py), [the Generator tests](../tests/test_test_generation.py), and [the health tests](../tests/test_health.py).
 
 ## 3. Design rules
 
@@ -78,6 +78,15 @@ class LocalReference(Model):
     uri: str
     summary: str | None = None
     description: str | None = None
+    extensions: dict[str, JsonValue] = Field(default_factory=dict)
+
+    @field_validator("uri")
+    @classmethod
+    def validate_local_uri(cls, value: str) -> str:
+        """Accept only syntactically valid local URI fragment references."""
+        if not _is_valid_local_reference(value):  # shared helper from uri_references.py
+            raise ValueError("uri must be a valid local URI fragment reference")
+        return value
 
 
 class ParameterReference(Model):
@@ -287,7 +296,7 @@ To reduce accidental cross-object mutation, the proposed `field_validator` deep-
 
 ## 5. Complete field contract
 
-In the tables, “required” means the Normalizer must supply the field when constructing the model. Defaults shown are model defaults, not necessarily explicit source values. The Pydantic `model_fields_set` can be consulted for optional scalar/example fields if distinguishing an absent source property from a source value of JSON `null` becomes necessary.
+In the tables, “required” means the Normalizer must supply the field when constructing the model. Defaults shown are model defaults, not necessarily explicit source values. The Pydantic `model_fields_set` can be consulted for optional scalar/example fields if distinguishing an absent source property from a source value of JSON `null` becomes necessary. This works for hand-built models. The current Normalizer, however, passes `example=source.get("example")` to `Parameter` and `MediaType` unconditionally, so on normalized models the `example` field is always set and an absent example and an explicit JSON `null` example both arrive as `None`. Consumers must treat `None` as absent until the Normalizer is changed.
 
 ### `ApiModel`
 
@@ -357,7 +366,7 @@ Both OpenAPI 3.0.x and 3.1.x define `$ref` on a Path Item Object. Both versions 
 | `allow_reserved` | `bool \| None` | `None` | Query serialization option. |
 | `schema` | `Schema \| None` | `None` | Schema-style parameter definition. |
 | `content` | `dict[str, MediaType] \| None` | `None` | Content-style parameter definition keyed by media type. At most one of `schema` and `content` should be set. |
-| `example` | `JsonValue \| None` | `None` | Singular example; `model_fields_set` distinguishes omitted from explicit JSON null. |
+| `example` | `JsonValue \| None` | `None` | Singular example. For hand-built models `model_fields_set` distinguishes omitted from explicit JSON null; the current Normalizer always sets this field (`source.get("example")`), so normalized models do not preserve the distinction. |
 | `examples` | `dict[str, JsonObject \| LocalReference]` | `{}` | Named examples, preserving local references. |
 | `source_scope` | `Literal["path", "operation", "component"]` | Required | Provenance of the effective parameter value. |
 | `extensions` | `dict[str, JsonValue]` | `{}` | Parameter `x-` fields. |
@@ -392,7 +401,7 @@ Responses live in `Endpoint.responses` under string keys. This preserves exact c
 | Field | Type | Required/default | Meaning and preservation |
 |---|---|---|---|
 | `schema` | `Schema \| None` | `None` | Optional schema value; `Schema.raw` preserves keywords and composition. |
-| `example` | `JsonValue \| None` | `None` | Singular example value, including explicit JSON null via field-set tracking. |
+| `example` | `JsonValue \| None` | `None` | Singular example value. For hand-built models explicit JSON null is distinguishable via field-set tracking; the current Normalizer always sets this field (`source.get("example")`), so normalized models do not preserve the distinction. |
 | `examples` | `dict[str, JsonObject \| LocalReference]` | `{}` | Named example definitions or local references. |
 | `encoding` | `dict[str, JsonObject]` | `{}` | Property encoding metadata, notably for form/multipart. |
 | `extensions` | `dict[str, JsonValue]` | `{}` | Media Type `x-` fields. |
@@ -568,7 +577,7 @@ pet_schema = api.components.schemas["Pet"]
 assert pet_schema.raw["type"] == "object"
 ```
 
-The future Generator should receive a small resolver/lookup service or use a Normalizer-provided registry access method. On a reference edge it looks up one target, traverses only as required for that test, and keeps a visited-reference set to detect cycles. It must enforce an explicit traversal/generation budget. It must not fetch external URIs. This document defines the contract only; it does not implement reference parsing, resolution, or traversal.
+The Generator (`backend/app/services/test_generation/generator.py`) follows references lazily with private helpers, not through a separate resolver service or a Normalizer-provided registry method. Targets of `#/components/parameters/<name>`, `#/components/requestBodies/<name>`, `#/components/responses/<name>` and `#/components/schemas/<name>` are looked up directly in the matching `Components` registry (schemas through a per-call registry; schema references are followed for request-side generation only, while response schemas are preserved as declared and are not resolved or evaluated by the Generator). On a reference edge it looks up one target, traverses only as required for the case being built, follows alias chains, and detects cycles by keeping the followed URIs. Missing targets, cycles and unsupported forms (external references, `$defs`, anchors) produce a generation diagnostic and no case. Nesting depth is limited to 32 levels (`schema_depth_limit`), and deterministic budgets limit resolved reference expansions, cases and diagnostics per endpoint and per suite (*implemented*; details in `AGENTS.md` §12). The Generator never fetches external URIs. This document defines the model contract only; it does not describe the Generator's behavior in detail.
 
 For JSON Pointer component references, target lookup must percent-decode and apply `~1`/`~0` decoding in the correct order. A local anchor is a distinct reference form, not a component-name string. The installed validator currently has a known OpenAPI 3.1 anchor resolution limitation documented in the current Parser tests; do not claim full anchor support for normalized/generator use until that library behavior is addressed.
 
@@ -583,6 +592,8 @@ Because `Schema.raw` retains the original mapping:
 - Unknown JSON Schema keywords and vendor extensions survive model serialization inside `Schema.raw`.
 
 The Generator can offer typed helper functions for common keywords, but those helpers must read from `raw` and must not create a second mutable copy of the same constraints.
+
+**Generator support status:** the Generator interprets only a subset of the preserved keywords, with private helpers in `generator.py` that read from `Schema.raw`: `type`, `nullable` (3.0 only), `enum`, `const`, `example`/`examples`/`default`, numeric bounds and `multipleOf`, `minLength`/`maxLength`, `minItems`/`maxItems`, `uniqueItems`, `properties`, `required`, `items`, `readOnly` (applied to request bodies: read-only properties are not generated), `writeOnly` (accepted and only type-checked as a boolean; its response-schema semantics are not implemented), annotations and `x-` keywords. Other keywords, such as `pattern` and `format`, and the compositions `allOf`/`oneOf`/`anyOf`/`not`, are preserved by the model but unsupported by the Generator (reported with diagnostics, no cases). The model itself is not affected.
 
 ## 8. Example `ApiModel` instance
 
@@ -802,10 +813,10 @@ The API Model implementation is in place. The following items remain relevant fo
 7. **Webhooks:** Webhooks are retained separately from ordinary client-call endpoints. Decide whether the Basic Edition should only preserve them or report a structured unsupported-feature diagnostic.
 8. **Empty server arrays:** The model preserves absent versus explicitly empty server declarations. Effective server selection must follow the exact OpenAPI 3.0.x and 3.1.x inheritance/default rules.
 9. **Normalization failures:** The recommended MVP behavior is to fail clearly when an unsupported construct would otherwise produce an incomplete or misleading model. Partial normalization should not silently discard information.
-10. **Format and constraint support:** The model preserves schema keywords, but the Test Generator still needs a documented subset of formats, patterns, and constraints that it can generate deterministic values for.
-11. **Reference traversal limits:** The future Generator must define explicit depth, cycle-detection, and generation-size limits when following local reference edges. The API Model itself must continue to retain references without recursive expansion.
+10. **Format and constraint support:** The model preserves schema keywords. The Generator now supports a documented subset of constraints (see "Composition and dialect preservation" in §7); `format` and `pattern` remain unsupported, and a support table for them is still an open decision.
+11. **Reference traversal limits:** *Implemented* in the Generator: a nesting depth limit, cycle detection and deterministic generation budgets apply when following local reference edges. The API Model itself continues to retain references without recursive expansion.
 
-## 11. Implementation status and next steps
+## 11. Implementation status
 
 ### Completed
 
@@ -819,23 +830,10 @@ The API Model implementation is in place. The following items remain relevant fo
 8. Added tests covering model construction, validation, serialization, reference handling, schema preservation, and distinctions between absent and explicitly empty values.
 9. Added a direct Pydantic dependency pin to `requirements.txt`.
 
-### Remaining before Normalizer implementation
+### API Model Normalizer (completed)
 
-1. Complete the final API Model audit against this contract.
-2. Resolve any discrepancies found between the implementation, tests, and documented behavior.
-3. Add or adjust tests where the audit identifies missing coverage.
-4. Ensure the contract accurately describes the implemented model and the remaining Normalizer responsibilities.
+`normalize_openapi_document(document: dict[str, Any]) -> NormalizationResult` is implemented in `backend/app/services/openapi/normalizer.py`. It normalizes API metadata, root servers, security requirements, component registries, endpoints, request bodies, media types, responses and path/operation server declarations; merges path-level and operation-level parameters by `(name, location)` while keeping reference edges; returns separate `ParameterOverrideDiagnostic` values; and rejects a Path Item `$ref` under `paths` with `OpenAPINormalizationError` (`unsupported_path_item_reference`). It is covered by `tests/test_openapi_normalizer.py`. Known limitation: `Parameter.example` and `MediaType.example` are always populated with `source.get("example")`, so absent and explicit-null examples are not distinguishable (see §5).
 
-### Next development stage: API Model Normalizer
+### Deterministic Test Generator (Phase 4, partially implemented)
 
-1. Implement `normalize_openapi_document(document: dict[str, Any]) -> NormalizationResult`.
-2. Normalize API metadata, root servers, security requirements, and component registries.
-3. Normalize paths and operations into deterministic `Endpoint` objects.
-4. Merge path-level and operation-level parameters by `(name, location)`, preserving declaration order and reference edges.
-5. Generate separate parameter override diagnostics.
-6. Normalize request bodies, media types, responses, response status keys, and path/operation server declarations.
-7. Reject unsupported Path Item `$ref` usage with a clear `OpenAPINormalizationError`.
-8. Add representative OpenAPI 3.0.x and 3.1.x fixtures and tests for normalization behavior.
-9. Verify deterministic output and reference-cycle handling.
-
-The Deterministic Test Generator must not be implemented until the Normalizer has been completed, tested, and its output contract has been verified.
+`generate_test_suite()` in `backend/app/services/test_generation/` consumes `NormalizationResult.api` and returns declarative test cases and generation diagnostics; it does not execute requests. It is covered by `tests/test_test_generation.py`. The authoritative description of what is implemented and what is planned is `AGENTS.md` §12, `docs/ROADMAP.md` and `docs/TEST_GENERATION_ENGINE_PROPOSAL.md` (the original proposal, annotated with implementation status).
