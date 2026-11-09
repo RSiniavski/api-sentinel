@@ -4969,3 +4969,605 @@ def test_response_reference_hops_are_charged_to_the_suite_expansion_budget(
     assert suite.diagnostics[0].endpoint_path == "/e2"
     assert "per-suite limit of 2" in suite.diagnostics[0].message
     assert "1 following endpoint(s)" in suite.diagnostics[0].message
+
+
+ITEM_SCHEMA: dict[str, object] = {"type": "string", "example": "x"}
+ARRAY_BODY_POINTER = "/paths/~1items/post/requestBody/content/application~1json/schema"
+ARRAY_CONSTRAINTS = {"minItems", "maxItems"}
+
+
+def tags_body(tags: object, *, required: bool = True) -> dict[str, object]:
+    return {
+        "type": "object",
+        "required": ["tags"] if required else [],
+        "properties": {"tags": tags},
+    }
+
+
+def array_cases(suite: GeneratedTestSuite) -> list[GeneratedTestCase]:
+    return [case for case in suite.cases if case.violated_constraint in ARRAY_CONSTRAINTS]
+
+
+def array_summary(suite: GeneratedTestSuite) -> list[tuple[str | None, str | None, int]]:
+    summary = []
+    for case in array_cases(suite):
+        assert case.request_body is not None
+        value = case.request_body.value
+        assert isinstance(value, dict)
+        tags = value["tags"]
+        assert isinstance(tags, list)
+        summary.append((case.affected_property, case.violated_constraint, len(tags)))
+    return summary
+
+
+def array_diagnostics(suite: GeneratedTestSuite) -> list[tuple[str, str | None]]:
+    return [
+        (item.code, item.source_pointer)
+        for item in suite.diagnostics
+        if item.code.startswith("array_bound_")
+    ]
+
+
+def tags_schema_pointer(*parts: str) -> str:
+    return "/".join((f"{ARRAY_BODY_POINTER}/properties/tags", *parts))
+
+
+def run_array_step(
+    body_schema: object, body_value: dict[str, object]
+) -> tuple[tuple[GeneratedTestCase, ...], tuple[GenerationDiagnostic, ...]]:
+    """Run only the array step against a hand-set positive body.
+
+    Contradictory or malformed bounds on a present property cannot come from a
+    successful positive baseline, so the baseline is replaced here.
+    """
+    result = make_result(post_endpoint(body_schema))
+    baseline = generate_test_suite(make_result(post_endpoint({"type": "object"}))).cases[0]
+    positive = baseline.model_copy(
+        update={"request_body": GeneratedBody(media_type="application/json", value=body_value)}
+    )
+    return generator_module._array_bound_negative_cases(
+        result.api.endpoints[0], positive, result.api
+    )
+
+
+def array_suite(tags: object, **options: bool) -> GeneratedTestSuite:
+    return generate_test_suite(make_result(post_endpoint(tags_body(tags, **options))))
+
+
+def test_min_items_violation_has_one_item_fewer() -> None:
+    suite = array_suite({"type": "array", "minItems": 2, "items": ITEM_SCHEMA})
+
+    assert array_summary(suite) == [("/tags", "minItems", 1)]
+    case = array_cases(suite)[0]
+    assert case.request_body is not None
+    assert case.request_body.value == {"tags": ["x"]}
+    assert case.category == "negative"
+    assert case.expected_outcome == "request_rejection_status_unspecified"
+    assert case.provenance[-3:] == (
+        tags_schema_pointer(),
+        tags_schema_pointer("minItems"),
+        "violated_constraint:minItems:/tags",
+    )
+    assert array_diagnostics(suite) == []
+
+
+def test_max_items_violation_has_one_item_more() -> None:
+    suite = array_suite({"type": "array", "maxItems": 3, "items": ITEM_SCHEMA})
+
+    assert array_summary(suite) == [("/tags", "maxItems", 4)]
+    assert array_cases(suite)[0].provenance[-2:] == (
+        tags_schema_pointer("maxItems"),
+        "violated_constraint:maxItems:/tags",
+    )
+
+
+def test_both_bounds_give_independent_cases() -> None:
+    suite = array_suite({"type": "array", "minItems": 2, "maxItems": 4, "items": ITEM_SCHEMA})
+
+    assert array_summary(suite) == [("/tags", "minItems", 1), ("/tags", "maxItems", 5)]
+    assert len({case.case_id for case in array_cases(suite)}) == 2
+
+
+def test_min_items_zero_has_no_case_and_max_items_zero_has_one_item() -> None:
+    suite = array_suite({"type": "array", "minItems": 0, "maxItems": 0, "items": ITEM_SCHEMA})
+
+    assert array_summary(suite) == [("/tags", "maxItems", 1)]
+    assert array_diagnostics(suite) == [
+        ("array_bound_no_safe_candidate", tags_schema_pointer("minItems"))
+    ]
+
+
+def test_min_items_one_gives_an_empty_array() -> None:
+    suite = array_suite({"type": "array", "minItems": 1, "items": ITEM_SCHEMA})
+
+    assert array_summary(suite) == [("/tags", "minItems", 0)]
+
+
+def test_bounds_around_the_collection_size_limit() -> None:
+    at_limit = array_suite({"type": "array", "maxItems": 99, "items": ITEM_SCHEMA})
+    above_limit = array_suite({"type": "array", "maxItems": 100, "items": ITEM_SCHEMA})
+    large_min = array_suite({"type": "array", "minItems": 100, "items": ITEM_SCHEMA})
+
+    assert array_summary(at_limit) == [("/tags", "maxItems", 100)]
+    assert array_summary(above_limit) == []
+    assert array_diagnostics(above_limit) == [
+        ("array_bound_no_safe_candidate", tags_schema_pointer("maxItems"))
+    ]
+    assert array_summary(large_min) == [("/tags", "minItems", 99)]
+
+
+def test_contradictory_bounds_give_one_diagnostic_and_no_case() -> None:
+    cases, diagnostics = run_array_step(
+        tags_body({"type": "array", "minItems": 3, "maxItems": 1, "items": ITEM_SCHEMA}),
+        {"tags": ["x"]},
+    )
+
+    assert cases == ()
+    assert [(item.code, item.source_pointer) for item in diagnostics] == [
+        ("array_bound_contradictory_bounds", tags_schema_pointer())
+    ]
+
+
+@pytest.mark.parametrize("bound", [-1, 1.5, 2.0, True, "2", None])
+def test_malformed_bounds_are_diagnosed_without_a_case(bound: object) -> None:
+    cases, diagnostics = run_array_step(
+        tags_body({"type": "array", "minItems": bound, "items": ITEM_SCHEMA}),
+        {"tags": ["x"]},
+    )
+
+    assert cases == ()
+    assert [item.code for item in diagnostics] == ["array_bound_unsupported_schema"]
+    assert diagnostics[0].source_pointer == tags_schema_pointer("minItems")
+
+
+@pytest.mark.parametrize(
+    ("bounds", "malformed"),
+    [
+        ({"minItems": 2, "maxItems": -1}, "maxItems"),
+        ({"minItems": "2", "maxItems": 4}, "minItems"),
+    ],
+)
+def test_one_malformed_bound_gives_exactly_one_diagnostic(
+    bounds: dict[str, object], malformed: str
+) -> None:
+    cases, diagnostics = run_array_step(
+        tags_body({"type": "array", **bounds, "items": ITEM_SCHEMA}),
+        {"tags": ["a", "b"]},
+    )
+
+    assert cases == ()
+    assert [(item.code, item.source_pointer) for item in diagnostics] == [
+        ("array_bound_unsupported_schema", tags_schema_pointer(malformed))
+    ]
+
+
+def test_unsupported_items_do_not_block_a_case_that_needs_no_item() -> None:
+    cases, diagnostics = run_array_step(
+        tags_body(
+            {"type": "array", "minItems": 1, "items": {"type": "string", "pattern": "^a$"}}
+        ),
+        {"tags": ["a"]},
+    )
+
+    assert diagnostics == ()
+    assert [(case.affected_property, case.violated_constraint) for case in cases] == [
+        ("/tags", "minItems")
+    ]
+    assert cases[0].request_body is not None
+    assert cases[0].request_body.value == {"tags": []}
+
+
+def test_unsupported_items_are_reported_once_for_all_candidates_that_need_an_item() -> None:
+    cases, diagnostics = run_array_step(
+        tags_body(
+            {
+                "type": "array",
+                "minItems": 2,
+                "maxItems": 3,
+                "items": {"type": "string", "pattern": "^a$"},
+            }
+        ),
+        {"tags": ["a", "b"]},
+    )
+
+    assert cases == ()
+    assert [(item.code, item.source_pointer) for item in diagnostics] == [
+        ("array_bound_unsupported_schema", tags_schema_pointer("items", "pattern"))
+    ]
+
+
+def test_unsupported_items_still_allow_the_candidate_that_needs_no_item() -> None:
+    cases, diagnostics = run_array_step(
+        tags_body(
+            {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 3,
+                "items": {"type": "string", "pattern": "^a$"},
+            }
+        ),
+        {"tags": ["a"]},
+    )
+
+    assert [case.violated_constraint for case in cases] == ["minItems"]
+    assert [(item.code, item.source_pointer) for item in diagnostics] == [
+        ("array_bound_unsupported_schema", tags_schema_pointer("items", "pattern"))
+    ]
+
+
+UNSUPPORTED_ITEMS: dict[str, object] = {"type": "string", "pattern": "^a$"}
+
+
+@pytest.mark.parametrize(
+    "literal",
+    [{"enum": [[], ["a"]]}, {"const": []}],
+    ids=["enum", "const"],
+)
+def test_unsupported_items_in_enum_or_const_candidates_are_reported_at_their_pointer(
+    literal: dict[str, object],
+) -> None:
+    cases, diagnostics = run_array_step(
+        tags_body({"type": "array", "minItems": 1, "items": UNSUPPORTED_ITEMS, **literal}),
+        {"tags": ["a"]},
+    )
+
+    assert cases == ()
+    assert [(item.code, item.source_pointer) for item in diagnostics] == [
+        ("array_bound_unsupported_schema", tags_schema_pointer("items", "pattern"))
+    ]
+
+
+def test_unsupported_items_in_enum_candidates_are_reported_once_for_both_bounds() -> None:
+    cases, diagnostics = run_array_step(
+        tags_body(
+            {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 3,
+                "enum": [[], ["a", "b", "c", "d"]],
+                "items": UNSUPPORTED_ITEMS,
+            }
+        ),
+        {"tags": ["a"]},
+    )
+
+    assert cases == ()
+    assert [(item.code, item.source_pointer) for item in diagnostics] == [
+        ("array_bound_unsupported_schema", tags_schema_pointer("items", "pattern"))
+    ]
+
+
+def test_enum_candidates_with_usable_items_still_generate_a_case() -> None:
+    cases, diagnostics = run_array_step(
+        tags_body({"type": "array", "minItems": 1, "enum": [[], ["a"]], "items": ITEM_SCHEMA}),
+        {"tags": ["a"]},
+    )
+
+    assert diagnostics == ()
+    assert [case.violated_constraint for case in cases] == ["minItems"]
+    assert cases[0].request_body is not None
+    assert cases[0].request_body.value == {"tags": []}
+
+
+def test_missing_type_with_array_keywords_is_identified_as_an_array() -> None:
+    suite = array_suite({"minItems": 2, "items": ITEM_SCHEMA})
+
+    assert array_summary(suite) == [("/tags", "minItems", 1)]
+    assert array_diagnostics(suite) == []
+
+
+def test_type_list_including_array_is_accepted() -> None:
+    suite = array_suite(
+        {"type": ["array", "null"], "minItems": 2, "items": ITEM_SCHEMA}
+    )
+
+    assert array_summary(suite) == [("/tags", "minItems", 1)]
+
+
+def test_explicit_non_array_type_is_diagnosed_per_constraint() -> None:
+    cases, diagnostics = run_array_step(
+        tags_body({"type": "string", "minItems": 2, "maxItems": 3}),
+        {"tags": "x"},
+    )
+
+    assert cases == ()
+    assert [(item.code, item.source_pointer) for item in diagnostics] == [
+        ("array_bound_non_array_type", tags_schema_pointer("minItems")),
+        ("array_bound_non_array_type", tags_schema_pointer("maxItems")),
+    ]
+
+
+def test_unique_items_allows_candidates_of_at_most_one_item() -> None:
+    zero = array_suite({"type": "array", "maxItems": 0, "uniqueItems": True, "items": ITEM_SCHEMA})
+    one = array_suite({"type": "array", "maxItems": 1, "uniqueItems": True, "items": ITEM_SCHEMA})
+    shorter = run_array_step(
+        tags_body({"type": "array", "minItems": 2, "uniqueItems": True, "items": ITEM_SCHEMA}),
+        {"tags": ["a", "b"]},
+    )
+    too_short = run_array_step(
+        tags_body({"type": "array", "minItems": 3, "uniqueItems": True, "items": ITEM_SCHEMA}),
+        {"tags": ["a", "b", "c"]},
+    )
+
+    assert array_summary(zero) == [("/tags", "maxItems", 1)]
+    assert array_summary(one) == []
+    assert array_diagnostics(one) == [
+        ("array_bound_no_safe_candidate", tags_schema_pointer("maxItems"))
+    ]
+    assert [case.violated_constraint for case in shorter[0]] == ["minItems"]
+    assert [item.code for item in too_short[1]] == ["array_bound_no_safe_candidate"]
+    assert too_short[0] == ()
+
+
+def test_missing_or_unusable_items_are_diagnosed_when_an_item_is_needed() -> None:
+    no_items = array_suite({"type": "array", "maxItems": 1})
+    false_items = array_suite({"type": "array", "maxItems": 0, "items": False})
+    unsupported_items = run_array_step(
+        tags_body({"type": "array", "maxItems": 1, "items": {"type": "string", "pattern": "^a$"}}),
+        {"tags": []},
+    )
+
+    assert array_summary(no_items) == []
+    assert array_diagnostics(no_items) == [
+        ("array_bound_no_safe_candidate", tags_schema_pointer("maxItems"))
+    ]
+    assert array_summary(false_items) == []
+    assert [code for code, _ in array_diagnostics(false_items)] == ["array_bound_no_safe_candidate"]
+    assert unsupported_items[0] == ()
+    assert [(item.code, item.source_pointer) for item in unsupported_items[1]] == [
+        ("array_bound_unsupported_schema", tags_schema_pointer("items", "pattern"))
+    ]
+
+
+def test_min_items_one_needs_no_items_schema() -> None:
+    cases, diagnostics = run_array_step(
+        tags_body({"type": "array", "minItems": 1}), {"tags": ["x"]}
+    )
+
+    assert diagnostics == ()
+    assert [case.violated_constraint for case in cases] == ["minItems"]
+    assert cases[0].request_body is not None
+    assert cases[0].request_body.value == {"tags": []}
+
+
+def test_array_items_are_independent_copies() -> None:
+    suite = array_suite(
+        {
+            "type": "array",
+            "maxItems": 2,
+            "items": {"type": "object", "required": ["id"], "properties": {"id": {"type": "integer", "example": 1}}},
+        }
+    )
+
+    case = array_cases(suite)[0]
+    assert case.request_body is not None
+    tags = case.request_body.value["tags"]  # type: ignore[index]
+    assert tags == [{"id": 1}] * 3
+    assert tags[0] is not tags[1]
+
+
+def test_referenced_array_and_item_schemas_are_followed() -> None:
+    suite = generate_test_suite(
+        make_result_with_schemas(
+            post_endpoint(tags_body(schema_reference("Tags"))),
+            {
+                "Tags": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 2,
+                    "items": schema_reference("Item"),
+                },
+                "Item": ITEM_SCHEMA,
+            },
+        )
+    )
+
+    assert array_summary(suite) == [("/tags", "minItems", 0), ("/tags", "maxItems", 3)]
+    assert array_cases(suite)[1].provenance[-3:] == (
+        "/components/schemas/Tags",
+        "/components/schemas/Tags/maxItems",
+        "violated_constraint:maxItems:/tags",
+    )
+    assert array_diagnostics(suite) == []
+
+
+def test_arrays_inside_nested_objects_are_covered() -> None:
+    suite = generate_test_suite(
+        make_result(
+            post_endpoint(
+                {
+                    "type": "object",
+                    "required": ["outer"],
+                    "properties": {
+                        "outer": {
+                            "type": "object",
+                            "required": ["tags"],
+                            "properties": {
+                                "tags": {"type": "array", "minItems": 2, "items": ITEM_SCHEMA}
+                            },
+                        }
+                    },
+                }
+            )
+        )
+    )
+
+    cases = array_cases(suite)
+    assert [(case.affected_property, case.violated_constraint) for case in cases] == [
+        ("/outer/tags", "minItems")
+    ]
+    assert cases[0].request_body is not None
+    assert cases[0].request_body.value == {"outer": {"tags": ["x"]}}
+
+
+def test_out_of_scope_arrays_are_not_generated() -> None:
+    optional = array_suite({"type": "array", "minItems": 2, "items": ITEM_SCHEMA}, required=False)
+    nested_array = generate_test_suite(
+        make_result(
+            post_endpoint(
+                tags_body(
+                    {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {"type": "array", "minItems": 2, "items": ITEM_SCHEMA},
+                    }
+                )
+            )
+        )
+    )
+
+    assert array_cases(optional) == []
+    assert array_diagnostics(optional) == []
+    assert array_summary(nested_array) == [("/tags", "minItems", 0)]
+
+
+def test_a_malformed_property_does_not_stop_other_properties() -> None:
+    body = {
+        "type": "object",
+        "required": ["bad", "good"],
+        "properties": {
+            "bad": {"type": "array", "minItems": -1, "items": ITEM_SCHEMA},
+            "good": {"type": "array", "minItems": 2, "items": ITEM_SCHEMA},
+        },
+    }
+
+    cases, diagnostics = run_array_step(body, {"bad": ["x"], "good": ["a", "b"]})
+
+    assert [(case.affected_property, case.violated_constraint) for case in cases] == [
+        ("/good", "minItems")
+    ]
+    assert [(item.code, item.source_pointer) for item in diagnostics] == [
+        (
+            "array_bound_unsupported_schema",
+            f"{ARRAY_BODY_POINTER}/properties/bad/minItems",
+        )
+    ]
+
+
+def test_a_failing_earlier_step_does_not_stop_the_array_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def failing(*args: object) -> object:
+        raise generator_module._UnsupportedOperation(
+            "simulated_unsupported", "Simulated failure.", "/paths/~1items/post"
+        )
+
+    monkeypatch.setattr(generator_module, "_string_boundary_negative_cases", failing)
+
+    suite = array_suite({"type": "array", "minItems": 2, "items": ITEM_SCHEMA})
+
+    assert array_summary(suite) == [("/tags", "minItems", 1)]
+    assert [item.code for item in suite.diagnostics] == ["simulated_unsupported"]
+
+
+def test_array_step_case_budget_drops_only_the_array_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tags = {"type": "array", "minItems": 2, "maxItems": 4, "items": ITEM_SCHEMA}
+    reference = array_suite(tags)
+    before_array = len(reference.cases) - 2
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_CASES", before_array + 1)
+
+    suite = array_suite(tags)
+
+    assert array_cases(suite) == []
+    assert suite.cases == reference.cases[:before_array]
+    assert [item.code for item in suite.diagnostics] == ["generation_case_budget_exceeded"]
+    assert "'array_bounds'" in suite.diagnostics[0].message
+
+
+def test_array_step_expansion_budget_drops_only_the_array_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def build() -> NormalizationResult:
+        return make_result_with_schemas(
+            post_endpoint(
+                tags_body({"type": "array", "minItems": 2, "items": schema_reference("Item")})
+            ),
+            {"Item": ITEM_SCHEMA},
+        )
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(generator_module, "_array_bound_negative_cases", lambda *args: ((), ()))
+        hops_without_array_step = count_expansions(build())
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_EXPANSIONS", hops_without_array_step)
+
+    suite = generate_test_suite(build())
+
+    assert array_cases(suite) == []
+    assert [item.code for item in suite.diagnostics] == ["generation_expansion_budget_exceeded"]
+    assert "'array_bounds'" in suite.diagnostics[0].message
+    assert suite.cases[0].category == "positive"
+
+
+def test_array_cases_are_deterministic_with_stable_ids() -> None:
+    def build() -> NormalizationResult:
+        return make_result(
+            post_endpoint(
+                tags_body({"type": "array", "minItems": 2, "maxItems": 4, "items": ITEM_SCHEMA})
+            )
+        )
+
+    first = generate_test_suite(build())
+    second = generate_test_suite(build())
+
+    assert first == second
+    assert first.model_dump_json() == second.model_dump_json()
+    assert [case.case_id for case in array_cases(first)] == [
+        generator_module.build_case_id("negative", "/items", "post", "array-bound:/tags:minItems:1"),
+        generator_module.build_case_id("negative", "/items", "post", "array-bound:/tags:maxItems:5"),
+    ]
+
+
+def test_array_step_is_appended_and_leaves_existing_cases_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tags = {"type": "array", "minItems": 2, "maxItems": 4, "items": ITEM_SCHEMA}
+    with monkeypatch.context() as patch:
+        patch.setattr(generator_module, "_array_bound_negative_cases", lambda *args: ((), ()))
+        without_step = array_suite(tags)
+
+    with_step = array_suite(tags)
+
+    assert with_step.cases == (*without_step.cases, *array_cases(with_step))
+    assert with_step.diagnostics == without_step.diagnostics
+    no_bounds = array_suite({"type": "array", "items": ITEM_SCHEMA})
+    assert array_cases(no_bounds) == []
+    assert array_diagnostics(no_bounds) == []
+
+
+@pytest.mark.parametrize("version", ["3.0.3", "3.1.1"])
+def test_normalized_documents_generate_array_bound_cases(version: str) -> None:
+    from app.services.openapi import normalize_openapi_document
+
+    document = {
+        "openapi": version,
+        "info": {"title": "T", "version": "1"},
+        "paths": {
+            "/items": {
+                "post": {
+                    "requestBody": {
+                        "required": True,
+                        "content": {
+                            "application/json": {
+                                "schema": tags_body(
+                                    {
+                                        "type": "array",
+                                        "minItems": 1,
+                                        "maxItems": 2,
+                                        "items": {"type": "string", "example": "x"},
+                                    }
+                                )
+                            }
+                        },
+                    },
+                    "responses": {"200": {"description": "OK"}, "400": {"description": "Bad"}},
+                }
+            }
+        },
+    }
+
+    suite = generate_test_suite(normalize_openapi_document(document))
+
+    assert array_summary(suite) == [("/tags", "minItems", 0), ("/tags", "maxItems", 3)]
+    assert array_diagnostics(suite) == []

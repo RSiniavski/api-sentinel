@@ -250,6 +250,7 @@ def _negative_steps(
         ),
         ("required_request_body", required_request_body),
         ("enum_const", lambda: _enum_const_negative_cases(endpoint, positive, api)),
+        ("array_bounds", lambda: _array_bound_negative_cases(endpoint, positive, api)),
     )
 
 
@@ -1189,6 +1190,303 @@ def _string_boundary_candidate(
 
 
 def _string_boundary_diagnostic(
+    endpoint: Endpoint,
+    code: str,
+    message: str,
+    pointer: str,
+    reference_uri: str | None = None,
+) -> GenerationDiagnostic:
+    return GenerationDiagnostic(
+        code=code,
+        message=message,
+        endpoint_path=endpoint.path,
+        endpoint_method=endpoint.method,
+        source_pointer=pointer,
+        reference_uri=reference_uri,
+    )
+
+
+class _ArrayItemUnavailable(Exception):
+    """The array schema gives no deterministic valid item to build an array."""
+
+
+def _array_bound_negative_cases(
+    endpoint: Endpoint, positive: GeneratedTestCase, api: ApiModel
+) -> tuple[tuple[GeneratedTestCase, ...], tuple[GenerationDiagnostic, ...]]:
+    """Generate minItems and maxItems violations for arrays present in the body.
+
+    Only properties that already exist in the positive request body are
+    considered, and array elements are not traversed.
+    """
+    version = api.openapi_version
+    resolved = _resolved_request_body(endpoint, api)
+    if resolved is None or positive.request_body is None:
+        return (), ()
+    request_body, body_pointer = resolved
+    if set(request_body.content) != {"application/json"}:
+        return (), ()
+    media = request_body.content["application/json"]
+    if media.schema is None or not isinstance(media.schema.raw, dict):
+        return (), ()
+
+    root_pointer = _child(body_pointer, "content", "application/json", "schema")
+    targets: list[tuple[tuple[str, ...], str, list[Any], str]] = []
+    diagnostics: list[GenerationDiagnostic] = []
+
+    def report(
+        code: str, message: str, pointer: str, reference_uri: str | None = None
+    ) -> None:
+        diagnostics.append(
+            _array_bound_diagnostic(endpoint, code, message, pointer, reference_uri)
+        )
+
+    def report_issue(issue: _UnsupportedOperation) -> None:
+        report(
+            "array_bound_unsupported_schema",
+            str(issue),
+            issue.pointer,
+            issue.reference_uri,
+        )
+
+    def array_candidates(
+        schema: dict[str, Any],
+        pointer: str,
+        path: tuple[str, ...],
+        constraints: tuple[str, ...],
+    ) -> None:
+        """Collect one candidate per constraint, or explain why there is none."""
+        if "minItems" in schema and "maxItems" in schema and schema["minItems"] > schema["maxItems"]:
+            report(
+                "array_bound_contradictory_bounds",
+                "minItems is greater than maxItems; no array-length case was generated.",
+                pointer,
+            )
+            return
+        item_state: list[Any] = []
+        reported_issues: list[tuple[str, str | None, str]] = []
+
+        def select_item() -> Any:
+            if "items" not in schema:
+                raise _ArrayItemUnavailable("The array schema declares no items schema.")
+            items_pointer = _child(pointer, "items")
+            item_schema = _check_schema(schema["items"], version, items_pointer, "request", 1)
+            if item_schema is False:
+                raise _ArrayItemUnavailable("The items schema accepts no value.")
+            if item_schema is True:
+                return None
+            value, _ = _select_value(
+                item_schema, version, [], items_pointer, direction="request"
+            )
+            return value
+
+        def item() -> Any:
+            # Selected at most once per property, and only when a candidate needs
+            # an item. An unsupported items schema is remembered, so one root
+            # cause is reported once even when both bounds need an item.
+            if not item_state:
+                try:
+                    item_state.append(select_item())
+                except _UnsupportedOperation as issue:
+                    item_state.append(issue)
+            if isinstance(item_state[0], _UnsupportedOperation):
+                raise item_state[0]
+            return item_state[0]
+
+        for constraint in constraints:
+            constraint_pointer = _child(pointer, constraint)
+            if constraint == "minItems":
+                if schema["minItems"] == 0:
+                    report(
+                        "array_bound_no_safe_candidate",
+                        "minItems is 0, so no array can have fewer items.",
+                        constraint_pointer,
+                    )
+                    continue
+                length = schema["minItems"] - 1
+            else:
+                length = schema["maxItems"] + 1
+            if length > _MAX_COLLECTION_SIZE:
+                report(
+                    "array_bound_no_safe_candidate",
+                    f"A violating array would need {length} items, above the limit of {_MAX_COLLECTION_SIZE}.",
+                    constraint_pointer,
+                )
+                continue
+            if schema.get("uniqueItems") is True and length > 1:
+                report(
+                    "array_bound_no_safe_candidate",
+                    f"No deterministic array of {length} items violates '{constraint}' without also violating uniqueItems.",
+                    constraint_pointer,
+                )
+                continue
+            try:
+                candidate = _array_candidate(
+                    schema, constraint, length, item, version, pointer
+                )
+            except _ArrayItemUnavailable as issue:
+                report("array_bound_no_safe_candidate", str(issue), constraint_pointer)
+                continue
+            except _UnsupportedOperation as issue:
+                issue_key = (issue.pointer, issue.reference_uri, str(issue))
+                if issue_key not in reported_issues:
+                    reported_issues.append(issue_key)
+                    report(
+                        "array_bound_unsupported_schema",
+                        str(issue),
+                        issue.pointer,
+                        issue.reference_uri,
+                    )
+                continue
+            if candidate is None:
+                report(
+                    "array_bound_no_safe_candidate",
+                    f"No deterministic array safely violates '{constraint}' while satisfying the other supported constraints.",
+                    constraint_pointer,
+                )
+            else:
+                targets.append((path, constraint, candidate, pointer))
+
+    def visit(schema: Any, value: Any, path: tuple[str, ...], pointer: str) -> None:
+        followed = _follow_property_schema(schema, pointer, report_issue)
+        if followed is None:
+            return
+        schema, pointer = followed
+        if not isinstance(schema, dict) or not isinstance(value, dict):
+            return
+        properties = schema.get("properties")
+        if not isinstance(properties, dict):
+            return
+        for name in sorted(properties):
+            if name not in value:
+                continue
+            child_pointer = _child(pointer, "properties", name)
+            followed_child = _follow_property_schema(
+                properties[name], child_pointer, report_issue
+            )
+            if followed_child is None:
+                continue
+            child_schema, child_pointer = followed_child
+            child_path = (*path, name)
+            if not isinstance(child_schema, dict):
+                continue
+
+            constraints = tuple(
+                key for key in ("minItems", "maxItems") if key in child_schema
+            )
+            if constraints:
+                try:
+                    # Bounds and type are validated here. The items schema is
+                    # validated only when a candidate actually needs an item.
+                    _check_schema(
+                        {k: v for k, v in child_schema.items() if k != "items"},
+                        version,
+                        child_pointer,
+                        "request",
+                        0,
+                    )
+                    allowed_types = (
+                        _types(child_schema["type"], version, _child(child_pointer, "type"))
+                        if "type" in child_schema
+                        else None
+                    )
+                except _UnsupportedOperation as issue:
+                    report_issue(issue)
+                else:
+                    if allowed_types is not None and "array" not in allowed_types:
+                        for constraint in constraints:
+                            report(
+                                "array_bound_non_array_type",
+                                "Array-size constraints do not apply to this property's declared type.",
+                                _child(child_pointer, constraint),
+                            )
+                    else:
+                        array_candidates(child_schema, child_pointer, child_path, constraints)
+
+            visit(child_schema, value[name], child_path, child_pointer)
+
+    visit(media.schema.raw, positive.request_body.value, (), root_pointer)
+
+    cases: list[GeneratedTestCase] = []
+    for path, constraint, candidate, schema_pointer in targets:
+        generated_value = deepcopy(positive.request_body.value)
+        parent = generated_value
+        for name in path[:-1]:
+            parent = parent[name]
+        parent[path[-1]] = candidate
+
+        property_pointer = _json_pointer(path)
+        constraint_pointer = _child(schema_pointer, constraint)
+        cases.append(
+            _counted_case(
+                case_id=build_case_id(
+                    "negative",
+                    endpoint.path,
+                    endpoint.method,
+                    f"array-bound:{property_pointer}:{constraint}:{len(candidate)}",
+                ),
+                category="negative",
+                path=positive.path,
+                method=positive.method,
+                parameters=deepcopy(positive.parameters),
+                request_body=GeneratedBody(
+                    media_type="application/json", value=generated_value
+                ),
+                security=deepcopy(positive.security),
+                response_expectations=deepcopy(positive.response_expectations),
+                provenance=(
+                    *positive.provenance,
+                    schema_pointer,
+                    constraint_pointer,
+                    f"violated_constraint:{constraint}:{property_pointer}",
+                ),
+                expected_outcome="request_rejection_status_unspecified",
+                violated_constraint=constraint,
+                affected_property=property_pointer,
+            )
+        )
+
+    return tuple(cases), tuple(diagnostics)
+
+
+def _array_candidate(
+    schema: dict[str, Any],
+    constraint: str,
+    length: int,
+    item: Callable[[], Any],
+    version: str,
+    pointer: str,
+) -> list[Any] | None:
+    """Return a deterministic array violating one size bound only."""
+    if "const" in schema or "enum" in schema:
+        candidates = [schema["const"]] if "const" in schema else schema["enum"]
+        other_constraints_schema = {
+            key: value for key, value in schema.items() if key != constraint
+        }
+        items_checked = False
+        for candidate in candidates:
+            if not isinstance(candidate, list):
+                continue
+            if constraint == "minItems" and len(candidate) >= schema[constraint]:
+                continue
+            if constraint == "maxItems" and len(candidate) <= schema[constraint]:
+                continue
+            if "items" in schema and not items_checked:
+                # _matches checks items with a generic pointer. Check it first
+                # so an unsupported items schema is reported at its real
+                # location; the error reaches the caller, not a silent skip.
+                _check_schema(
+                    schema["items"], version, _child(pointer, "items"), "request", 1
+                )
+                items_checked = True
+            if _matches(other_constraints_schema, candidate, version, "request", 0):
+                return deepcopy(candidate)
+        return None
+    if length == 0:
+        return []
+    return [deepcopy(item()) for _ in range(length)]
+
+
+def _array_bound_diagnostic(
     endpoint: Endpoint,
     code: str,
     message: str,
