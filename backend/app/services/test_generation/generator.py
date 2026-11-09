@@ -1213,7 +1213,7 @@ class _ArrayItemUnavailable(Exception):
 def _array_bound_negative_cases(
     endpoint: Endpoint, positive: GeneratedTestCase, api: ApiModel
 ) -> tuple[tuple[GeneratedTestCase, ...], tuple[GenerationDiagnostic, ...]]:
-    """Generate minItems and maxItems violations for arrays present in the body.
+    """Generate minItems, maxItems and uniqueItems violations for arrays present in the body.
 
     Only properties that already exist in the positive request body are
     considered, and array elements are not traversed.
@@ -1294,7 +1294,17 @@ def _array_bound_negative_cases(
 
         for constraint in constraints:
             constraint_pointer = _child(pointer, constraint)
-            if constraint == "minItems":
+            if constraint == "uniqueItems":
+                if schema.get("maxItems", 2) < 2:
+                    report(
+                        "array_bound_no_safe_candidate",
+                        f"uniqueItems cannot be violated: maxItems is {schema['maxItems']}, so no array has two items.",
+                        constraint_pointer,
+                    )
+                    continue
+                # Two equal items are the smallest violation; minItems may need more.
+                length = max(2, schema.get("minItems", 0))
+            elif constraint == "minItems":
                 if schema["minItems"] == 0:
                     report(
                         "array_bound_no_safe_candidate",
@@ -1312,7 +1322,7 @@ def _array_bound_negative_cases(
                     constraint_pointer,
                 )
                 continue
-            if schema.get("uniqueItems") is True and length > 1:
+            if constraint != "uniqueItems" and schema.get("uniqueItems") is True and length > 1:
                 report(
                     "array_bound_no_safe_candidate",
                     f"No deterministic array of {length} items violates '{constraint}' without also violating uniqueItems.",
@@ -1373,6 +1383,8 @@ def _array_bound_negative_cases(
             constraints = tuple(
                 key for key in ("minItems", "maxItems") if key in child_schema
             )
+            if child_schema.get("uniqueItems") is True:
+                constraints = (*constraints, "uniqueItems")
             if constraints:
                 try:
                     # Bounds and type are validated here. The items schema is
@@ -1396,7 +1408,11 @@ def _array_bound_negative_cases(
                         for constraint in constraints:
                             report(
                                 "array_bound_non_array_type",
-                                "Array-size constraints do not apply to this property's declared type.",
+                                (
+                                    "uniqueItems does not apply to this property's declared type."
+                                    if constraint == "uniqueItems"
+                                    else "Array-size constraints do not apply to this property's declared type."
+                                ),
                                 _child(child_pointer, constraint),
                             )
                     else:
@@ -1456,7 +1472,7 @@ def _array_candidate(
     version: str,
     pointer: str,
 ) -> list[Any] | None:
-    """Return a deterministic array violating one size bound only."""
+    """Return a deterministic array violating one supported array constraint."""
     if "const" in schema or "enum" in schema:
         candidates = [schema["const"]] if "const" in schema else schema["enum"]
         other_constraints_schema = {
@@ -1469,6 +1485,8 @@ def _array_candidate(
             if constraint == "minItems" and len(candidate) >= schema[constraint]:
                 continue
             if constraint == "maxItems" and len(candidate) <= schema[constraint]:
+                continue
+            if constraint == "uniqueItems" and not _has_duplicate_items(candidate):
                 continue
             if "items" in schema and not items_checked:
                 # _matches checks items with a generic pointer. Check it first
@@ -1483,7 +1501,19 @@ def _array_candidate(
         return None
     if length == 0:
         return []
-    return [deepcopy(item()) for _ in range(length)]
+    candidate = [deepcopy(item()) for _ in range(length)]
+    if constraint == "uniqueItems" and not _has_duplicate_items(candidate):
+        return None
+    return candidate
+
+
+def _has_duplicate_items(items: list[Any]) -> bool:
+    """Whether two items are equal under the JSON Schema equality of _equal."""
+    return any(
+        _equal(items[i], items[j])
+        for i in range(len(items))
+        for j in range(i + 1, len(items))
+    )
 
 
 def _array_bound_diagnostic(

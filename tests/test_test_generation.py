@@ -4973,7 +4973,7 @@ def test_response_reference_hops_are_charged_to_the_suite_expansion_budget(
 
 ITEM_SCHEMA: dict[str, object] = {"type": "string", "example": "x"}
 ARRAY_BODY_POINTER = "/paths/~1items/post/requestBody/content/application~1json/schema"
-ARRAY_CONSTRAINTS = {"minItems", "maxItems"}
+ARRAY_CONSTRAINTS = {"minItems", "maxItems", "uniqueItems"}
 
 
 def tags_body(tags: object, *, required: bool = True) -> dict[str, object]:
@@ -5291,12 +5291,16 @@ def test_unique_items_allows_candidates_of_at_most_one_item() -> None:
 
     assert array_summary(zero) == [("/tags", "maxItems", 1)]
     assert array_summary(one) == []
+    # The maxItems diagnostic stays; uniqueItems adds its own (see Step 6.5 tests).
     assert array_diagnostics(one) == [
-        ("array_bound_no_safe_candidate", tags_schema_pointer("maxItems"))
+        ("array_bound_no_safe_candidate", tags_schema_pointer("maxItems")),
+        ("array_bound_no_safe_candidate", tags_schema_pointer("uniqueItems")),
     ]
-    assert [case.violated_constraint for case in shorter[0]] == ["minItems"]
-    assert [item.code for item in too_short[1]] == ["array_bound_no_safe_candidate"]
-    assert too_short[0] == ()
+    assert [case.violated_constraint for case in shorter[0]] == ["minItems", "uniqueItems"]
+    assert [(item.code, item.source_pointer) for item in too_short[1]] == [
+        ("array_bound_no_safe_candidate", tags_schema_pointer("minItems"))
+    ]
+    assert [case.violated_constraint for case in too_short[0]] == ["uniqueItems"]
 
 
 def test_missing_or_unusable_items_are_diagnosed_when_an_item_is_needed() -> None:
@@ -5570,4 +5574,485 @@ def test_normalized_documents_generate_array_bound_cases(version: str) -> None:
     suite = generate_test_suite(normalize_openapi_document(document))
 
     assert array_summary(suite) == [("/tags", "minItems", 0), ("/tags", "maxItems", 3)]
+    assert array_diagnostics(suite) == []
+
+
+# --- Step 6.5: uniqueItems violations -------------------------------------------
+
+UNIQUE_ITEM_OBJECT: dict[str, object] = {
+    "type": "object",
+    "required": ["id"],
+    "properties": {"id": {"type": "integer", "example": 1}},
+}
+
+
+def unique_cases(cases: object) -> list[GeneratedTestCase]:
+    return [case for case in cases if case.violated_constraint == "uniqueItems"]  # type: ignore[attr-defined]
+
+
+def tags_of(case: GeneratedTestCase) -> list[object]:
+    assert case.request_body is not None
+    value = case.request_body.value
+    assert isinstance(value, dict)
+    tags = value["tags"]
+    assert isinstance(tags, list)
+    return tags
+
+
+def step_diagnostics(diagnostics: tuple[GenerationDiagnostic, ...]) -> list[tuple[str, str | None]]:
+    return [(item.code, item.source_pointer) for item in diagnostics]
+
+
+def test_array_with_only_unique_items_generates_a_duplicate_pair() -> None:
+    suite = array_suite({"type": "array", "uniqueItems": True, "items": ITEM_SCHEMA})
+
+    assert array_summary(suite) == [("/tags", "uniqueItems", 2)]
+    case = array_cases(suite)[0]
+    assert tags_of(case) == ["x", "x"]
+    assert case.category == "negative"
+    assert case.expected_outcome == "request_rejection_status_unspecified"
+    assert case.case_id == generator_module.build_case_id(
+        "negative", "/items", "post", "array-bound:/tags:uniqueItems:2"
+    )
+    assert case.provenance[-3:] == (
+        tags_schema_pointer(),
+        tags_schema_pointer("uniqueItems"),
+        "violated_constraint:uniqueItems:/tags",
+    )
+    assert suite.cases[0].request_body is not None
+    assert suite.cases[0].request_body.value == {"tags": []}
+    assert array_diagnostics(suite) == []
+
+
+def test_unique_items_with_min_items_three_uses_three_duplicate_items() -> None:
+    cases, diagnostics = run_array_step(
+        tags_body({"type": "array", "minItems": 3, "uniqueItems": True, "items": ITEM_SCHEMA}),
+        {"tags": ["a", "b", "c"]},
+    )
+
+    assert [case.violated_constraint for case in cases] == ["uniqueItems"]
+    assert tags_of(cases[0]) == ["x", "x", "x"]
+    assert step_diagnostics(diagnostics) == [
+        ("array_bound_no_safe_candidate", tags_schema_pointer("minItems"))
+    ]
+
+
+def test_unique_items_with_both_bounds_follows_the_existing_cases() -> None:
+    suite = array_suite(
+        {"type": "array", "minItems": 1, "maxItems": 5, "uniqueItems": True, "items": ITEM_SCHEMA}
+    )
+
+    assert array_summary(suite) == [("/tags", "minItems", 0), ("/tags", "uniqueItems", 2)]
+    assert tags_of(array_cases(suite)[1]) == ["x", "x"]
+    assert array_diagnostics(suite) == [
+        ("array_bound_no_safe_candidate", tags_schema_pointer("maxItems"))
+    ]
+
+
+def test_unique_items_with_max_items_below_two_keeps_both_diagnostics() -> None:
+    zero = array_suite({"type": "array", "maxItems": 0, "uniqueItems": True, "items": ITEM_SCHEMA})
+    one = array_suite({"type": "array", "maxItems": 1, "uniqueItems": True, "items": ITEM_SCHEMA})
+    two = array_suite({"type": "array", "maxItems": 2, "uniqueItems": True, "items": ITEM_SCHEMA})
+
+    assert array_summary(zero) == [("/tags", "maxItems", 1)]
+    assert array_diagnostics(zero) == [
+        ("array_bound_no_safe_candidate", tags_schema_pointer("uniqueItems"))
+    ]
+    assert array_summary(one) == []
+    assert array_diagnostics(one) == [
+        ("array_bound_no_safe_candidate", tags_schema_pointer("maxItems")),
+        ("array_bound_no_safe_candidate", tags_schema_pointer("uniqueItems")),
+    ]
+    assert array_summary(two) == [("/tags", "uniqueItems", 2)]
+    assert array_diagnostics(two) == [
+        ("array_bound_no_safe_candidate", tags_schema_pointer("maxItems"))
+    ]
+
+
+@pytest.mark.parametrize("unique", [{"uniqueItems": False}, {}], ids=["false", "absent"])
+def test_unique_items_false_or_absent_gives_no_unique_case(unique: dict[str, object]) -> None:
+    only_flag = array_suite({"type": "array", "items": ITEM_SCHEMA, **unique})
+    bounded = array_suite({"type": "array", "minItems": 2, "items": ITEM_SCHEMA, **unique})
+
+    assert array_cases(only_flag) == []
+    assert array_diagnostics(only_flag) == []
+    assert array_summary(bounded) == [("/tags", "minItems", 1)]
+    assert array_diagnostics(bounded) == []
+
+
+def test_unique_items_false_and_absent_give_identical_suites() -> None:
+    schema = {"type": "array", "minItems": 1, "maxItems": 3, "items": ITEM_SCHEMA}
+
+    assert array_suite({**schema, "uniqueItems": False}) == array_suite(schema)
+
+
+@pytest.mark.parametrize(
+    "items",
+    [{}, {"items": False}],
+    ids=["missing", "false"],
+)
+def test_unique_items_without_a_usable_items_schema_has_no_safe_candidate(
+    items: dict[str, object],
+) -> None:
+    suite = array_suite({"type": "array", "uniqueItems": True, **items})
+
+    assert array_cases(suite) == []
+    assert array_diagnostics(suite) == [
+        ("array_bound_no_safe_candidate", tags_schema_pointer("uniqueItems"))
+    ]
+
+
+def test_unsupported_items_are_reported_once_across_constraints() -> None:
+    cases, diagnostics = run_array_step(
+        tags_body(
+            {
+                "type": "array",
+                "minItems": 2,
+                "maxItems": 4,
+                "uniqueItems": True,
+                "items": UNSUPPORTED_ITEMS,
+            }
+        ),
+        {"tags": ["a", "b"]},
+    )
+
+    assert cases == ()
+    assert step_diagnostics(diagnostics) == [
+        ("array_bound_unsupported_schema", tags_schema_pointer("items", "pattern")),
+        ("array_bound_no_safe_candidate", tags_schema_pointer("maxItems")),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("items", "expected"),
+    [
+        ({"type": "string", "enum": ["a", "b"]}, "a"),
+        ({"const": "c"}, "c"),
+        ({"type": "integer", "minimum": 5}, 5),
+        ({"type": "string", "minLength": 3, "maxLength": 4}, "sent"),
+        (UNIQUE_ITEM_OBJECT, {"id": 1}),
+    ],
+    ids=["enum", "const", "numeric", "string", "object"],
+)
+def test_unique_items_duplicates_a_valid_item(items: dict[str, object], expected: object) -> None:
+    suite = array_suite({"type": "array", "uniqueItems": True, "items": items})
+
+    assert array_summary(suite) == [("/tags", "uniqueItems", 2)]
+    assert tags_of(array_cases(suite)[0]) == [expected, expected]
+    assert array_diagnostics(suite) == []
+
+
+def test_unique_items_copies_are_independent() -> None:
+    suite = array_suite({"type": "array", "uniqueItems": True, "items": UNIQUE_ITEM_OBJECT})
+
+    tags = tags_of(array_cases(suite)[0])
+    assert tags[0] is not tags[1]
+    tags[0]["id"] = 99  # type: ignore[index]
+    assert tags[1] == {"id": 1}
+    assert UNIQUE_ITEM_OBJECT["properties"]["id"] == {"type": "integer", "example": 1}  # type: ignore[index]
+
+
+def test_array_level_enum_selects_the_first_literal_with_a_duplicate() -> None:
+    suite = array_suite(
+        {
+            "type": "array",
+            "uniqueItems": True,
+            "items": ITEM_SCHEMA,
+            "enum": [["a", "b"], ["a", "a"], ["z", "z"], ["c"]],
+        }
+    )
+
+    assert array_summary(suite) == [("/tags", "uniqueItems", 2)]
+    assert tags_of(array_cases(suite)[0]) == ["a", "a"]
+    assert array_diagnostics(suite) == []
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [
+        {"enum": [["a", "b"], ["c"]]},
+        {"const": ["a", "b"]},
+        {"enum": [["a", "b"], ["a", "a", "a"]], "maxItems": 2},
+        {"enum": [["a", "b"], [1, 1]]},
+    ],
+    ids=["no-duplicate", "const", "violates-other-bound", "invalid-items"],
+)
+def test_array_level_literals_without_a_usable_duplicate_have_no_safe_candidate(
+    schema: dict[str, object],
+) -> None:
+    suite = array_suite({"type": "array", "uniqueItems": True, "items": ITEM_SCHEMA, **schema})
+
+    assert array_cases(suite) == []
+    assert [
+        pointer
+        for code, pointer in array_diagnostics(suite)
+        if code == "array_bound_no_safe_candidate"
+    ].count(tags_schema_pointer("uniqueItems")) == 1
+
+
+def test_unsupported_items_in_enum_literals_are_reported_once_at_their_pointer() -> None:
+    cases, diagnostics = run_array_step(
+        tags_body(
+            {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 3,
+                "uniqueItems": True,
+                "enum": [[], ["a", "a"]],
+                "items": UNSUPPORTED_ITEMS,
+            }
+        ),
+        {"tags": ["a"]},
+    )
+
+    assert cases == ()
+    assert step_diagnostics(diagnostics) == [
+        ("array_bound_unsupported_schema", tags_schema_pointer("items", "pattern")),
+        ("array_bound_no_safe_candidate", tags_schema_pointer("maxItems")),
+    ]
+
+
+def test_unique_items_follows_referenced_array_and_item_schemas() -> None:
+    def build(tags: dict[str, object]) -> NormalizationResult:
+        return make_result_with_schemas(
+            post_endpoint(tags_body(schema_reference("Tags"))),
+            {"Tags": tags, "Item": ITEM_SCHEMA},
+        )
+
+    unique = build({"type": "array", "minItems": 1, "uniqueItems": True, "items": schema_reference("Item")})
+    baseline = build({"type": "array", "minItems": 1, "maxItems": 1, "items": schema_reference("Item")})
+
+    suite = generate_test_suite(unique)
+
+    assert array_summary(suite) == [("/tags", "minItems", 0), ("/tags", "uniqueItems", 2)]
+    assert array_cases(suite)[1].provenance[-3:] == (
+        "/components/schemas/Tags",
+        "/components/schemas/Tags/uniqueItems",
+        "violated_constraint:uniqueItems:/tags",
+    )
+    assert array_diagnostics(suite) == []
+    # One item selection per property, shared by every constraint that needs it.
+    assert count_expansions(unique) == count_expansions(baseline)
+
+
+@pytest.mark.parametrize("version", ["3.0.3", "3.1.1"])
+def test_explicit_non_array_type_reports_unique_items_as_not_applicable(version: str) -> None:
+    suite = generate_test_suite(
+        make_result(
+            post_endpoint(tags_body({"type": "string", "maxItems": 3, "uniqueItems": True})),
+            version=version,
+        )
+    )
+
+    assert array_cases(suite) == []
+    assert [
+        (item.code, item.source_pointer, item.message)
+        for item in suite.diagnostics
+        if item.code.startswith("array_bound_")
+    ] == [
+        (
+            "array_bound_non_array_type",
+            tags_schema_pointer("maxItems"),
+            "Array-size constraints do not apply to this property's declared type.",
+        ),
+        (
+            "array_bound_non_array_type",
+            tags_schema_pointer("uniqueItems"),
+            "uniqueItems does not apply to this property's declared type.",
+        ),
+    ]
+
+
+def test_contradictory_bounds_still_give_one_diagnostic_with_unique_items() -> None:
+    cases, diagnostics = run_array_step(
+        tags_body(
+            {"type": "array", "minItems": 3, "maxItems": 2, "uniqueItems": True, "items": ITEM_SCHEMA}
+        ),
+        {"tags": []},
+    )
+
+    assert cases == ()
+    assert step_diagnostics(diagnostics) == [
+        ("array_bound_contradictory_bounds", tags_schema_pointer())
+    ]
+
+
+def test_unique_items_respects_the_collection_size_limit() -> None:
+    at_limit = run_array_step(
+        tags_body({"type": "array", "minItems": 100, "uniqueItems": True, "items": ITEM_SCHEMA}),
+        {"tags": []},
+    )
+    above_limit = run_array_step(
+        tags_body({"type": "array", "minItems": 101, "uniqueItems": True, "items": ITEM_SCHEMA}),
+        {"tags": []},
+    )
+
+    assert [len(tags_of(case)) for case in unique_cases(at_limit[0])] == [100]
+    assert unique_cases(above_limit[0]) == []
+    assert ("array_bound_no_safe_candidate", tags_schema_pointer("uniqueItems")) in step_diagnostics(
+        above_limit[1]
+    )
+
+
+def test_unique_items_cases_are_deterministic_isolated_and_do_not_mutate_input() -> None:
+    def build() -> NormalizationResult:
+        return make_result(
+            post_endpoint(
+                tags_body({"type": "array", "minItems": 1, "uniqueItems": True, "items": UNIQUE_ITEM_OBJECT})
+            )
+        )
+
+    result = build()
+    before = result.model_dump_json()
+    first = generate_test_suite(result)
+    second = generate_test_suite(build())
+
+    assert result.model_dump_json() == before
+    assert first == second
+    assert first.model_dump_json() == second.model_dump_json()
+    assert [case.case_id for case in array_cases(first)] == [
+        generator_module.build_case_id("negative", "/items", "post", "array-bound:/tags:minItems:0"),
+        generator_module.build_case_id("negative", "/items", "post", "array-bound:/tags:uniqueItems:2"),
+    ]
+    assert first.cases[0].request_body is not None
+    assert first.cases[0].request_body.value == {"tags": [{"id": 1}]}
+    assert tags_of(array_cases(first)[1]) == [{"id": 1}, {"id": 1}]
+
+
+def test_unique_items_case_follows_the_existing_cases_of_its_property() -> None:
+    body = {
+        "type": "object",
+        "required": ["a", "b"],
+        "properties": {
+            "a": {"type": "array", "minItems": 1, "uniqueItems": True, "items": ITEM_SCHEMA},
+            "b": {"type": "array", "minItems": 1, "items": ITEM_SCHEMA},
+        },
+    }
+    without = generate_test_suite(make_result(post_endpoint({
+        **body, "properties": {**body["properties"], "a": {**body["properties"]["a"], "uniqueItems": False}}  # type: ignore[index]
+    })))
+    with_unique = generate_test_suite(make_result(post_endpoint(body)))
+
+    def summary(suite: GeneratedTestSuite) -> list[tuple[str | None, str | None]]:
+        return [(case.affected_property, case.violated_constraint) for case in array_cases(suite)]
+
+    assert summary(without) == [("/a", "minItems"), ("/b", "minItems")]
+    assert summary(with_unique) == [("/a", "minItems"), ("/a", "uniqueItems"), ("/b", "minItems")]
+    kept = [case for case in array_cases(with_unique) if case.violated_constraint != "uniqueItems"]
+    assert kept == array_cases(without)
+
+
+def test_unique_items_out_of_scope_arrays_are_not_generated() -> None:
+    optional = array_suite({"type": "array", "uniqueItems": True, "items": ITEM_SCHEMA}, required=False)
+    nested_array = array_suite(
+        {
+            "type": "array",
+            "minItems": 1,
+            "items": {"type": "array", "uniqueItems": True, "items": ITEM_SCHEMA},
+        }
+    )
+    nested_object = generate_test_suite(
+        make_result(
+            post_endpoint(
+                {
+                    "type": "object",
+                    "required": ["outer"],
+                    "properties": {
+                        "outer": {
+                            "type": "object",
+                            "required": ["tags"],
+                            "properties": {"tags": {"type": "array", "uniqueItems": True, "items": ITEM_SCHEMA}},
+                        }
+                    },
+                }
+            )
+        )
+    )
+
+    assert array_cases(optional) == [] and array_diagnostics(optional) == []
+    assert unique_cases(nested_array.cases) == [] and array_diagnostics(nested_array) == []
+    assert [(case.affected_property, case.violated_constraint) for case in array_cases(nested_object)] == [
+        ("/outer/tags", "uniqueItems")
+    ]
+
+
+def test_unique_items_case_budget_drops_the_whole_array_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tags = {"type": "array", "minItems": 1, "uniqueItems": True, "items": ITEM_SCHEMA}
+    reference = array_suite(tags)
+    before_array = len(reference.cases) - 2
+    assert len(array_cases(reference)) == 2
+
+    with monkeypatch.context() as patch:
+        patch.setattr(generator_module, "_MAX_ENDPOINT_CASES", before_array + 2)
+        assert array_suite(tags).cases == reference.cases
+
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_CASES", before_array + 1)
+    suite = array_suite(tags)
+
+    assert array_cases(suite) == []
+    assert suite.cases == reference.cases[:before_array]
+    assert [item.code for item in suite.diagnostics] == ["generation_case_budget_exceeded"]
+    assert "'array_bounds'" in suite.diagnostics[0].message
+
+
+def test_unique_items_expansion_budget_drops_the_whole_array_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def build() -> NormalizationResult:
+        return make_result_with_schemas(
+            post_endpoint(
+                tags_body({"type": "array", "uniqueItems": True, "items": schema_reference("Item")})
+            ),
+            {"Item": ITEM_SCHEMA},
+        )
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(generator_module, "_array_bound_negative_cases", lambda *args: ((), ()))
+        hops_without_array_step = count_expansions(build())
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_EXPANSIONS", hops_without_array_step)
+
+    suite = generate_test_suite(build())
+
+    assert array_cases(suite) == []
+    assert [item.code for item in suite.diagnostics] == ["generation_expansion_budget_exceeded"]
+    assert "'array_bounds'" in suite.diagnostics[0].message
+
+
+@pytest.mark.parametrize("version", ["3.0.3", "3.1.1"])
+def test_normalized_documents_generate_unique_items_cases(version: str) -> None:
+    from app.services.openapi import normalize_openapi_document
+
+    document = {
+        "openapi": version,
+        "info": {"title": "T", "version": "1"},
+        "paths": {
+            "/items": {
+                "post": {
+                    "requestBody": {
+                        "required": True,
+                        "content": {
+                            "application/json": {
+                                "schema": tags_body(
+                                    {
+                                        "type": "array",
+                                        "minItems": 1,
+                                        "uniqueItems": True,
+                                        "items": {"type": "string", "example": "x"},
+                                    }
+                                )
+                            }
+                        },
+                    },
+                    "responses": {"200": {"description": "OK"}, "400": {"description": "Bad"}},
+                }
+            }
+        },
+    }
+
+    suite = generate_test_suite(normalize_openapi_document(document))
+
+    assert array_summary(suite) == [("/tags", "minItems", 0), ("/tags", "uniqueItems", 2)]
+    assert tags_of(array_cases(suite)[1]) == ["x", "x"]
     assert array_diagnostics(suite) == []

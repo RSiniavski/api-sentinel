@@ -103,7 +103,7 @@ Implemented so far:
 - Internal test representation: strict, frozen output models (`GeneratedTestSuite`, `GeneratedTestCase`, `GenerationDiagnostic`).
 - Positive test generation: one baseline case per operation for the supported schema subset.
 - Negative test generation: required parameter, request body and property omission; wrong JSON type; enum/const violation.
-- Boundary test generation: string length bounds, numeric bounds (including properties reached through nested local `$ref`), and array size bounds (`minItems`, `maxItems`) for arrays present in the positive request body.
+- Boundary test generation: string length bounds, numeric bounds (including properties reached through nested local `$ref`), array size bounds (`minItems`, `maxItems`) and `uniqueItems` duplicate cases for arrays present in the positive request body.
 - Local reference resolution for parameters, request bodies and schemas, with diagnostics for unsupported, missing, invalid and cyclic references and the `$ref` sibling policy (annotations only).
 - Deterministic resource budgets for reference expansions, generated cases and diagnostics, with stable budget diagnostics.
 - Referenced responses: local `#/components/responses/` references, including alias chains, resolved into `ResponseExpectation`.
@@ -111,7 +111,7 @@ Implemented so far:
 
 Still planned:
 
-- Array bound cases for optional arrays, array elements and nested arrays, and `uniqueItems` violations.
+- Array bound cases for optional arrays, array elements and nested arrays.
 - Support for further schema keywords (for example `pattern`, `format`) and compositions.
 - Request media types other than `application/json`.
 - Contract validation of responses, together with the Test Execution Engine (Phase 5).
