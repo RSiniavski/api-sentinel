@@ -23,6 +23,7 @@ from app.services.openapi.models import (
     RequestBody,
     Schema,
     SecurityRequirement,
+    SecurityScheme,
 )
 from app.services.test_generation import (
     GeneratedBody,
@@ -115,12 +116,24 @@ def sample_normalization_result() -> NormalizationResult:
     )
 
 
-def make_result(*endpoints: Endpoint, version: str = "3.1.1") -> NormalizationResult:
+def declared_security_schemes(*names: str) -> Components:
+    """Components that declare each named scheme, as every requirement name must be."""
+    return Components(
+        security_schemes={
+            name: SecurityScheme(type="apiKey", name=name, location="header") for name in names
+        }
+    )
+
+
+def make_result(
+    *endpoints: Endpoint, version: str = "3.1.1", components: Components | None = None
+) -> NormalizationResult:
     return NormalizationResult(
         api=ApiModel(
             openapi_version=version,
             info=ApiInfo(title="Generated API", version="1.0"),
             endpoints=tuple(endpoints),
+            **({"components": components} if components is not None else {}),
         )
     )
 
@@ -328,6 +341,7 @@ def test_security_output_is_isolated_from_input_in_both_directions() -> None:
             info=ApiInfo(title="Generated API", version="1.0"),
             security=(requirement,),
             endpoints=(endpoint,),
+            components=declared_security_schemes("oauth"),
         )
     )
 
@@ -598,7 +612,7 @@ def test_required_parameter_cases_remove_one_parameter_preserve_metadata_and_ord
         security=(SecurityRequirement(schemes={"apiKey": ()}),),
         responses={"400": Response(description="Invalid request")},
     )
-    result = make_result(endpoint)
+    result = make_result(endpoint, components=declared_security_schemes("apiKey"))
     original = result.model_dump_json()
 
     first_suite = generate_test_suite(result)
@@ -699,7 +713,7 @@ def test_required_request_body_generates_one_deterministic_omission_case() -> No
         security=(SecurityRequirement(schemes={"apiKey": ()}),),
         responses={"400": Response(description="Invalid request")},
     )
-    result = make_result(endpoint)
+    result = make_result(endpoint, components=declared_security_schemes("apiKey"))
     original = result.model_dump_json()
 
     first_suite = generate_test_suite(result)
@@ -901,7 +915,7 @@ def test_nested_enum_case_preserves_other_payload_and_metadata_deterministically
         security=(SecurityRequirement(schemes={"oauth": ("write",)}),),
         responses={"400": Response(description="Invalid request")},
     )
-    result = make_result(endpoint)
+    result = make_result(endpoint, components=declared_security_schemes("oauth"))
     original = result.model_dump_json()
 
     first = generate_test_suite(result)
@@ -1239,6 +1253,7 @@ def test_one_required_property_produces_one_explicit_negative_case() -> None:
             openapi_version="3.1.1",
             info=ApiInfo(title="Generated API", version="1.0"),
             endpoints=(endpoint,),
+            components=declared_security_schemes("oauth"),
         )
     )
 
@@ -2414,7 +2429,7 @@ def test_numeric_negative_case_preserves_and_copies_parameters_security_and_resp
         ),
     )
 
-    suite = generate_test_suite(make_result(endpoint))
+    suite = generate_test_suite(make_result(endpoint, components=declared_security_schemes("oauth")))
     positive = suite.cases[0]
     negative = next(case for case in suite.cases if case.violated_constraint == "minimum")
 
@@ -6056,3 +6071,655 @@ def test_normalized_documents_generate_unique_items_cases(version: str) -> None:
     assert array_summary(suite) == [("/tags", "minItems", 0), ("/tags", "uniqueItems", 2)]
     assert tags_of(array_cases(suite)[1]) == ["x", "x"]
     assert array_diagnostics(suite) == []
+
+
+# --- Step 7.1: security scheme references --------------------------------------
+
+SECURITY_API_KEY = SecurityScheme(type="apiKey", name="X-Key", location="header")
+SECURITY_BASE = "#/components/securitySchemes/"
+
+
+def security_ref(name: str) -> LocalReference:
+    return LocalReference(uri=f"{SECURITY_BASE}{name}")
+
+
+def requirement(*names: str) -> SecurityRequirement:
+    return SecurityRequirement(schemes={name: () for name in names})
+
+
+def security_endpoint(
+    path: str = "/items", security: tuple[SecurityRequirement, ...] | None = None
+) -> Endpoint:
+    return Endpoint(
+        path=path,
+        method="get",
+        responses={"200": Response(description="OK")},
+        security=security,
+    )
+
+
+def security_result(
+    schemes: dict[str, SecurityScheme | LocalReference],
+    *endpoints: Endpoint,
+    api_security: tuple[SecurityRequirement, ...] | None = None,
+    version: str = "3.1.1",
+) -> NormalizationResult:
+    return NormalizationResult(
+        api=ApiModel(
+            openapi_version=version,
+            info=ApiInfo(title="Generated API", version="1.0"),
+            endpoints=endpoints or (security_endpoint(),),
+            security=api_security,
+            components=Components(security_schemes=schemes),
+        )
+    )
+
+
+def security_diagnostics(
+    suite: GeneratedTestSuite,
+) -> list[tuple[str, str | None, str | None, str | None]]:
+    return [
+        (item.code, item.endpoint_path, item.source_pointer, item.reference_uri)
+        for item in suite.diagnostics
+    ]
+
+
+@pytest.mark.parametrize(
+    "scheme",
+    [
+        SecurityScheme(type="apiKey", name="X-Key", location="query"),
+        SecurityScheme(type="http", scheme="bearer", bearer_format="JWT"),
+        SecurityScheme(
+            type="oauth2",
+            flows={"clientCredentials": {"tokenUrl": "https://auth.example.test/t", "scopes": {}}},
+        ),
+        SecurityScheme(type="openIdConnect", openid_connect_url="https://auth.example.test/o"),
+    ],
+    ids=["apiKey", "http", "oauth2", "openIdConnect"],
+)
+def test_inline_supported_security_schemes_generate_cases(scheme: SecurityScheme) -> None:
+    result = security_result({"s": scheme}, api_security=(requirement("s"),))
+
+    suite = generate_test_suite(result)
+
+    assert [case.security for case in suite.cases] == [(requirement("s"),)]
+    assert suite.diagnostics == ()
+    assert count_expansions(result) == 0
+
+
+def test_mutual_tls_is_supported_only_for_openapi_3_1() -> None:
+    scheme = SecurityScheme(type="mutualTLS")
+    accepted = generate_test_suite(
+        security_result({"m": scheme}, api_security=(requirement("m"),), version="3.1.1")
+    )
+    rejected = generate_test_suite(
+        security_result({"m": scheme}, api_security=(requirement("m"),), version="3.0.3")
+    )
+
+    assert len(accepted.cases) == 1 and accepted.diagnostics == ()
+    assert rejected.cases == ()
+    assert security_diagnostics(rejected) == [
+        ("unsupported_security_scheme", "/items", "/components/securitySchemes/m", None)
+    ]
+    assert "OpenAPI 3.1" in rejected.diagnostics[0].message
+
+
+def test_single_security_scheme_reference_is_resolved_and_charged() -> None:
+    result = security_result(
+        {"a": security_ref("b"), "b": SECURITY_API_KEY}, api_security=(requirement("a"),)
+    )
+
+    suite = generate_test_suite(result)
+
+    assert [case.security for case in suite.cases] == [(requirement("a"),)]
+    assert suite.diagnostics == ()
+    assert count_expansions(result) == 1
+
+
+def test_security_scheme_alias_chain_is_resolved_and_every_hop_charged() -> None:
+    result = security_result(
+        {
+            "a": security_ref("b"),
+            "b": security_ref("c"),
+            "c": security_ref("d"),
+            "d": SECURITY_API_KEY,
+        },
+        api_security=(requirement("a"),),
+    )
+
+    suite = generate_test_suite(result)
+
+    assert len(suite.cases) == 1 and suite.diagnostics == ()
+    assert count_expansions(result) == 3
+
+
+def test_undeclared_security_scheme_name_skips_the_endpoint() -> None:
+    suite = generate_test_suite(
+        security_result({}, api_security=(requirement("ghost"),))
+    )
+
+    assert suite.cases == ()
+    assert security_diagnostics(suite) == [
+        ("unsupported_security_scheme_reference", "/items", "/security/0/ghost", None)
+    ]
+
+
+def test_dangling_security_scheme_reference_reports_the_failing_hop() -> None:
+    suite = generate_test_suite(
+        security_result({"a": security_ref("zzz")}, api_security=(requirement("a"),))
+    )
+
+    assert suite.cases == ()
+    assert security_diagnostics(suite) == [
+        (
+            "unsupported_security_scheme_reference",
+            "/items",
+            "/security/0/a",
+            f"{SECURITY_BASE}zzz",
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    ("schemes", "failing_uri"),
+    [
+        ({"a": security_ref("a")}, f"{SECURITY_BASE}a"),
+        ({"a": security_ref("b"), "b": security_ref("a")}, f"{SECURITY_BASE}b"),
+        (
+            {"a": security_ref("b"), "b": security_ref("c"), "c": security_ref("b")},
+            f"{SECURITY_BASE}b",
+        ),
+    ],
+    ids=["self", "two-step", "tail-loop"],
+)
+def test_security_scheme_reference_cycles_are_reported(
+    schemes: dict[str, SecurityScheme | LocalReference], failing_uri: str
+) -> None:
+    suite = generate_test_suite(security_result(schemes, api_security=(requirement("a"),)))
+
+    assert suite.cases == ()
+    assert security_diagnostics(suite) == [
+        ("unsupported_security_scheme_reference", "/items", "/security/0/a", failing_uri)
+    ]
+    assert "cycle" in suite.diagnostics[0].message
+
+
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "#/components/schemas/Pet",
+        "#/components/securitySchemes/a/b",
+        "#/components/securitySchemes/",
+        "#/components/securitySchemes",
+        "#",
+        "#/securitySchemes/a",
+    ],
+    ids=["wrong-category", "extra-segment", "empty-name", "no-name", "root", "wrong-prefix"],
+)
+def test_invalid_security_scheme_reference_paths_are_reported(uri: str) -> None:
+    suite = generate_test_suite(
+        security_result({"a": LocalReference(uri=uri)}, api_security=(requirement("a"),))
+    )
+
+    assert suite.cases == ()
+    assert security_diagnostics(suite) == [
+        ("unsupported_security_scheme_reference", "/items", "/security/0/a", uri)
+    ]
+    assert "#/components/securitySchemes/<name>" in suite.diagnostics[0].message
+
+
+@pytest.mark.parametrize(
+    ("target", "reference_name"),
+    [("a/b", "a~1b"), ("a b", "a%20b"), ("a~b", "a~0b"), ("a~1b", "a~01b"), ("a/b", "a%2Fb")],
+    ids=["slash", "space", "tilde", "decode-order", "encoded-slash"],
+)
+def test_security_scheme_reference_names_are_decoded(target: str, reference_name: str) -> None:
+    suite = generate_test_suite(
+        security_result(
+            {"alias": security_ref(reference_name), target: SECURITY_API_KEY},
+            api_security=(requirement("alias"),),
+        )
+    )
+
+    assert len(suite.cases) == 1 and suite.diagnostics == ()
+
+
+def test_unknown_or_unsupported_security_scheme_types_are_reported() -> None:
+    direct = generate_test_suite(
+        security_result({"s": SecurityScheme(type="weird")}, api_security=(requirement("s"),))
+    )
+    through_alias = generate_test_suite(
+        security_result(
+            {"a": security_ref("s"), "s": SecurityScheme(type="APIKEY")},
+            api_security=(requirement("a"),),
+        )
+    )
+
+    assert direct.cases == () and through_alias.cases == ()
+    assert security_diagnostics(direct) == [
+        ("unsupported_security_scheme", "/items", "/components/securitySchemes/s", None)
+    ]
+    assert security_diagnostics(through_alias) == [
+        (
+            "unsupported_security_scheme",
+            "/items",
+            "/components/securitySchemes/s",
+            f"{SECURITY_BASE}s",
+        )
+    ]
+
+
+def test_operation_security_overrides_api_security() -> None:
+    suite = generate_test_suite(
+        security_result(
+            {"ok": SECURITY_API_KEY},
+            security_endpoint(security=(requirement("ok"),)),
+            api_security=(requirement("undeclared"),),
+        )
+    )
+    broken_operation = generate_test_suite(
+        security_result(
+            {"ok": SECURITY_API_KEY},
+            security_endpoint(security=(requirement("bad"),)),
+            api_security=(requirement("ok"),),
+        )
+    )
+
+    assert [case.security for case in suite.cases] == [(requirement("ok"),)]
+    assert suite.diagnostics == ()
+    assert broken_operation.cases == ()
+    assert security_diagnostics(broken_operation) == [
+        (
+            "unsupported_security_scheme_reference",
+            "/items",
+            "/paths/~1items/get/security/0/bad",
+            None,
+        )
+    ]
+
+
+def test_api_security_is_inherited_when_operation_security_is_none() -> None:
+    valid = generate_test_suite(
+        security_result({"ok": SECURITY_API_KEY}, api_security=(requirement("ok"),))
+    )
+    broken = generate_test_suite(security_result({}, api_security=(requirement("bad"),)))
+
+    assert [case.security for case in valid.cases] == [(requirement("ok"),)]
+    assert broken.cases == ()
+    assert security_diagnostics(broken)[0][2] == "/security/0/bad"
+
+
+def test_empty_operation_security_looks_nothing_up() -> None:
+    result = security_result(
+        {"a": security_ref("zzz")},
+        security_endpoint(security=()),
+        api_security=(requirement("a"), requirement("undeclared")),
+    )
+
+    suite = generate_test_suite(result)
+
+    assert [case.security for case in suite.cases] == [()]
+    assert suite.diagnostics == ()
+    assert count_expansions(result) == 0
+
+
+@pytest.mark.parametrize("level", ["api", "operation"])
+def test_anonymous_security_requirement_looks_nothing_up(level: str) -> None:
+    anonymous = (SecurityRequirement(schemes={}),)
+    endpoint = security_endpoint(security=anonymous if level == "operation" else None)
+    result = security_result(
+        {}, endpoint, api_security=anonymous if level == "api" else None
+    )
+
+    suite = generate_test_suite(result)
+
+    assert [case.security for case in suite.cases] == [anonymous]
+    assert suite.diagnostics == ()
+
+
+def test_security_alternatives_keep_or_semantics_and_fail_the_whole_endpoint() -> None:
+    schemes = {"good": SECURITY_API_KEY, "other": SECURITY_API_KEY}
+    valid = generate_test_suite(
+        security_result(schemes, api_security=(requirement("good"), requirement("other", "good")))
+    )
+    broken = generate_test_suite(
+        security_result(
+            schemes,
+            api_security=(
+                requirement("good"),
+                SecurityRequirement(schemes={}),
+                requirement("good", "missing"),
+            ),
+        )
+    )
+
+    assert [case.security for case in valid.cases] == [
+        (requirement("good"), requirement("other", "good"))
+    ]
+    assert broken.cases == ()
+    assert security_diagnostics(broken) == [
+        ("unsupported_security_scheme_reference", "/items", "/security/2/missing", None)
+    ]
+
+
+def test_failures_follow_requirement_order_then_sorted_names() -> None:
+    first = generate_test_suite(
+        security_result({}, api_security=(requirement("b_missing", "a_missing"),))
+    )
+    second = generate_test_suite(
+        security_result({}, api_security=(requirement("x"), requirement("a")))
+    )
+
+    assert [item[2] for item in security_diagnostics(first)] == [
+        "/security/0/a_missing",
+        "/security/0/b_missing",
+    ]
+    assert [item[2] for item in security_diagnostics(second)] == [
+        "/security/0/x",
+        "/security/1/a",
+    ]
+
+
+def test_missing_names_in_different_requirements_are_all_reported() -> None:
+    suite = generate_test_suite(
+        security_result(
+            {},
+            security_endpoint("/items", (requirement("one"), requirement("two"))),
+        )
+    )
+
+    assert suite.cases == ()
+    assert security_diagnostics(suite) == [
+        (
+            "unsupported_security_scheme_reference",
+            "/items",
+            "/paths/~1items/get/security/0/one",
+            None,
+        ),
+        (
+            "unsupported_security_scheme_reference",
+            "/items",
+            "/paths/~1items/get/security/1/two",
+            None,
+        ),
+    ]
+
+
+def test_invalid_schemes_in_one_requirement_are_reported_in_sorted_name_order() -> None:
+    suite = generate_test_suite(
+        security_result(
+            {"zeta": SecurityScheme(type="mutualTLS"), "beta": SecurityScheme(type="mutualTLS")},
+            security_endpoint("/items", (requirement("zeta", "missing", "beta"),)),
+            version="3.0.3",
+        )
+    )
+
+    assert suite.cases == ()
+    assert security_diagnostics(suite) == [
+        ("unsupported_security_scheme", "/items", "/components/securitySchemes/beta", None),
+        (
+            "unsupported_security_scheme_reference",
+            "/items",
+            "/paths/~1items/get/security/0/missing",
+            None,
+        ),
+        ("unsupported_security_scheme", "/items", "/components/securitySchemes/zeta", None),
+    ]
+
+
+def test_a_valid_scheme_does_not_hide_other_invalid_schemes() -> None:
+    suite = generate_test_suite(
+        security_result(
+            {"ok": SECURITY_API_KEY},
+            security_endpoint("/items", (requirement("ok", "ghost"), requirement("ok"))),
+        )
+    )
+
+    assert suite.cases == ()
+    assert security_diagnostics(suite) == [
+        (
+            "unsupported_security_scheme_reference",
+            "/items",
+            "/paths/~1items/get/security/0/ghost",
+            None,
+        )
+    ]
+
+
+def test_identical_failures_are_reported_once_per_pointer_and_reference_uri() -> None:
+    bad = SecurityScheme(type="mutualTLS")
+    suite = generate_test_suite(
+        security_result(
+            {"bad": bad, "alias": security_ref("bad"), "other": security_ref("bad")},
+            security_endpoint(
+                "/items",
+                (
+                    requirement("bad"),
+                    requirement("bad"),
+                    requirement("alias"),
+                    requirement("other"),
+                ),
+            ),
+            version="3.0.3",
+        )
+    )
+
+    assert suite.cases == ()
+    assert security_diagnostics(suite) == [
+        ("unsupported_security_scheme", "/items", "/components/securitySchemes/bad", None),
+        (
+            "unsupported_security_scheme",
+            "/items",
+            "/components/securitySchemes/bad",
+            f"{SECURITY_BASE}bad",
+        ),
+    ]
+
+
+def test_identical_failures_of_different_endpoints_are_not_merged() -> None:
+    suite = generate_test_suite(
+        security_result(
+            {"bad": SecurityScheme(type="mutualTLS")},
+            security_endpoint("/a", (requirement("bad"),)),
+            security_endpoint("/b", (requirement("bad"),)),
+            version="3.0.3",
+        )
+    )
+
+    assert [item[1] for item in security_diagnostics(suite)] == ["/a", "/b"]
+
+
+def test_an_endpoint_with_several_failures_generates_no_partial_cases() -> None:
+    suite = generate_test_suite(
+        security_result(
+            {"ok": SECURITY_API_KEY},
+            security_endpoint("/a", (requirement("ok"),)),
+            security_endpoint("/b", (requirement("ok"), requirement("x"), requirement("y"))),
+            security_endpoint("/c", (requirement("ok"),)),
+        )
+    )
+
+    assert {case.path for case in suite.cases} == {"/a", "/c"}
+    assert [item[:3] for item in security_diagnostics(suite)] == [
+        ("unsupported_security_scheme_reference", "/b", "/paths/~1b/get/security/1/x"),
+        ("unsupported_security_scheme_reference", "/b", "/paths/~1b/get/security/2/y"),
+    ]
+
+
+def test_budget_exhaustion_after_an_ordinary_failure_keeps_only_the_budget_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    schemes: dict[str, SecurityScheme | LocalReference] = {
+        "a": security_ref("b"),
+        "b": security_ref("c"),
+        "c": security_ref("d"),
+        "d": SECURITY_API_KEY,
+    }
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_EXPANSIONS", 2)
+
+    suite = generate_test_suite(
+        security_result(
+            schemes,
+            security_endpoint("/items", (requirement("ghost"), requirement("a"))),
+            security_endpoint("/inline", ()),
+        )
+    )
+
+    assert [case.path for case in suite.cases] == ["/inline"]
+    assert [item.code for item in suite.diagnostics] == ["generation_expansion_budget_exceeded"]
+    assert suite.diagnostics[0].endpoint_path == "/items"
+    assert suite.diagnostics[0].source_pointer == "/paths/~1items/get/security/1/a"
+
+
+def test_a_broken_security_scheme_does_not_stop_other_endpoints() -> None:
+    suite = generate_test_suite(
+        security_result(
+            {"ok": SECURITY_API_KEY},
+            security_endpoint("/a", (requirement("ok"),)),
+            security_endpoint("/b", (requirement("ghost"),)),
+            security_endpoint("/c", (requirement("ok"),)),
+        )
+    )
+
+    assert [case.path for case in suite.cases] == ["/a", "/c"]
+    assert security_diagnostics(suite) == [
+        (
+            "unsupported_security_scheme_reference",
+            "/b",
+            "/paths/~1b/get/security/0/ghost",
+            None,
+        )
+    ]
+
+
+def test_security_reference_hops_are_charged_to_the_endpoint_expansion_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    schemes: dict[str, SecurityScheme | LocalReference] = {
+        "a": security_ref("b"),
+        "b": security_ref("c"),
+        "c": security_ref("d"),
+        "d": SECURITY_API_KEY,
+    }
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_EXPANSIONS", 2)
+
+    suite = generate_test_suite(
+        security_result(
+            schemes,
+            security_endpoint("/items", (requirement("a"),)),
+            security_endpoint("/inline", ()),
+        )
+    )
+
+    assert [case.path for case in suite.cases] == ["/inline"]
+    assert [item.code for item in suite.diagnostics] == ["generation_expansion_budget_exceeded"]
+    diagnostic = suite.diagnostics[0]
+    assert diagnostic.endpoint_path == "/items"
+    assert diagnostic.source_pointer == "/paths/~1items/get/security/0/a"
+    assert diagnostic.reference_uri == f"{SECURITY_BASE}d"
+    assert "per-endpoint limit of 2" in diagnostic.message
+
+
+def test_security_reference_hops_are_charged_to_the_suite_expansion_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(generator_module, "_MAX_SUITE_EXPANSIONS", 2)
+    suite = generate_test_suite(
+        security_result(
+            {"a": security_ref("b"), "b": SECURITY_API_KEY},
+            *(security_endpoint(f"/e{index}") for index in range(4)),
+            api_security=(requirement("a"),),
+        )
+    )
+
+    assert [case.path for case in suite.cases] == ["/e0", "/e1"]
+    assert [item.code for item in suite.diagnostics] == ["generation_expansion_budget_exceeded"]
+    assert suite.diagnostics[0].endpoint_path == "/e2"
+    assert "per-suite limit of 2" in suite.diagnostics[0].message
+    assert "1 following endpoint(s)" in suite.diagnostics[0].message
+
+
+def test_security_validation_is_deterministic_and_does_not_mutate_input() -> None:
+    def build() -> NormalizationResult:
+        return security_result(
+            {"ok": SECURITY_API_KEY, "alias": security_ref("ok")},
+            security_endpoint("/a", (requirement("alias"),)),
+            security_endpoint("/b", (requirement("ghost"), requirement("ok"))),
+            security_endpoint("/c"),
+            api_security=(requirement("ok"),),
+        )
+
+    result = build()
+    before = result.model_dump_json()
+    first = generate_test_suite(result)
+    second = generate_test_suite(build())
+
+    assert result.model_dump_json() == before
+    assert first == second
+    assert first.model_dump_json() == second.model_dump_json()
+    assert [case.path for case in first.cases][:1] == ["/a"]
+    assert first.cases[0].security is not result.api.endpoints[0].security
+    assert [item[1] for item in security_diagnostics(first)] == ["/b"]
+
+
+def test_security_scheme_data_is_not_copied_into_cases_or_diagnostics() -> None:
+    secret = "SECRET-VALUE-123"
+    schemes: dict[str, SecurityScheme | LocalReference] = {
+        "good": SecurityScheme(
+            type="http",
+            scheme="bearer",
+            description=secret,
+            extensions={"x-token": secret},
+        ),
+        "bad": SecurityScheme(
+            type="weird", description=secret, extensions={"x-token": secret}
+        ),
+    }
+
+    suite = generate_test_suite(
+        security_result(
+            schemes,
+            security_endpoint("/good", (requirement("good"),)),
+            security_endpoint("/bad", (requirement("bad"),)),
+        )
+    )
+
+    assert [case.path for case in suite.cases] == ["/good"]
+    assert len(suite.diagnostics) == 1
+    assert secret not in suite.model_dump_json()
+    assert set(GeneratedTestCase.model_fields) >= {"security"}
+    assert "security_schemes" not in GeneratedTestCase.model_fields
+
+
+@pytest.mark.parametrize("version", ["3.0.3", "3.1.1"])
+def test_normalized_documents_resolve_security_scheme_aliases(version: str) -> None:
+    from app.services.openapi import normalize_openapi_document
+
+    def document(target: str) -> dict[str, object]:
+        return {
+            "openapi": version,
+            "info": {"title": "T", "version": "1"},
+            "security": [{"alias": []}],
+            "components": {
+                "securitySchemes": {
+                    "apiKey": {"type": "apiKey", "name": "X-Key", "in": "header"},
+                    "alias": {"$ref": f"#/components/securitySchemes/{target}"},
+                }
+            },
+            "paths": {"/items": {"get": {"responses": {"200": {"description": "OK"}}}}},
+        }
+
+    valid = generate_test_suite(normalize_openapi_document(document("apiKey")))
+    dangling = generate_test_suite(normalize_openapi_document(document("missing")))
+
+    assert [case.security for case in valid.cases] == [(requirement("alias"),)]
+    assert valid.diagnostics == ()
+    assert dangling.cases == ()
+    assert security_diagnostics(dangling) == [
+        (
+            "unsupported_security_scheme_reference",
+            "/items",
+            "/security/0/alias",
+            f"{SECURITY_BASE}missing",
+        )
+    ]

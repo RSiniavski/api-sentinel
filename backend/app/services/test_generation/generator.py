@@ -23,6 +23,8 @@ from app.services.openapi.models import (
     RequestBody,
     Response,
     Schema,
+    SecurityRequirement,
+    SecurityScheme,
 )
 from app.services.test_generation.models import (
     GeneratedBody,
@@ -184,6 +186,19 @@ class _UnsupportedOperation(Exception):
         self.reference_uri = reference_uri
 
 
+class _SecurityIssues(_UnsupportedOperation):
+    """Every ordinary security validation failure of one endpoint, in order.
+
+    It is an _UnsupportedOperation (the first failure), so existing handlers
+    skip the endpoint; the endpoint-level handler reports all of `issues`.
+    """
+
+    def __init__(self, issues: list[_UnsupportedOperation]) -> None:
+        first = issues[0]
+        super().__init__(first.code, str(first), first.pointer, first.reference_uri)
+        self.issues = tuple(issues)
+
+
 def build_case_id(category: str, endpoint_path: str, method: str, variant_id: str) -> str:
     """Build a stable SHA-256 ID from length-prefixed UTF-8 input fields."""
     fields = (category, endpoint_path, method, variant_id)
@@ -285,7 +300,14 @@ def _generate_suite(result: NormalizationResult, budget: _GenerationBudget) -> G
         except _UnsupportedOperation as issue:
             # Only the positive baseline can fail here: the endpoint is skipped.
             diagnostics.extend(
-                budget.admit([_unsupported_diagnostic(issue, endpoint)])
+                budget.admit(
+                    [
+                        _unsupported_diagnostic(item, endpoint)
+                        for item in (
+                            issue.issues if isinstance(issue, _SecurityIssues) else (issue,)
+                        )
+                    ]
+                )
             )
         if exhausted is not None:
             diagnostics.append(
@@ -2312,6 +2334,7 @@ def _generate_endpoint(endpoint: Endpoint, api: ApiModel) -> GeneratedTestCase:
     body, body_provenance = _generate_body(endpoint, api, root)
     expectations = _response_expectations(endpoint, root, api)
     security = endpoint.security if endpoint.security is not None else api.security
+    _check_security_schemes(endpoint, api, root)
 
     return _counted_case(
         case_id=build_case_id("positive", endpoint.path, endpoint.method, "baseline"),
@@ -2516,6 +2539,121 @@ def _response_expectations(
             )
         )
     return tuple(expectations)
+
+
+_SECURITY_SCHEME_REFERENCE_PREFIX = "#/components/securitySchemes/"
+_SECURITY_SCHEME_TYPES = frozenset({"apiKey", "http", "oauth2", "openIdConnect"})
+
+
+def _check_security_schemes(endpoint: Endpoint, api: ApiModel, endpoint_pointer: str) -> None:
+    """Validate every scheme named by the effective security requirements.
+
+    The effective requirements are the operation's own `security` if it is not
+    None, otherwise the API-level `security`. Anonymous requirements and an
+    explicitly empty list name no scheme, so nothing is looked up. Every
+    ordinary failure, in requirement order and then sorted name order, is
+    collected (identical pointer and reference URI once) and fails the whole
+    endpoint together; no alternative or scheme is dropped. An exhausted
+    expansion budget is not an ordinary failure: it propagates and stops the
+    check.
+    """
+    if endpoint.security is not None:
+        requirements: tuple[SecurityRequirement, ...] = endpoint.security
+        base = _child(endpoint_pointer, "security")
+    elif api.security is not None:
+        requirements = api.security
+        base = _pointer("security")
+    else:
+        return
+    issues: list[_UnsupportedOperation] = []
+    seen: set[tuple[str, str | None]] = set()
+    for index, requirement in enumerate(requirements):
+        for name in sorted(requirement.schemes):
+            try:
+                _resolve_security_scheme(name, api, _child(base, str(index), name))
+            except _UnsupportedOperation as issue:
+                key = (issue.pointer, issue.reference_uri)
+                if key not in seen:
+                    seen.add(key)
+                    issues.append(issue)
+    if issues:
+        raise _SecurityIssues(issues)
+
+
+def _resolve_security_scheme(name: str, api: ApiModel, pointer: str) -> SecurityScheme:
+    """Look up a security scheme by name and follow local references to it.
+
+    Only the scheme's type is validated. Every successfully followed reference
+    hop is charged to the expansion budget.
+    """
+    entry = api.components.security_schemes.get(name)
+    if entry is None:
+        raise _UnsupportedOperation(
+            "unsupported_security_scheme_reference",
+            "Security scheme is not declared in components.securitySchemes.",
+            pointer,
+        )
+
+    followed: list[str] = []
+    declaration = _pointer("components", "securitySchemes", name)
+    current = entry
+    while isinstance(current, LocalReference):
+        uri = current.uri
+        if uri in followed:
+            raise _UnsupportedOperation(
+                "unsupported_security_scheme_reference",
+                "Security scheme reference cycle.",
+                pointer,
+                uri,
+            )
+        followed.append(uri)
+        segment = uri[len(_SECURITY_SCHEME_REFERENCE_PREFIX) :]
+        if (
+            not uri.startswith(_SECURITY_SCHEME_REFERENCE_PREFIX)
+            or not segment
+            or "/" in segment
+        ):
+            raise _UnsupportedOperation(
+                "unsupported_security_scheme_reference",
+                "Only #/components/securitySchemes/<name> references are supported.",
+                pointer,
+                uri,
+            )
+        target_name = unquote(segment).replace("~1", "/").replace("~0", "~")
+        target = api.components.security_schemes.get(target_name)
+        if target is None:
+            raise _UnsupportedOperation(
+                "unsupported_security_scheme_reference",
+                "Security scheme reference target was not found.",
+                pointer,
+                uri,
+            )
+        _charge_expansion(pointer, uri)
+        declaration = _pointer("components", "securitySchemes", target_name)
+        current = target
+
+    if not isinstance(current, SecurityScheme):
+        raise _UnsupportedOperation(
+            "unsupported_security_scheme",
+            "Unsupported security scheme entry.",
+            declaration,
+            followed[-1] if followed else None,
+        )
+    mutual_tls = current.type == "mutualTLS"
+    if current.type in _SECURITY_SCHEME_TYPES or (
+        mutual_tls and api.openapi_version.startswith("3.1.")
+    ):
+        return current
+    raise _UnsupportedOperation(
+        "unsupported_security_scheme",
+        (
+            "The mutualTLS security scheme type requires OpenAPI 3.1."
+            if mutual_tls
+            else f"Security scheme type '{current.type}' is not supported."
+        ),
+        declaration,
+        followed[-1] if followed else None,
+    )
 
 
 def _parameter_examples(parameter: Parameter, pointer: str) -> list[tuple[Any, str]]:

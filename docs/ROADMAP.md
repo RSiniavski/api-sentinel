@@ -107,6 +107,7 @@ Implemented so far:
 - Local reference resolution for parameters, request bodies and schemas, with diagnostics for unsupported, missing, invalid and cyclic references and the `$ref` sibling policy (annotations only).
 - Deterministic resource budgets for reference expansions, generated cases and diagnostics, with stable budget diagnostics.
 - Referenced responses: local `#/components/responses/` references, including alias chains, resolved into `ResponseExpectation`.
+- Security scheme validation: schemes named by the effective security requirements are looked up, local `#/components/securitySchemes/` alias chains are resolved, and the scheme type is checked; all failures of an endpoint are reported together and the endpoint is skipped.
 - Failure isolation: an unsupported schema in one negative step does not stop the other negative steps of the endpoint.
 
 Still planned:
@@ -114,6 +115,7 @@ Still planned:
 - Array bound cases for optional arrays, array elements and nested arrays.
 - Support for further schema keywords (for example `pattern`, `format`) and compositions.
 - Request media types other than `application/json`.
+- Security scheme checks beyond the type (required fields per type, OAuth2 scopes) and resolved scheme metadata in generated cases.
 - Contract validation of responses, together with the Test Execution Engine (Phase 5).
 
 ## 6. Phase 5 — Test Execution Engine
