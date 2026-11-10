@@ -248,3 +248,75 @@ def test_oversized_document_is_rejected() -> None:
 
     with pytest.raises(OpenAPIParseError, match="5 MiB"):
         parse_openapi_document(content, "api.json")
+
+
+SECURITY_SCHEME_DEFINITIONS = {
+    "apiKey": {"type": "apiKey", "name": "X-Key", "in": "header"},
+    "http": {"type": "http", "scheme": "bearer"},
+    "oauth2": {
+        "type": "oauth2",
+        "flows": {
+            "clientCredentials": {"tokenUrl": "https://auth.example.test/token", "scopes": {}}
+        },
+    },
+    "openIdConnect": {
+        "type": "openIdConnect",
+        "openIdConnectUrl": "https://auth.example.test/.well-known/openid-configuration",
+    },
+}
+
+
+def security_scheme_document(version: str, scheme: dict) -> str:
+    document = openapi_document(version)
+    document["components"] = {"securitySchemes": {"scheme": scheme}}
+    return json.dumps(document)
+
+
+@pytest.mark.parametrize("version", ["3.0.3", "3.1.1"])
+@pytest.mark.parametrize("scheme_type", sorted(SECURITY_SCHEME_DEFINITIONS))
+def test_complete_security_schemes_pass_real_openapi_validation(
+    version: str, scheme_type: str
+) -> None:
+    scheme = SECURITY_SCHEME_DEFINITIONS[scheme_type]
+
+    result = parse_openapi_document(security_scheme_document(version, scheme), "api.json")
+
+    assert result["components"]["securitySchemes"]["scheme"] == scheme
+
+
+@pytest.mark.parametrize(
+    ("scheme_type", "missing_field"),
+    [
+        ("apiKey", "name"),
+        ("apiKey", "in"),
+        ("http", "scheme"),
+        ("oauth2", "flows"),
+        ("openIdConnect", "openIdConnectUrl"),
+    ],
+)
+def test_openapi_30_rejects_security_scheme_missing_required_field(
+    scheme_type: str, missing_field: str
+) -> None:
+    scheme = {
+        key: value
+        for key, value in SECURITY_SCHEME_DEFINITIONS[scheme_type].items()
+        if key != missing_field
+    }
+
+    with pytest.raises(OpenAPIValidationError):
+        parse_openapi_document(security_scheme_document("3.0.3", scheme), "api.json")
+
+
+def test_openapi_30_rejects_mutual_tls_security_scheme() -> None:
+    with pytest.raises(OpenAPIValidationError):
+        parse_openapi_document(
+            security_scheme_document("3.0.3", {"type": "mutualTLS"}), "api.json"
+        )
+
+
+def test_openapi_31_accepts_mutual_tls_security_scheme() -> None:
+    scheme = {"type": "mutualTLS"}
+
+    result = parse_openapi_document(security_scheme_document("3.1.1", scheme), "api.json")
+
+    assert result["components"]["securitySchemes"]["scheme"] == scheme
