@@ -7271,3 +7271,239 @@ def test_format_generation_is_deterministic_and_does_not_mutate_input() -> None:
 
     assert first.model_dump_json() == second.model_dump_json()
     assert result.model_dump_json() == before
+
+
+# --- Step 8.2.1: empty arrays with unsupported item schemas ---
+
+UNSUPPORTED_ITEMS: dict[str, object] = {"type": "string", "pattern": "^a$"}
+ITEMS_PATTERN_POINTER = tags_schema_pointer("items", "pattern")
+
+
+def empty_array_suite(
+    tags: object,
+    *,
+    version: str = "3.1.1",
+    schemas: dict[str, dict[str, object]] | None = None,
+    body: dict[str, object] | None = None,
+) -> GeneratedTestSuite:
+    components = (
+        Components(schemas={name: Schema(raw=raw) for name, raw in schemas.items()})
+        if schemas
+        else None
+    )
+    endpoint = post_endpoint(body if body is not None else tags_body(tags))
+    return generate_test_suite(make_result(endpoint, version=version, components=components))
+
+
+def positive_tags(suite: GeneratedTestSuite) -> object:
+    positive = suite.cases[0]
+    assert positive.category == "positive"
+    assert positive.request_body is not None
+    return positive.request_body.value["tags"]  # type: ignore[index]
+
+
+def codes(suite: GeneratedTestSuite) -> list[str]:
+    return [item.code for item in suite.diagnostics]
+
+
+@pytest.mark.parametrize("version", ["3.0.3", "3.1.1"])
+@pytest.mark.parametrize("extra", [{}, {"minItems": 0}], ids=["no-minItems", "minItems-0"])
+def test_required_empty_array_is_valid_despite_unsupported_items(
+    extra: dict[str, object], version: str
+) -> None:
+    suite = empty_array_suite({"type": "array", **extra, "items": UNSUPPORTED_ITEMS}, version=version)
+
+    assert positive_tags(suite) == []
+    assert "unsupported_schema_keyword" not in codes(suite)
+    assert array_cases(suite) == []
+    # The other negative steps still run for the endpoint.
+    assert {case.violated_constraint for case in suite.cases[1:]} >= {"required_property", "type"}
+
+
+def test_empty_array_nested_in_an_object_property_is_valid() -> None:
+    body = {
+        "type": "object",
+        "required": ["outer"],
+        "properties": {"outer": tags_body({"type": "array", "items": UNSUPPORTED_ITEMS})},
+    }
+
+    suite = empty_array_suite(None, body=body)
+
+    assert suite.cases[0].request_body.value == {"outer": {"tags": []}}  # type: ignore[union-attr]
+    assert codes(suite) == []
+
+
+def test_unsupported_items_with_max_items_report_one_diagnostic_at_the_real_pointer() -> None:
+    suite = empty_array_suite({"type": "array", "maxItems": 2, "items": UNSUPPORTED_ITEMS})
+
+    assert positive_tags(suite) == []
+    assert array_cases(suite) == []
+    assert array_diagnostics(suite) == [("array_bound_unsupported_schema", ITEMS_PATTERN_POINTER)]
+    assert codes(suite) == ["array_bound_unsupported_schema"]
+
+
+def test_unsupported_items_with_unique_items_report_one_diagnostic() -> None:
+    suite = empty_array_suite({"type": "array", "uniqueItems": True, "items": UNSUPPORTED_ITEMS})
+
+    assert positive_tags(suite) == []
+    assert array_cases(suite) == []
+    assert array_diagnostics(suite) == [("array_bound_unsupported_schema", ITEMS_PATTERN_POINTER)]
+
+
+def test_unsupported_items_needed_by_several_candidates_are_reported_once() -> None:
+    suite = empty_array_suite(
+        {"type": "array", "maxItems": 2, "uniqueItems": True, "items": UNSUPPORTED_ITEMS}
+    )
+
+    assert positive_tags(suite) == []
+    # maxItems needs three unique items (existing diagnostic); uniqueItems needs
+    # an item, so the unsupported items schema is reported once, at its pointer.
+    assert array_diagnostics(suite) == [
+        ("array_bound_no_safe_candidate", tags_schema_pointer("maxItems")),
+        ("array_bound_unsupported_schema", ITEMS_PATTERN_POINTER),
+    ]
+
+
+def test_min_items_one_with_unsupported_items_still_fails_the_positive_baseline() -> None:
+    suite = empty_array_suite({"type": "array", "minItems": 1, "items": UNSUPPORTED_ITEMS})
+
+    assert suite.cases == ()
+    assert [(item.code, item.source_pointer) for item in suite.diagnostics] == [
+        ("unsupported_schema_keyword", ITEMS_PATTERN_POINTER)
+    ]
+
+
+def test_supported_items_still_produce_the_same_array_cases() -> None:
+    suite = empty_array_suite({"type": "array", "minItems": 1, "maxItems": 2, "items": ITEM_SCHEMA})
+
+    assert positive_tags(suite) == ["x"]
+    assert array_summary(suite) == [("/tags", "minItems", 0), ("/tags", "maxItems", 3)]
+    assert codes(suite) == []
+
+
+def test_boolean_false_items_allow_the_empty_array_only() -> None:
+    plain = empty_array_suite({"type": "array", "items": False})
+    bounded = empty_array_suite({"type": "array", "maxItems": 1, "items": False})
+    required_item = empty_array_suite({"type": "array", "minItems": 1, "items": False})
+
+    assert positive_tags(plain) == [] and codes(plain) == []
+    assert positive_tags(bounded) == []
+    assert array_diagnostics(bounded) == [
+        ("array_bound_no_safe_candidate", tags_schema_pointer("maxItems"))
+    ]
+    assert required_item.cases == ()
+    assert codes(required_item) == ["no_positive_schema_value"]
+
+
+def test_boolean_true_items_keep_generating_null_items() -> None:
+    suite = empty_array_suite({"type": "array", "minItems": 1, "maxItems": 1, "items": True})
+
+    assert positive_tags(suite) == [None]
+    assert array_summary(suite) == [("/tags", "minItems", 0), ("/tags", "maxItems", 2)]
+
+
+@pytest.mark.parametrize(
+    "literal", [{"const": []}, {"enum": [[]]}], ids=["const", "enum"]
+)
+def test_empty_array_const_and_enum_are_valid_despite_unsupported_items(
+    literal: dict[str, object],
+) -> None:
+    suite = empty_array_suite({"type": "array", **literal, "items": UNSUPPORTED_ITEMS})
+
+    assert positive_tags(suite) == []
+    assert "unsupported_schema_keyword" not in codes(suite)
+    assert array_cases(suite) == []
+
+
+def test_nonempty_array_literals_with_unsupported_items_are_not_accepted() -> None:
+    const = empty_array_suite({"type": "array", "const": ["a"], "items": UNSUPPORTED_ITEMS})
+    enum = empty_array_suite({"type": "array", "enum": [["a"]], "items": UNSUPPORTED_ITEMS})
+
+    for suite in (const, enum):
+        assert suite.cases == ()
+        assert codes(suite) == ["no_positive_schema_value"]
+
+
+def test_nonempty_example_with_unsupported_items_is_rejected_not_used() -> None:
+    suite = empty_array_suite(
+        {"type": "array", "example": ["a"], "items": UNSUPPORTED_ITEMS}
+    )
+    required_two = empty_array_suite(
+        {"type": "array", "minItems": 2, "example": ["a", "a"], "items": UNSUPPORTED_ITEMS}
+    )
+
+    assert positive_tags(suite) == []
+    assert required_two.cases == ()
+    assert [(item.code, item.source_pointer) for item in required_two.diagnostics] == [
+        ("unsupported_schema_keyword", ITEMS_PATTERN_POINTER)
+    ]
+
+
+def test_openapi_31_nullable_array_type_accepts_the_empty_array() -> None:
+    schema = {"type": ["array", "null"], "maxItems": 2, "items": UNSUPPORTED_ITEMS}
+
+    suite = empty_array_suite(schema)
+    null_literal = empty_array_suite({**schema, "const": None})
+
+    assert positive_tags(suite) == []
+    assert array_diagnostics(suite) == [("array_bound_unsupported_schema", ITEMS_PATTERN_POINTER)]
+    assert positive_tags(null_literal) is None
+
+
+def test_unsupported_composition_in_items_allows_only_the_empty_array() -> None:
+    items = {"oneOf": [{"type": "string"}, {"type": "integer"}]}
+
+    empty = empty_array_suite({"type": "array", "maxItems": 2, "items": items})
+    required_item = empty_array_suite({"type": "array", "minItems": 1, "items": items})
+
+    assert positive_tags(empty) == []
+    assert array_diagnostics(empty) == [
+        ("array_bound_unsupported_schema", tags_schema_pointer("items", "oneOf"))
+    ]
+    assert required_item.cases == ()
+    assert [(item.code, item.source_pointer) for item in required_item.diagnostics] == [
+        ("unsupported_schema_composition", tags_schema_pointer("items", "oneOf"))
+    ]
+
+
+def test_local_reference_in_items_to_an_unsupported_schema_is_reported_at_the_target() -> None:
+    items = {"$ref": "#/components/schemas/Letter"}
+    schemas = {"Letter": UNSUPPORTED_ITEMS}
+
+    empty = empty_array_suite({"type": "array", "maxItems": 2, "items": items}, schemas=schemas)
+    required_item = empty_array_suite(
+        {"type": "array", "minItems": 1, "items": items}, schemas=schemas
+    )
+
+    assert positive_tags(empty) == []
+    assert [(item.code, item.source_pointer, item.reference_uri) for item in empty.diagnostics] == [
+        ("array_bound_unsupported_schema", "/components/schemas/Letter/pattern", None)
+    ]
+    assert required_item.cases == ()
+    assert [(item.code, item.source_pointer, item.reference_uri) for item in required_item.diagnostics] == [
+        ("unsupported_schema_keyword", "/components/schemas/Letter/pattern", None)
+    ]
+
+
+def test_local_reference_in_items_to_a_supported_schema_is_unchanged() -> None:
+    suite = empty_array_suite(
+        {"type": "array", "minItems": 1, "maxItems": 1, "items": {"$ref": "#/components/schemas/Name"}},
+        schemas={"Name": {"type": "string", "minLength": 2}},
+    )
+
+    assert positive_tags(suite) == ["sentinel"]
+    assert array_summary(suite) == [("/tags", "minItems", 0), ("/tags", "maxItems", 2)]
+    assert codes(suite) == []
+
+
+def test_empty_array_generation_is_deterministic_and_does_not_mutate_input() -> None:
+    result = make_result(
+        post_endpoint(tags_body({"type": "array", "maxItems": 2, "items": UNSUPPORTED_ITEMS}))
+    )
+    before = result.model_dump_json()
+
+    first = generate_test_suite(result)
+    second = generate_test_suite(result)
+
+    assert first.model_dump_json() == second.model_dump_json()
+    assert result.model_dump_json() == before

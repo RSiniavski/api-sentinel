@@ -3058,7 +3058,9 @@ def _matches(schema: dict[str, Any], value: Any, version: str, direction: str, d
             _equal(value[i], value[j]) for i in range(len(value)) for j in range(i + 1, len(value))
         ):
             return False
-        if "items" in schema:
+        # An empty array has no item to check, so an unsupported `items` schema
+        # must not reject it (_check_schema also skips `items` when minItems is 0).
+        if "items" in schema and value:
             item_schema = _check_schema(schema["items"], version, "/items", direction, depth + 1)
             for item in value:
                 if item_schema is False or (isinstance(item_schema, dict) and not _matches(item_schema, item, version, direction, depth + 1)):
