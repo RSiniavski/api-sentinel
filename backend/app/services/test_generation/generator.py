@@ -6,6 +6,8 @@ from collections.abc import Callable, Mapping
 from contextvars import ContextVar
 from copy import deepcopy
 import math
+import re
+from datetime import date
 from decimal import Decimal, InvalidOperation, localcontext
 from hashlib import sha256
 from types import MappingProxyType
@@ -42,9 +44,46 @@ _SCHEMA_KEYS = {
     "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf",
     "minLength", "maxLength", "minItems", "maxItems", "uniqueItems",
     "properties", "required", "items", "readOnly", "writeOnly", "title",
-    "description", "deprecated",
+    "description", "deprecated", "format",
 }
 _COMPOSITIONS = {"allOf", "oneOf", "anyOf", "not"}
+
+# The closed set of supported `format` values and the one schema type each
+# requires. Any other format string stays an unsupported schema keyword.
+_FORMAT_TYPES = {
+    "int32": "integer",
+    "int64": "integer",
+    "float": "number",
+    "double": "number",
+    "date": "string",
+    "date-time": "string",
+    "uuid": "string",
+    "email": "string",
+}
+_FLOAT_MAX = 3.4028234663852886e38
+# Inclusive implicit numeric ranges. `double` only requires a finite value.
+_FORMAT_RANGES = {
+    "int32": (Decimal(-(2**31)), Decimal(2**31 - 1)),
+    "int64": (Decimal(-(2**63)), Decimal(2**63 - 1)),
+    "float": (Decimal(-_FLOAT_MAX), Decimal(_FLOAT_MAX)),
+}
+# Fixed string fallbacks, tried in order; the first that passes _matches wins.
+_FORMAT_FALLBACKS = {
+    "date": ("2000-01-01",),
+    "date-time": ("2000-01-01T00:00:00Z", "2000-01-01T00:00:00.000Z"),
+    "uuid": ("00000000-0000-4000-8000-000000000000",),
+    "email": ("user@example.com",),
+}
+_DATE_PATTERN = re.compile(r"([0-9]{4})-([0-9]{2})-([0-9]{2})")
+_DATE_TIME_PATTERN = re.compile(
+    r"([0-9]{4})-([0-9]{2})-([0-9]{2})[Tt]([0-9]{2}):([0-9]{2}):([0-9]{2})"
+    r"(?:\.[0-9]+)?(?:[Zz]|[+-]([0-9]{2}):([0-9]{2}))"
+)
+_UUID_PATTERN = re.compile(
+    r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}"
+)
+_EMAIL_LOCAL_PATTERN = re.compile(r"[A-Za-z0-9._%+-]+")
+_EMAIL_LABEL_PATTERN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?")
 _MAX_DEPTH = 32
 _MAX_COLLECTION_SIZE = 100
 _SCHEMA_REFERENCE_PREFIX = "#/components/schemas/"
@@ -1866,6 +1905,9 @@ def _numeric_boundary_candidate(
                 continue
             (add_lower if side == "lower" else add_upper)(bound, not strict)
 
+        # Implicit format ranges are enforced as an "other constraint" by
+        # _numeric_schema_constraints_match. The nearest violating lattice value
+        # is the only candidate, so a range check on it is sufficient.
         if constraint in ("minimum", "exclusiveMinimum"):
             add_upper(boundary, inclusive=constraint == "exclusiveMinimum")
         else:
@@ -2048,6 +2090,9 @@ def _numeric_schema_constraints_match(
             return False
     multiple = _as_decimal(schema.get("multipleOf"))
     if multiple is not None and (multiple <= 0 or not _decimal_is_multiple(value, multiple)):
+        return False
+    format_range = _FORMAT_RANGES.get(schema.get("format"))
+    if format_range is not None and not format_range[0] <= value <= format_range[1]:
         return False
     if "const" in schema:
         const = _as_decimal(schema["const"])
@@ -2904,6 +2949,8 @@ def _check_schema(
             )
     if "type" in raw:
         _types(raw["type"], version, _child(pointer, "type"))
+    if "format" in raw:
+        _check_format(raw, version, pointer)
     for key in ("enum", "examples"):
         if key in raw and not isinstance(raw[key], list):
             raise _UnsupportedOperation("unsupported_schema_form", f"Schema {key} must be an array.", _child(pointer, key))
@@ -2926,6 +2973,34 @@ def _check_schema(
     if "items" in raw and raw.get("minItems", 0) > 0:
         _check_schema(raw["items"], version, _child(pointer, "items"), direction, depth + 1)
     return raw
+
+
+def _check_format(raw: dict[str, Any], version: str, pointer: str) -> None:
+    """Validate a `format` keyword: a supported string format on its own type."""
+    format_pointer = _child(pointer, "format")
+    name = raw["format"]
+    if not isinstance(name, str):
+        raise _UnsupportedOperation(
+            "unsupported_schema_form", "Schema format must be a string.", format_pointer
+        )
+    expected = _FORMAT_TYPES.get(name)
+    if expected is None:
+        raise _UnsupportedOperation(
+            "unsupported_schema_keyword",
+            "Schema keyword 'format' is outside the supported subset.",
+            format_pointer,
+        )
+    declared = (
+        next((item for item in _types(raw["type"], version, _child(pointer, "type")) if item != "null"), None)
+        if "type" in raw
+        else None
+    )
+    if declared != expected:
+        raise _UnsupportedOperation(
+            "unsupported_schema_form",
+            f"Schema format '{name}' requires the {expected} type.",
+            format_pointer,
+        )
 
 
 def _types(value: Any, version: str, pointer: str) -> tuple[str, ...]:
@@ -2967,6 +3042,8 @@ def _matches(schema: dict[str, Any], value: Any, version: str, direction: str, d
         return False
     if "enum" in schema and not any(_equal(value, item) for item in schema["enum"]):
         return False
+    if "format" in schema and not _format_matches(schema["format"], value):
+        return False
 
     if isinstance(value, str):
         if len(value) < schema.get("minLength", 0) or len(value) > schema.get("maxLength", math.inf):
@@ -3007,6 +3084,74 @@ def _matches(schema: dict[str, Any], value: Any, version: str, direction: str, d
     return True
 
 
+def _format_matches(name: Any, value: Any) -> bool:
+    """Check a non-null value against one supported format; others are annotations."""
+    expected = _FORMAT_TYPES.get(name) if isinstance(name, str) else None
+    if expected is None:
+        return True
+    if expected == "string":
+        if not isinstance(value, str):
+            return False
+        if name == "date":
+            return _valid_date(value)
+        if name == "date-time":
+            return _valid_date_time(value)
+        if name == "uuid":
+            return _UUID_PATTERN.fullmatch(value) is not None
+        return _valid_email(value)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    if name == "double":
+        try:
+            return math.isfinite(float(value))
+        except OverflowError:
+            return False
+    if name == "float" and isinstance(value, float) and not math.isfinite(value):
+        return False
+    low, high = _FORMAT_RANGES[name]
+    return low <= Decimal(value) <= high
+
+
+def _valid_date(value: str) -> bool:
+    match = _DATE_PATTERN.fullmatch(value)
+    if match is None:
+        return False
+    try:
+        date(*(int(part) for part in match.groups()))
+    except ValueError:
+        return False
+    return True
+
+
+def _valid_date_time(value: str) -> bool:
+    match = _DATE_TIME_PATTERN.fullmatch(value)
+    if match is None:
+        return False
+    year, month, day, hour, minute, second = (int(part) for part in match.groups()[:6])
+    try:
+        date(year, month, day)
+    except ValueError:
+        return False
+    if hour > 23 or minute > 59 or second > 59:
+        return False
+    offset_hour, offset_minute = match.groups()[6:]
+    return offset_hour is None or (int(offset_hour) <= 23 and int(offset_minute) <= 59)
+
+
+def _valid_email(value: str) -> bool:
+    local, separator, domain = value.partition("@")
+    if not separator or "@" in domain:
+        return False
+    if _EMAIL_LOCAL_PATTERN.fullmatch(local) is None:
+        return False
+    if local.startswith(".") or local.endswith(".") or ".." in local:
+        return False
+    labels = domain.split(".")
+    return len(labels) >= 2 and all(
+        _EMAIL_LABEL_PATTERN.fullmatch(label) is not None for label in labels
+    )
+
+
 def _fallback_values(schema: dict[str, Any], version: str, pointer: str, direction: str) -> tuple[Any, ...]:
     types = _types(schema["type"], version, _child(pointer, "type")) if "type" in schema else ()
     kind = next((item for item in types if item != "null"), None)
@@ -3019,6 +3164,8 @@ def _fallback_values(schema: dict[str, Any], version: str, pointer: str, directi
             kind = "string"
         elif any(k in schema for k in ("minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf")):
             kind = "number"
+    if kind == "string" and schema.get("format") in _FORMAT_FALLBACKS:
+        return _FORMAT_FALLBACKS[schema["format"]]
     if kind == "string":
         minimum, maximum = schema.get("minLength", 0), schema.get("maxLength", 8)
         if not _bounded_int(minimum) or not _bounded_int(maximum) or minimum > maximum or minimum > _MAX_COLLECTION_SIZE:

@@ -1450,7 +1450,7 @@ def test_unsupported_request_body_schema_emits_diagnostic_without_cases() -> Non
                             "type": "object",
                             "required": ["name"],
                             "properties": {
-                                "name": {"type": "string", "format": "email"}
+                                "name": {"type": "string", "format": "hostname"}
                             },
                         }
                     )
@@ -6723,3 +6723,551 @@ def test_normalized_documents_resolve_security_scheme_aliases(version: str) -> N
             f"{SECURITY_BASE}missing",
         )
     ]
+
+
+# --- Step 8.1: supported schema formats ---
+
+FORMAT_FALLBACKS = {
+    "int32": ("integer", 0),
+    "int64": ("integer", 0),
+    "float": ("number", 0),
+    "double": ("number", 0),
+    "date": ("string", "2000-01-01"),
+    "date-time": ("string", "2000-01-01T00:00:00Z"),
+    "uuid": ("string", "00000000-0000-4000-8000-000000000000"),
+    "email": ("string", "user@example.com"),
+}
+
+
+FORMAT_SKIP_CODES = {
+    "enum_const_candidate_unavailable",
+    "string_boundary_no_safe_candidate",
+    "numeric_boundary_no_safe_candidate",
+}
+
+
+def format_endpoint(schema: dict[str, object], path: str = "/formatted") -> Endpoint:
+    return make_endpoint(
+        path,
+        "post",
+        responses={"400": Response(description="Invalid request")},
+        request_body=RequestBody(
+            required=True,
+            content={
+                "application/json": MediaType(
+                    schema=Schema(
+                        raw={
+                            "type": "object",
+                            "required": ["v"],
+                            "properties": {"v": schema},
+                        }
+                    )
+                )
+            },
+        ),
+    )
+
+
+def format_suite(schema: dict[str, object], version: str = "3.1.1") -> GeneratedTestSuite:
+    return generate_test_suite(make_result(format_endpoint(schema), version=version))
+
+
+def format_value(schema: dict[str, object], version: str = "3.1.1") -> object:
+    suite = format_suite(schema, version)
+    # Negative steps may legitimately skip a case they cannot build for a formatted value.
+    assert {item.code for item in suite.diagnostics} <= FORMAT_SKIP_CODES, suite.diagnostics
+    return suite.cases[0].request_body.value["v"]
+
+
+def format_codes(suite: GeneratedTestSuite) -> list[tuple[str, str | None]]:
+    return [(item.code, item.source_pointer) for item in suite.diagnostics]
+
+
+@pytest.mark.parametrize("version", ["3.0.3", "3.1.1"])
+@pytest.mark.parametrize("name", sorted(FORMAT_FALLBACKS))
+def test_each_supported_format_generates_its_fixed_fallback(name: str, version: str) -> None:
+    schema_type, expected = FORMAT_FALLBACKS[name]
+
+    value = format_value({"type": schema_type, "format": name}, version)
+
+    assert value == expected
+    assert type(value) is type(expected)
+    assert format_value({"type": schema_type, "format": name}, version) == value
+
+
+def test_date_time_uses_the_second_fixed_fallback_when_the_first_is_too_short() -> None:
+    value = format_value({"type": "string", "format": "date-time", "minLength": 21})
+
+    assert value == "2000-01-01T00:00:00.000Z"
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [
+        {"type": "string", "format": "uuid", "maxLength": 10},
+        {"type": "string", "format": "date", "minLength": 11},
+        {"type": "string", "format": "date-time", "minLength": 25},
+        {"type": "string", "format": "email", "maxLength": 5},
+    ],
+)
+def test_length_bounds_that_no_fixed_candidate_satisfies_report_no_positive_value(
+    schema: dict[str, object],
+) -> None:
+    suite = format_suite(schema)
+
+    assert suite.cases == ()
+    assert [item.code for item in suite.diagnostics] == ["no_positive_schema_value"]
+
+
+@pytest.mark.parametrize(
+    ("schema", "expected"),
+    [
+        ({"type": "string", "format": "date", "enum": ["not-a-date", "2024-02-29"]}, "2024-02-29"),
+        ({"type": "string", "format": "uuid", "const": "ABCDEF01-2345-6789-abcd-ef0123456789"},
+         "ABCDEF01-2345-6789-abcd-ef0123456789"),
+        ({"type": "integer", "format": "int32", "enum": [2**31, 7]}, 7),
+        ({"type": "string", "format": "email", "example": "bad", "default": "a@b.co"}, "a@b.co"),
+        ({"type": "string", "format": "email", "example": "bad@x", "examples": ["ok@example.org"]},
+         "ok@example.org"),
+        ({"type": "string", "format": "date", "default": "2001-02-29"}, "2000-01-01"),
+        ({"type": "integer", "format": "int64", "example": 2**63}, 0),
+    ],
+)
+def test_candidate_order_is_kept_and_invalid_candidates_are_rejected(
+    schema: dict[str, object], expected: object
+) -> None:
+    assert format_value(schema) == expected
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [
+        {"type": "string", "format": "date", "enum": ["2001-02-29", "x"]},
+        {"type": "string", "format": "uuid", "const": "{00000000-0000-4000-8000-000000000000}"},
+        {"type": "integer", "format": "int32", "const": 2147483648},
+    ],
+)
+def test_all_invalid_enum_or_const_values_report_no_positive_value(
+    schema: dict[str, object],
+) -> None:
+    suite = format_suite(schema)
+
+    assert suite.cases == ()
+    assert [item.code for item in suite.diagnostics] == ["no_positive_schema_value"]
+
+
+@pytest.mark.parametrize(
+    ("name", "valid", "invalid"),
+    [
+        (
+            "date",
+            ["2000-01-01", "2024-02-29", "9999-12-31", "0001-01-01"],
+            ["2023-02-29", "1900-02-29", "2000-13-01", "2000-00-10", "2000-01-00", "2000-04-31",
+             "0000-01-01", "2000-1-01", "2000-01-01 ", "2000-01-01\n", "20000101",
+             "٢٠٠٠-٠١-٠١", "2000-01-01T00:00:00Z", ""],
+        ),
+        (
+            "date-time",
+            ["2000-01-01T00:00:00Z", "2000-01-01t00:00:00z", "2000-01-01T23:59:59+05:30",
+             "2000-01-01T00:00:00.1-23:59", "2000-02-29T12:00:00.123456789Z", "2000-01-01T00:00:00+00:00"],
+            ["2000-01-01T00:00:00", "2000-01-01", "2000-01-01 00:00:00Z", "2000-01-01T24:00:00Z",
+             "2000-01-01T00:60:00Z", "2000-01-01T23:59:60Z", "2000-01-01T00:00:00+24:00",
+             "2000-01-01T00:00:00+05:60", "2000-01-01T00:00:00+0530", "2000-02-30T00:00:00Z",
+             "0000-01-01T00:00:00Z", "2000-01-01T00:00:00.Z", "2000-01-01T00:00Z",
+             "2000-01-01T00:00:00Z\n"],
+        ),
+        (
+            "uuid",
+            ["00000000-0000-4000-8000-000000000000", "ABCDEF01-2345-6789-ABCD-EF0123456789",
+             "abcdef01-2345-6789-abcd-ef0123456789", "123e4567-E89b-12D3-a456-426614174000"],
+            ["{00000000-0000-4000-8000-000000000000}", "urn:uuid:00000000-0000-4000-8000-000000000000",
+             "00000000000040008000000000000000", "00000000-0000-4000-8000-00000000000",
+             "0000000g-0000-4000-8000-000000000000", "00000000-0000-4000-8000-000000000000\n", ""],
+        ),
+        (
+            "email",
+            ["user@example.com", "first.last+tag@sub.example.co", "a_b%c-d@x-y.io", "A@B.CD",
+             "user@127.0.0.1", "user@example.123"],
+            ["user", "user@", "@example.com", "a@b@c.com", "user@example", "user@example.com.",
+             ".user@example.com", "user.@example.com", "us..er@example.com", "us er@example.com",
+             "user@-example.com", "user@example-.com", "user@exa mple.com", "user@[127.0.0.1]",
+             "üser@example.com", "user@exämple.com", "user@example..com",
+             "user@example.com\n", ""],
+        ),
+    ],
+)
+def test_string_format_profiles_accept_and_reject_documented_values(
+    name: str, valid: list[str], invalid: list[str]
+) -> None:
+    for text in valid:
+        assert format_value({"type": "string", "format": name, "const": text}) == text, text
+    for text in invalid:
+        suite = format_suite({"type": "string", "format": name, "const": text})
+        assert suite.cases == (), text
+        assert [item.code for item in suite.diagnostics] == ["no_positive_schema_value"], text
+
+
+@pytest.mark.parametrize(
+    ("name", "valid", "invalid"),
+    [
+        ("int32", [-(2**31), 2**31 - 1, 0], [-(2**31) - 1, 2**31]),
+        ("int64", [-(2**63), 2**63 - 1, 0], [-(2**63) - 1, 2**63]),
+    ],
+)
+def test_integer_format_ranges_are_inclusive(
+    name: str, valid: list[int], invalid: list[int]
+) -> None:
+    for number in valid:
+        assert format_value({"type": "integer", "format": name, "const": number}) == number
+    for number in invalid:
+        suite = format_suite({"type": "integer", "format": name, "const": number})
+        assert suite.cases == ()
+        assert [item.code for item in suite.diagnostics] == ["no_positive_schema_value"]
+
+
+def test_float_format_limits_magnitude_and_double_does_not() -> None:
+    limit = 3.4028234663852886e38
+
+    assert format_value({"type": "number", "format": "float", "const": limit}) == limit
+    assert format_value({"type": "number", "format": "float", "const": -limit}) == -limit
+    assert format_value({"type": "number", "format": "float", "const": 1}) == 1
+    for too_large in (3.4028236692093846e38, -3.4028236692093846e38, 1e39):
+        suite = format_suite({"type": "number", "format": "float", "const": too_large})
+        assert [item.code for item in suite.diagnostics] == ["no_positive_schema_value"]
+    assert format_value({"type": "number", "format": "double", "const": 1e300}) == 1e300
+    assert format_value({"type": "number", "format": "double", "const": 0.1}) == 0.1
+
+
+def test_boolean_never_satisfies_a_numeric_format() -> None:
+    for schema in (
+        {"type": "integer", "format": "int32", "const": True},
+        {"type": "number", "format": "double", "const": False},
+    ):
+        suite = format_suite(schema)
+        assert [item.code for item in suite.diagnostics] == ["no_positive_schema_value"]
+
+
+@pytest.mark.parametrize(
+    ("schema", "expected"),
+    [
+        ({"type": "integer", "format": "int32", "minimum": 2147483647}, 2147483647),
+        ({"type": "integer", "format": "int32", "maximum": -2147483648}, -2147483648),
+        ({"type": "integer", "format": "int64", "minimum": 2**62}, 2**62),
+        ({"type": "integer", "format": "int32", "multipleOf": 5, "minimum": 12}, 15),
+        ({"type": "integer", "format": "int32", "minimum": 1, "maximum": 10, "multipleOf": 7}, 7),
+    ],
+)
+def test_format_ranges_combine_with_explicit_numeric_constraints(
+    schema: dict[str, object], expected: int
+) -> None:
+    assert format_value(schema) == expected
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [
+        {"type": "integer", "format": "int32", "minimum": 2147483648},
+        {"type": "integer", "format": "int32", "maximum": -2147483649},
+        {"type": "integer", "format": "int64", "minimum": 2**63},
+        {"type": "integer", "format": "int32", "minimum": 2147483647, "exclusiveMinimum": 2147483647},
+    ],
+)
+def test_contradictory_format_and_numeric_constraints_report_no_positive_value(
+    schema: dict[str, object],
+) -> None:
+    suite = format_suite(schema)
+
+    assert suite.cases == ()
+    assert [item.code for item in suite.diagnostics] == ["no_positive_schema_value"]
+
+
+def test_openapi_30_exclusive_bound_at_the_format_edge() -> None:
+    schema = {"type": "integer", "format": "int32", "maximum": 2147483647, "exclusiveMaximum": True}
+
+    assert format_value(schema, "3.0.3") == 0
+    suite = format_suite({**schema, "minimum": 2147483647, "exclusiveMinimum": True}, "3.0.3")
+    assert [item.code for item in suite.diagnostics] == ["no_positive_schema_value"]
+
+
+def numeric_negatives(suite: GeneratedTestSuite) -> dict[str, object]:
+    return {
+        case.violated_constraint: case.request_body.value["v"]
+        for case in suite.cases
+        if case.category == "negative"
+        and case.affected_property == "/v"
+        and case.violated_constraint in {
+            "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"
+        }
+    }
+
+
+def boundary_skips(suite: GeneratedTestSuite) -> list[str | None]:
+    return [
+        item.source_pointer
+        for item in suite.diagnostics
+        if item.code == "numeric_boundary_no_safe_candidate"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("name", "limit"), [("int32", 2**31 - 1), ("int64", 2**63 - 1)]
+)
+def test_maximum_at_the_integer_format_limit_has_no_boundary_case(name: str, limit: int) -> None:
+    suite = format_suite({"type": "integer", "format": name, "maximum": limit})
+
+    assert numeric_negatives(suite) == {}
+    assert boundary_skips(suite) == ["/paths/~1formatted/post/requestBody/content/application~1json/schema/properties/v/maximum"]
+
+
+@pytest.mark.parametrize(
+    ("name", "limit"), [("int32", -(2**31)), ("int64", -(2**63))]
+)
+def test_minimum_at_the_integer_format_limit_has_no_boundary_case(name: str, limit: int) -> None:
+    suite = format_suite({"type": "integer", "format": name, "minimum": limit})
+
+    assert numeric_negatives(suite) == {}
+    assert len(boundary_skips(suite)) == 1
+
+
+def test_integer_boundary_cases_next_to_the_format_limits_stay_in_range() -> None:
+    suite = format_suite(
+        {"type": "integer", "format": "int32", "minimum": -2147483647, "maximum": 2147483646}
+    )
+
+    assert numeric_negatives(suite) == {"minimum": -2147483648, "maximum": 2147483647}
+    assert boundary_skips(suite) == []
+
+
+def test_maximum_above_the_format_limit_cannot_be_violated_in_range() -> None:
+    suite = format_suite({"type": "integer", "format": "int32", "maximum": 5000000000})
+
+    assert numeric_negatives(suite) == {}
+    assert len(boundary_skips(suite)) == 1
+
+
+def test_integer_boundary_with_multiple_of_and_format_stays_valid() -> None:
+    suite = format_suite(
+        {"type": "integer", "format": "int32", "minimum": 10, "multipleOf": 5}
+    )
+
+    assert numeric_negatives(suite) == {"minimum": 5}
+
+
+def test_exclusive_bound_cases_stay_inside_the_integer_format_range() -> None:
+    # Violating "< 2147483647" with 2147483647 itself is a valid int32 value.
+    v30 = format_suite(
+        {"type": "integer", "format": "int32", "maximum": 2147483647, "exclusiveMaximum": True},
+        "3.0.3",
+    )
+    v31 = format_suite({"type": "integer", "format": "int32", "exclusiveMaximum": 2147483647})
+    # Violating "< 2147483648" needs a value outside int32, so no case exists.
+    beyond = format_suite({"type": "integer", "format": "int32", "exclusiveMaximum": 2147483648})
+    below = format_suite({"type": "integer", "format": "int32", "exclusiveMinimum": -2147483649})
+
+    assert numeric_negatives(v30) == {"exclusiveMaximum": 2147483647}
+    assert numeric_negatives(v31) == {"exclusiveMaximum": 2147483647}
+    assert numeric_negatives(beyond) == {}
+    assert numeric_negatives(below) == {}
+    assert len(boundary_skips(beyond)) == 1 and len(boundary_skips(below)) == 1
+
+
+def test_float_boundary_candidates_respect_the_magnitude_limit() -> None:
+    at_limit = format_suite({"type": "number", "format": "float", "maximum": 3.4028234663852886e38})
+    inside = format_suite({"type": "number", "format": "float", "minimum": 0, "maximum": 10})
+
+    assert numeric_negatives(at_limit) == {}
+    assert len(boundary_skips(at_limit)) == 1
+    values = numeric_negatives(inside)
+    assert set(values) == {"minimum", "maximum"}
+    assert values["minimum"] < 0 and values["maximum"] > 10
+
+
+def test_double_boundary_cases_behave_like_plain_numbers() -> None:
+    formatted = format_suite({"type": "number", "format": "double", "minimum": 0, "maximum": 10})
+    plain = format_suite({"type": "number", "minimum": 0, "maximum": 10})
+
+    assert numeric_negatives(formatted) == numeric_negatives(plain)
+
+
+def test_boundary_enum_candidates_outside_the_format_range_are_skipped() -> None:
+    suite = format_suite(
+        {"type": "integer", "format": "int32", "enum": [2147483647, 2147483648], "maximum": 2147483647}
+    )
+
+    assert numeric_negatives(suite) == {}
+
+
+def test_formatted_string_boundary_and_enum_violation_cases_are_skipped_not_invalid() -> None:
+    bounded = format_suite({"type": "string", "format": "uuid", "minLength": 36, "maxLength": 36})
+    enum = format_suite({"type": "string", "format": "date", "enum": ["2000-01-01"]})
+
+    for suite in (bounded, enum):
+        assert suite.cases[0].category == "positive"
+        assert {item.code for item in suite.diagnostics} <= FORMAT_SKIP_CODES
+        assert len(suite.diagnostics) >= 1
+        assert not {case.violated_constraint for case in suite.cases} & {"minLength", "maxLength", "enum"}
+        for case in suite.cases[1:]:
+            assert case.violated_constraint in {"required_request_body", "required_property", "type"}
+
+
+@pytest.mark.parametrize(
+    ("schema", "code"),
+    [
+        ({"type": "string", "format": "int32"}, "unsupported_schema_form"),
+        ({"type": "integer", "format": "uuid"}, "unsupported_schema_form"),
+        ({"type": "number", "format": "date"}, "unsupported_schema_form"),
+        ({"type": "integer", "format": "float"}, "unsupported_schema_form"),
+        ({"type": "number", "format": "int64"}, "unsupported_schema_form"),
+        ({"type": "boolean", "format": "email"}, "unsupported_schema_form"),
+        ({"format": "uuid"}, "unsupported_schema_form"),
+        ({"type": "null", "format": "uuid"}, "unsupported_schema_form"),
+        ({"type": "string", "format": 5}, "unsupported_schema_form"),
+        ({"type": "string", "format": None}, "unsupported_schema_form"),
+        ({"type": "string", "format": "hostname"}, "unsupported_schema_keyword"),
+        ({"type": "string", "format": "Email"}, "unsupported_schema_keyword"),
+        ({"type": "string", "format": "binary"}, "unsupported_schema_keyword"),
+        ({"type": "integer", "format": "custom"}, "unsupported_schema_keyword"),
+    ],
+)
+def test_incompatible_or_unknown_formats_are_reported_at_the_format_pointer(
+    schema: dict[str, object], code: str
+) -> None:
+    suite = format_suite(schema)
+
+    assert suite.cases == ()
+    assert format_codes(suite) == [
+        (code, "/paths/~1formatted/post/requestBody/content/application~1json/schema/properties/v/format")
+    ]
+
+
+def test_openapi_31_type_arrays_apply_the_format_to_the_non_null_type() -> None:
+    schema = {"type": ["string", "null"], "format": "uuid"}
+
+    suite = format_suite(schema)
+    null_const = format_suite({**schema, "const": None})
+    bad = format_suite({**schema, "const": "nope"})
+
+    assert suite.cases[0].request_body.value["v"] == "00000000-0000-4000-8000-000000000000"
+    assert null_const.cases[0].request_body.value["v"] is None
+    assert [item.code for item in bad.diagnostics] == ["no_positive_schema_value"]
+    assert format_suite({"type": ["null"], "format": "uuid"}).cases == ()
+
+
+def test_openapi_30_nullable_formatted_values_still_accept_null() -> None:
+    schema = {"type": "string", "format": "date", "nullable": True}
+
+    assert format_value({**schema, "const": None}, "3.0.3") is None
+    assert format_value(schema, "3.0.3") == "2000-01-01"
+
+
+def test_format_works_for_primitive_parameters() -> None:
+    endpoint = make_endpoint(
+        "/items/{id}",
+        parameters=(
+            Parameter(name="id", location="path", required=True,
+                      schema=Schema(raw={"type": "string", "format": "uuid"}), source_scope="operation"),
+            Parameter(name="since", location="query", required=True,
+                      schema=Schema(raw={"type": "string", "format": "date-time"}), source_scope="operation"),
+            Parameter(name="limit", location="header", required=True,
+                      schema=Schema(raw={"type": "integer", "format": "int32", "minimum": 5}),
+                      source_scope="operation"),
+        ),
+    )
+
+    suite = generate_test_suite(make_result(endpoint))
+
+    values = {item.name: item.value for item in suite.cases[0].parameters}
+    assert values == {
+        "id": "00000000-0000-4000-8000-000000000000",
+        "since": "2000-01-01T00:00:00Z",
+        "limit": 5,
+    }
+    assert suite.diagnostics == ()
+
+
+def test_unknown_parameter_format_is_unsupported() -> None:
+    endpoint = make_endpoint(
+        "/items",
+        parameters=(
+            Parameter(name="q", location="query", required=True,
+                      schema=Schema(raw={"type": "string", "format": "hostname"}), source_scope="operation"),
+        ),
+    )
+
+    suite = generate_test_suite(make_result(endpoint))
+
+    assert suite.cases == ()
+    assert [item.code for item in suite.diagnostics] == ["unsupported_schema_keyword"]
+
+
+def test_formatted_array_items_and_nested_objects_generate_valid_values() -> None:
+    schema = {
+        "type": "object",
+        "required": ["ids", "inner"],
+        "properties": {
+            "ids": {"type": "array", "minItems": 2, "items": {"type": "string", "format": "uuid"}},
+            "inner": {"type": "object", "required": ["day"],
+                      "properties": {"day": {"type": "string", "format": "date"}}},
+        },
+    }
+    endpoint = make_endpoint(
+        "/nested",
+        "post",
+        request_body=RequestBody(required=True, content={"application/json": MediaType(schema=Schema(raw=schema))}),
+    )
+
+    positive = generate_test_suite(make_result(endpoint)).cases[0].request_body.value
+
+    assert positive == {
+        "ids": ["00000000-0000-4000-8000-000000000000"] * 2,
+        "inner": {"day": "2000-01-01"},
+    }
+
+
+def test_format_beside_a_reference_stays_unsupported() -> None:
+    schemas = {"Id": Schema(raw={"type": "string", "format": "uuid"})}
+    endpoint = format_endpoint({"$ref": "#/components/schemas/Id", "format": "uuid"})
+    result = make_result(endpoint, components=Components(schemas=schemas))
+
+    suite = generate_test_suite(result)
+
+    assert suite.cases == ()
+    assert [item.code for item in suite.diagnostics] == ["unsupported_schema_reference_siblings"]
+    assert suite.diagnostics[0].source_pointer.endswith("/properties/v/format")
+
+
+def test_formatted_referenced_schema_is_supported() -> None:
+    schemas = {"Id": Schema(raw={"type": "string", "format": "uuid"})}
+    endpoint = format_endpoint({"$ref": "#/components/schemas/Id"})
+
+    suite = generate_test_suite(make_result(endpoint, components=Components(schemas=schemas)))
+
+    assert suite.cases[0].request_body.value["v"] == "00000000-0000-4000-8000-000000000000"
+
+
+def test_response_schema_formats_are_preserved_without_validation() -> None:
+    response_schema = Schema(raw={"type": "string", "format": "hostname"})
+    endpoint = make_endpoint(
+        "/r",
+        responses={"200": Response(description="OK", content={"application/json": MediaType(schema=response_schema)})},
+    )
+
+    suite = generate_test_suite(make_result(endpoint))
+
+    assert suite.diagnostics == ()
+    assert suite.cases[0].response_expectations[0].schemas_by_media_type == {
+        "application/json": response_schema
+    }
+
+
+def test_format_generation_is_deterministic_and_does_not_mutate_input() -> None:
+    schema = {"type": "integer", "format": "int32", "minimum": 1, "maximum": 9}
+    endpoint = format_endpoint(schema)
+    result = make_result(endpoint)
+    before = result.model_dump_json()
+
+    first = generate_test_suite(result)
+    second = generate_test_suite(result)
+
+    assert first.model_dump_json() == second.model_dump_json()
+    assert result.model_dump_json() == before
