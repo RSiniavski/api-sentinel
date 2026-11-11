@@ -1417,11 +1417,56 @@ def _array_bound_negative_cases(
             else:
                 targets.append((path, constraint, candidate, pointer))
 
+    def target_array(
+        child_schema: dict[str, Any], child_pointer: str, child_path: tuple[str, ...]
+    ) -> None:
+        """Validate the array keywords of one schema and collect its candidates."""
+        constraints = tuple(
+            key for key in ("minItems", "maxItems") if key in child_schema
+        )
+        if child_schema.get("uniqueItems") is True:
+            constraints = (*constraints, "uniqueItems")
+        if constraints:
+            try:
+                # Bounds and type are validated here. The items schema is
+                # validated only when a candidate actually needs an item.
+                _check_schema(
+                    {k: v for k, v in child_schema.items() if k != "items"},
+                    version,
+                    child_pointer,
+                    "request",
+                    0,
+                )
+                allowed_types = (
+                    _types(child_schema["type"], version, _child(child_pointer, "type"))
+                    if "type" in child_schema
+                    else None
+                )
+            except _UnsupportedOperation as issue:
+                report_issue(issue)
+            else:
+                if allowed_types is not None and "array" not in allowed_types:
+                    for constraint in constraints:
+                        report(
+                            "array_bound_non_array_type",
+                            (
+                                "uniqueItems does not apply to this property's declared type."
+                                if constraint == "uniqueItems"
+                                else "Array-size constraints do not apply to this property's declared type."
+                            ),
+                            _child(child_pointer, constraint),
+                        )
+                else:
+                    array_candidates(child_schema, child_pointer, child_path, constraints)
+
     def visit(schema: Any, value: Any, path: tuple[str, ...], pointer: str) -> None:
         followed = _follow_property_schema(schema, pointer, report_issue)
         if followed is None:
             return
         schema, pointer = followed
+        if not path and isinstance(schema, dict):
+            # A root-level array body; nested arrays are not traversed.
+            target_array(schema, pointer, path)
         if not isinstance(schema, dict) or not isinstance(value, dict):
             return
         properties = schema.get("properties")
@@ -1441,43 +1486,7 @@ def _array_bound_negative_cases(
             if not isinstance(child_schema, dict):
                 continue
 
-            constraints = tuple(
-                key for key in ("minItems", "maxItems") if key in child_schema
-            )
-            if child_schema.get("uniqueItems") is True:
-                constraints = (*constraints, "uniqueItems")
-            if constraints:
-                try:
-                    # Bounds and type are validated here. The items schema is
-                    # validated only when a candidate actually needs an item.
-                    _check_schema(
-                        {k: v for k, v in child_schema.items() if k != "items"},
-                        version,
-                        child_pointer,
-                        "request",
-                        0,
-                    )
-                    allowed_types = (
-                        _types(child_schema["type"], version, _child(child_pointer, "type"))
-                        if "type" in child_schema
-                        else None
-                    )
-                except _UnsupportedOperation as issue:
-                    report_issue(issue)
-                else:
-                    if allowed_types is not None and "array" not in allowed_types:
-                        for constraint in constraints:
-                            report(
-                                "array_bound_non_array_type",
-                                (
-                                    "uniqueItems does not apply to this property's declared type."
-                                    if constraint == "uniqueItems"
-                                    else "Array-size constraints do not apply to this property's declared type."
-                                ),
-                                _child(child_pointer, constraint),
-                            )
-                    else:
-                        array_candidates(child_schema, child_pointer, child_path, constraints)
+            target_array(child_schema, child_pointer, child_path)
 
             visit(child_schema, value[name], child_path, child_pointer)
 
@@ -1485,13 +1494,18 @@ def _array_bound_negative_cases(
 
     cases: list[GeneratedTestCase] = []
     for path, constraint, candidate, schema_pointer in targets:
-        generated_value = deepcopy(positive.request_body.value)
-        parent = generated_value
-        for name in path[:-1]:
-            parent = parent[name]
-        parent[path[-1]] = candidate
+        if path:
+            generated_value = deepcopy(positive.request_body.value)
+            parent = generated_value
+            for name in path[:-1]:
+                parent = parent[name]
+            parent[path[-1]] = candidate
+        else:
+            # A root-level array replaces the whole body.
+            generated_value = candidate
 
-        property_pointer = _json_pointer(path)
+        # The empty JSON Pointer addresses the body root itself.
+        property_pointer = _json_pointer(path) if path else ""
         constraint_pointer = _child(schema_pointer, constraint)
         cases.append(
             _counted_case(

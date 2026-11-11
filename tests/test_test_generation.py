@@ -7876,3 +7876,349 @@ def test_a_null_only_item_schema_admits_no_other_value() -> None:
         assert not generator_module._matches({"type": "null"}, value, "3.1.1", "request", 0)
     assert generator_module._matches({"type": ["null"]}, None, "3.1.1", "request", 0)
     assert not generator_module._matches({"type": ["null"]}, 0, "3.1.1", "request", 0)
+
+
+# --- Step 8.4: root-level array request bodies ---
+
+ROOT_PATH = "/paths/~1items/post/requestBody/content/application~1json/schema"
+
+
+def root_suite(
+    root: dict[str, object],
+    *,
+    version: str = "3.1.1",
+    schemas: dict[str, dict[str, object]] | None = None,
+) -> GeneratedTestSuite:
+    endpoint = post_endpoint(root)
+    components = (
+        Components(schemas={name: Schema(raw=raw) for name, raw in schemas.items()})
+        if schemas
+        else None
+    )
+    return generate_test_suite(make_result(endpoint, version=version, components=components))
+
+
+def root_array_cases(suite: GeneratedTestSuite) -> dict[str, GeneratedTestCase]:
+    cases = {case.violated_constraint: case for case in array_cases(suite)}
+    assert len(cases) == len(array_cases(suite))
+    return cases  # type: ignore[return-value]
+
+
+def body_value(case: GeneratedTestCase) -> object:
+    assert case.request_body is not None
+    return case.request_body.value
+
+
+def assert_violates_only(
+    case: GeneratedTestCase, schema: dict[str, object], version: str = "3.1.1"
+) -> None:
+    """The case violates its targeted constraint and is valid without it."""
+    constraint = case.violated_constraint
+    assert constraint in ARRAY_CONSTRAINTS
+    assert not generator_module._matches(schema, body_value(case), version, "request", 0)
+    relaxed = {key: value for key, value in schema.items() if key != constraint}
+    assert generator_module._matches(relaxed, body_value(case), version, "request", 0)
+
+
+@pytest.mark.parametrize("version", ["3.0.3", "3.1.1"])
+def test_root_array_min_items_case(version: str) -> None:
+    schema = {"type": "array", "minItems": 2, "items": ITEM_SCHEMA}
+
+    suite = root_suite(schema, version=version)
+
+    cases = root_array_cases(suite)
+    assert set(cases) == {"minItems"}
+    assert body_value(suite.cases[0]) == ["x", "x"]
+    assert body_value(cases["minItems"]) == ["x"]
+    assert cases["minItems"].category == "negative"
+    assert_violates_only(cases["minItems"], schema, version)
+    assert suite.diagnostics == ()
+
+
+@pytest.mark.parametrize("version", ["3.0.3", "3.1.1"])
+def test_root_array_max_items_case(version: str) -> None:
+    schema = {"type": "array", "maxItems": 2, "items": ITEM_SCHEMA}
+
+    suite = root_suite(schema, version=version)
+
+    cases = root_array_cases(suite)
+    assert set(cases) == {"maxItems"}
+    assert body_value(cases["maxItems"]) == ["x", "x", "x"]
+    assert_violates_only(cases["maxItems"], schema, version)
+
+
+def test_root_array_bounds_at_zero_and_one() -> None:
+    zero = root_suite({"type": "array", "maxItems": 0, "items": ITEM_SCHEMA})
+    one = root_suite({"type": "array", "minItems": 1, "maxItems": 1, "items": ITEM_SCHEMA})
+
+    assert body_value(root_array_cases(zero)["maxItems"]) == ["x"]
+    assert body_value(root_array_cases(one)["minItems"]) == []
+    assert body_value(root_array_cases(one)["maxItems"]) == ["x", "x"]
+
+
+@pytest.mark.parametrize("version", ["3.0.3", "3.1.1"])
+def test_root_array_unique_items_case(version: str) -> None:
+    schema = {"type": "array", "uniqueItems": True, "items": {"type": "integer"}}
+
+    suite = root_suite(schema, version=version)
+
+    cases = root_array_cases(suite)
+    assert set(cases) == {"uniqueItems"}
+    assert body_value(cases["uniqueItems"]) == [0, 0]
+    assert_violates_only(cases["uniqueItems"], schema, version)
+
+
+def test_root_array_unique_items_with_min_items_three_uses_three_duplicates() -> None:
+    suite = root_suite({"type": "array", "minItems": 3, "uniqueItems": True, "items": {"type": "integer"}})
+
+    assert body_value(suite.cases[0]) == [0, 1, -1]
+    assert body_value(root_array_cases(suite)["uniqueItems"]) == [0, 0, 0]
+
+
+def test_root_array_combining_all_constraints() -> None:
+    schema = {"type": "array", "minItems": 2, "maxItems": 3, "uniqueItems": True, "items": {"type": "integer"}}
+
+    suite = root_suite(schema)
+
+    cases = root_array_cases(suite)
+    assert list(cases) == ["minItems", "uniqueItems"]
+    assert body_value(suite.cases[0]) == [0, 1]
+    assert body_value(cases["minItems"]) == [0]
+    assert body_value(cases["uniqueItems"]) == [0, 0]
+    for case in cases.values():
+        assert_violates_only(case, schema)
+    # maxItems needs four unique items, so it keeps the existing skip.
+    assert [(item.code, item.source_pointer) for item in suite.diagnostics] == [
+        ("array_bound_no_safe_candidate", f"{ROOT_PATH}/maxItems")
+    ]
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [
+        {"type": "array", "minItems": 2, "maxItems": 4, "items": ITEM_SCHEMA},
+        {"type": "array", "minItems": 1, "items": {"type": "integer", "minimum": 5}},
+        {"type": "array", "maxItems": 1, "uniqueItems": True, "items": {"type": "integer"}},
+        {"type": "array", "minItems": 3, "uniqueItems": True, "items": {"type": "integer"}},
+        {"type": "array", "minItems": 1, "items": {"type": "string", "pattern": "^a$"}},
+        {"type": "array", "maxItems": 100, "items": ITEM_SCHEMA},
+        {"type": "array", "maxItems": 2, "items": {"type": "string", "enum": ["a", "b"]}},
+    ],
+)
+def test_root_array_matches_the_same_array_inside_an_object_property(
+    schema: dict[str, object],
+) -> None:
+    root = root_suite(schema)
+    prop = array_suite(schema)
+
+    assert [(case.violated_constraint, body_value(case)) for case in array_cases(root)] == [
+        (case.violated_constraint, body_value(case)["tags"])  # type: ignore[index]
+        for case in array_cases(prop)
+    ]
+    assert [item.code for item in root.diagnostics] == [item.code for item in prop.diagnostics]
+    assert [item.message for item in root.diagnostics] == [item.message for item in prop.diagnostics]
+
+
+def test_root_array_uses_the_empty_json_pointer() -> None:
+    suite = root_suite({"type": "array", "minItems": 2, "maxItems": 3, "items": ITEM_SCHEMA})
+
+    for constraint, case in root_array_cases(suite).items():
+        assert case.affected_property == ""
+        assert case.violated_constraint == constraint
+        assert case.provenance[-2:] == (f"{ROOT_PATH}/{constraint}", f"violated_constraint:{constraint}:")
+        assert f"array-bound::{constraint}:" not in case.provenance
+    assert {case.affected_property for case in suite.cases if case.violated_constraint not in ARRAY_CONSTRAINTS} <= {None}
+
+
+def test_root_array_property_cases_keep_their_slash_pointer() -> None:
+    suite = array_suite({"type": "array", "minItems": 2, "items": ITEM_SCHEMA})
+
+    assert {case.affected_property for case in array_cases(suite)} == {"/tags"}
+
+
+def test_root_array_case_ids_are_unique_stable_and_ordered() -> None:
+    schema = {"type": "array", "minItems": 1, "maxItems": 1, "uniqueItems": True, "items": {"type": "integer"}}
+
+    first = root_suite(schema)
+    second = root_suite(schema)
+
+    ids = [case.case_id for case in first.cases]
+    assert len(ids) == len(set(ids))
+    assert ids == [case.case_id for case in second.cases]
+    assert [case.violated_constraint for case in array_cases(first)] == ["minItems"]
+    assert [item.code for item in first.diagnostics] == ["array_bound_no_safe_candidate"] * 2
+
+
+@pytest.mark.parametrize("version", ["3.0.3", "3.1.1"])
+def test_root_array_through_a_local_reference(version: str) -> None:
+    array = {"type": "array", "minItems": 1, "maxItems": 2, "items": {"$ref": "#/components/schemas/Name"}}
+    schemas = {"Tags": array, "Name": {"type": "string", "minLength": 2}}
+
+    suite = root_suite({"$ref": "#/components/schemas/Tags"}, version=version, schemas=schemas)
+
+    cases = root_array_cases(suite)
+    assert body_value(suite.cases[0]) == ["sentinel"]
+    assert body_value(cases["minItems"]) == []
+    assert body_value(cases["maxItems"]) == ["sentinel"] * 3
+    assert {case.affected_property for case in cases.values()} == {""}
+    assert cases["minItems"].provenance[-2] == "/components/schemas/Tags/minItems"
+    for case in cases.values():
+        assert_violates_only(case, {**array, "items": schemas["Name"]}, version)
+    assert suite.diagnostics == ()
+
+
+def test_root_array_with_unresolvable_reference_is_reported_once() -> None:
+    suite = root_suite({"$ref": "#/components/schemas/Missing"}, schemas={"Other": {"type": "string"}})
+
+    assert suite.cases == ()
+    assert [(item.code, item.source_pointer) for item in suite.diagnostics] == [
+        ("unsupported_schema_reference", ROOT_PATH)
+    ]
+
+
+def test_root_array_unsupported_and_insufficient_candidates_keep_existing_diagnostics() -> None:
+    unsupported = root_suite({"type": "array", "minItems": 2, "maxItems": 3, "items": {"type": "string", "pattern": "^a$"}})
+    no_items = root_suite({"type": "array", "maxItems": 2})
+    limit = root_suite({"type": "array", "maxItems": 100, "items": ITEM_SCHEMA})
+    non_array = root_suite({"type": "string", "minItems": 1})
+    literal = root_suite({"type": "array", "const": [1, 2], "items": {"type": "integer"}, "minItems": 1})
+
+    assert unsupported.cases == ()
+    assert [(item.code, item.source_pointer) for item in unsupported.diagnostics] == [
+        ("unsupported_schema_keyword", f"{ROOT_PATH}/items/pattern")
+    ]
+    assert array_cases(no_items) == []
+    assert [(item.code, item.source_pointer) for item in no_items.diagnostics] == [
+        ("array_bound_no_safe_candidate", f"{ROOT_PATH}/maxItems")
+    ]
+    assert array_cases(limit) == []
+    assert [item.code for item in limit.diagnostics] == ["array_bound_no_safe_candidate"]
+    assert "limit of 100" in limit.diagnostics[0].message
+    assert array_cases(non_array) == []
+    assert [(item.code, item.source_pointer) for item in non_array.diagnostics] == [
+        ("array_bound_non_array_type", f"{ROOT_PATH}/minItems")
+    ]
+    assert array_cases(literal) == []
+    assert "array_bound_no_safe_candidate" in {item.code for item in literal.diagnostics}
+
+
+def test_root_array_items_unsupported_still_allow_the_candidate_without_items() -> None:
+    suite = root_suite(
+        {"type": "array", "minItems": 1, "maxItems": 3, "items": {"type": "string", "pattern": "^a$"}}
+    )
+
+    # The positive baseline needs an item here, so nothing is generated at all.
+    assert suite.cases == ()
+    empty_ok = root_suite({"type": "array", "maxItems": 2, "items": {"type": "string", "pattern": "^a$"}})
+    assert body_value(empty_ok.cases[0]) == []
+    assert [(item.code, item.source_pointer) for item in empty_ok.diagnostics] == [
+        ("array_bound_unsupported_schema", f"{ROOT_PATH}/items/pattern")
+    ]
+
+
+def test_root_array_enum_literal_candidates_and_nested_arrays_are_not_expanded() -> None:
+    literal = root_suite({"type": "array", "maxItems": 1, "enum": [[1], [1, 2]], "items": {"type": "integer"}})
+    nested = root_suite(
+        {"type": "array", "minItems": 1, "items": {"type": "array", "minItems": 2, "maxItems": 3, "items": {"type": "integer"}}}
+    )
+
+    assert body_value(root_array_cases(literal)["maxItems"]) == [1, 2]
+    assert [(case.violated_constraint, body_value(case)) for case in array_cases(nested)] == [("minItems", [])]
+    assert [item.code for item in nested.diagnostics] == []
+
+
+def test_root_array_cases_are_isolated_from_each_other_and_the_input() -> None:
+    enum = [{"a": [1]}, {"a": [2]}, {"a": [3]}]
+    endpoint = post_endpoint(
+        {"type": "array", "minItems": 2, "uniqueItems": True, "items": {"enum": enum}}
+    )
+    result = make_result(endpoint)
+    before = result.model_dump_json()
+
+    suite = generate_test_suite(result)
+
+    cases = root_array_cases(suite)
+    positive = body_value(suite.cases[0])
+    min_items = body_value(cases["minItems"])
+    unique = body_value(cases["uniqueItems"])
+    assert (positive, min_items, unique) == (
+        [{"a": [1]}, {"a": [2]}],
+        [{"a": [1]}],
+        [{"a": [1]}, {"a": [1]}],
+    )
+    arrays = [positive, min_items, unique]
+    assert len({id(array) for array in arrays}) == 3
+    items = [item for array in arrays for item in array]  # type: ignore[union-attr]
+    assert len({id(item) for item in items}) == len(items)
+    positive[0]["a"].append("mutated")  # type: ignore[index]
+    unique[1]["a"].append("changed")  # type: ignore[index]
+    assert min_items == [{"a": [1]}]
+    assert unique[0] == {"a": [1]}  # type: ignore[index]
+    assert result.model_dump_json() == before
+    assert enum == [{"a": [1]}, {"a": [2]}, {"a": [3]}]
+
+
+def test_root_array_generation_is_deterministic_and_does_not_mutate_input() -> None:
+    result = make_result(
+        post_endpoint({"type": "array", "minItems": 2, "maxItems": 3, "uniqueItems": True, "items": ITEM_SCHEMA})
+    )
+    before = result.model_dump_json()
+
+    first = generate_test_suite(result)
+    second = generate_test_suite(result)
+
+    assert first.model_dump_json() == second.model_dump_json()
+    assert result.model_dump_json() == before
+
+
+def test_root_array_case_budget_drops_only_the_array_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    schema = {"type": "array", "minItems": 2, "maxItems": 4, "items": ITEM_SCHEMA}
+    reference = root_suite(schema)
+    before_array = len(reference.cases) - 2
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_CASES", before_array + 1)
+
+    suite = root_suite(schema)
+
+    assert array_cases(suite) == []
+    assert suite.cases == reference.cases[:before_array]
+    assert [item.code for item in suite.diagnostics] == ["generation_case_budget_exceeded"]
+    assert "'array_bounds'" in suite.diagnostics[0].message
+
+
+def test_root_array_expansion_budget_drops_only_the_array_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def build() -> NormalizationResult:
+        return make_result_with_schemas(
+            post_endpoint({"type": "array", "minItems": 2, "items": schema_reference("Item")}),
+            {"Item": ITEM_SCHEMA},
+        )
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(generator_module, "_array_bound_negative_cases", lambda *args: ((), ()))
+        hops_without_array_step = count_expansions(build())
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_EXPANSIONS", hops_without_array_step)
+
+    suite = generate_test_suite(build())
+
+    assert array_cases(suite) == []
+    assert [item.code for item in suite.diagnostics] == ["generation_expansion_budget_exceeded"]
+    assert suite.cases[0].category == "positive"
+
+
+def test_object_root_bodies_and_property_arrays_are_unchanged() -> None:
+    body = {
+        "type": "object",
+        "required": ["tags"],
+        "properties": {"tags": {"type": "array", "minItems": 2, "maxItems": 3, "items": ITEM_SCHEMA}},
+    }
+
+    suite = generate_test_suite(make_result(post_endpoint(body)))
+
+    assert [(case.violated_constraint, case.affected_property) for case in array_cases(suite)] == [
+        ("minItems", "/tags"),
+        ("maxItems", "/tags"),
+    ]
+    assert {case.affected_property for case in suite.cases} >= {"/tags"}
