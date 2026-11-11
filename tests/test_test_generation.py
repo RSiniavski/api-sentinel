@@ -7507,3 +7507,372 @@ def test_empty_array_generation_is_deterministic_and_does_not_mutate_input() -> 
 
     assert first.model_dump_json() == second.model_dump_json()
     assert result.model_dump_json() == before
+
+
+# --- Step 8.2.2: distinct positive items for uniqueItems with minItems > 1 ---
+
+UUID_A = "11111111-1111-4111-8111-111111111111"
+UUID_B = "22222222-2222-4222-8222-222222222222"
+
+
+def unique_suite(
+    items: object,
+    minimum: int = 2,
+    *,
+    version: str = "3.1.1",
+    schemas: dict[str, dict[str, object]] | None = None,
+    **array_options: object,
+) -> GeneratedTestSuite:
+    return empty_array_suite(
+        {"type": "array", "minItems": minimum, "uniqueItems": True, "items": items, **array_options},
+        version=version,
+        schemas=schemas,
+    )
+
+
+def assert_distinct_positive(suite: GeneratedTestSuite, expected: list[object]) -> None:
+    tags = positive_tags(suite)
+    assert tags == expected
+    assert [type(item) for item in tags] == [type(item) for item in expected]  # type: ignore[union-attr]
+    assert not generator_module._has_duplicate_items(tags)  # type: ignore[arg-type]
+    assert "no_positive_schema_value" not in codes(suite)
+
+
+@pytest.mark.parametrize("version", ["3.0.3", "3.1.1"])
+@pytest.mark.parametrize(
+    ("items", "minimum", "expected"),
+    [
+        ({"type": "integer"}, 2, [0, 1]),
+        ({"type": "integer"}, 3, [0, 1, -1]),
+        ({"type": "integer", "format": "int32"}, 2, [0, 1]),
+        ({"type": "integer", "minimum": 5, "maximum": 100}, 3, [5, 6, 100]),
+        ({"type": "integer", "minimum": 0, "maximum": 1}, 2, [0, 1]),
+        ({"type": "integer", "multipleOf": 5}, 3, [0, 5, -5]),
+        ({"type": "number"}, 3, [0, 1, -1]),
+        ({"type": "string"}, 2, ["sentinel", ""]),
+        ({"type": "string", "minLength": 1}, 2, ["sentinel", "x"]),
+        ({"type": "boolean"}, 2, [False, True]),
+        ({"type": "string", "format": "date-time"}, 2,
+         ["2000-01-01T00:00:00Z", "2000-01-01T00:00:00.000Z"]),
+    ],
+)
+def test_unique_arrays_use_distinct_existing_fallback_values(
+    items: dict[str, object], minimum: int, expected: list[object], version: str
+) -> None:
+    assert_distinct_positive(unique_suite(items, minimum, version=version), expected)
+
+
+@pytest.mark.parametrize(
+    ("items", "minimum", "expected"),
+    [
+        ({"type": "string", "enum": ["a", "b", "c"]}, 3, ["a", "b", "c"]),
+        ({"type": "string", "enum": ["a", "b", "c"]}, 2, ["a", "b"]),
+        ({"type": "string", "enum": ["a", "a", "b"]}, 2, ["a", "b"]),
+        ({"type": "integer", "enum": [7, 8, 9, 10]}, 3, [7, 8, 9]),
+        ({"type": "string", "examples": ["x", "y"]}, 2, ["x", "y"]),
+        ({"type": "string", "example": "x", "default": "y"}, 2, ["x", "y"]),
+        ({"type": "string", "example": "x"}, 2, ["x", "sentinel"]),
+        ({"type": "string", "example": "x", "default": "x"}, 2, ["x", "sentinel"]),
+        ({"type": "integer", "default": 7}, 2, [7, 0]),
+        ({"type": "string", "examples": ["x", 5, "y"]}, 2, ["x", "y"]),
+        ({"type": "string", "format": "uuid", "examples": [UUID_A, "nope", UUID_B]}, 2, [UUID_A, UUID_B]),
+    ],
+)
+def test_unique_arrays_follow_the_candidate_order(
+    items: dict[str, object], minimum: int, expected: list[object]
+) -> None:
+    assert_distinct_positive(unique_suite(items, minimum), expected)
+
+
+@pytest.mark.parametrize("version", ["3.0.3", "3.1.1"])
+def test_unique_arrays_with_referenced_items(version: str) -> None:
+    suite = unique_suite(
+        {"$ref": "#/components/schemas/Count"},
+        3,
+        version=version,
+        schemas={"Count": {"type": "integer", "minimum": 5, "maximum": 100}},
+    )
+
+    assert_distinct_positive(suite, [5, 6, 100])
+
+
+def test_unique_arrays_with_nested_reference_chain_and_enum() -> None:
+    suite = unique_suite(
+        {"$ref": "#/components/schemas/Outer"},
+        2,
+        schemas={
+            "Outer": {"$ref": "#/components/schemas/Inner"},
+            "Inner": {"type": "string", "enum": ["p", "q"]},
+        },
+    )
+
+    assert_distinct_positive(suite, ["p", "q"])
+
+
+def test_unique_arrays_may_use_null_only_when_an_existing_candidate_produces_it() -> None:
+    v30 = unique_suite(
+        {"type": "string", "nullable": True, "enum": ["a", None]}, 2, version="3.0.3"
+    )
+    v31 = unique_suite({"type": ["string", "null"], "enum": ["a", None]}, 2)
+    no_candidate = unique_suite({"type": ["string", "null"]}, 3)
+
+    assert_distinct_positive(v30, ["a", None])
+    assert_distinct_positive(v31, ["a", None])
+    assert positive_tags(v31)[1] is None  # type: ignore[index]
+    assert no_candidate.cases == ()
+    assert codes(no_candidate) == ["no_positive_schema_value"]
+
+
+@pytest.mark.parametrize(
+    ("items", "minimum"),
+    [
+        ({"type": "string", "enum": ["a", "b"]}, 3),
+        ({"type": "string", "const": "a"}, 2),
+        ({"type": "integer", "minimum": 0, "maximum": 1}, 3),
+        ({"type": "string", "maxLength": 0}, 2),
+        ({"type": "string", "format": "uuid"}, 2),
+        ({"type": "string", "format": "uuid", "examples": [UUID_A, "not-a-uuid"]}, 3),
+        ({"type": "number", "minimum": 0, "maximum": 1, "multipleOf": 1, "exclusiveMinimum": 0}, 2),
+        ({"type": "boolean", "enum": [True]}, 2),
+        ({"type": "object", "required": ["a"], "properties": {"a": {"type": "integer"}}}, 2),
+        ({"type": "object"}, 2),
+        ({"type": "array", "items": {"type": "integer"}}, 2),
+        ({"type": "array", "minItems": 1, "items": {"type": "integer"}}, 2),
+        ({"type": "null"}, 2),
+        (True, 2),
+        (False, 2),
+    ],
+)
+def test_unique_arrays_with_too_few_distinct_candidates_report_one_diagnostic(
+    items: object, minimum: int
+) -> None:
+    suite = unique_suite(items, minimum)
+
+    assert suite.cases == ()
+    assert [(item.code, item.source_pointer) for item in suite.diagnostics] == [
+        ("no_positive_schema_value", tags_schema_pointer())
+    ]
+
+
+def test_unique_arrays_above_the_collection_limit_are_not_generated() -> None:
+    for minimum in (100, 101):
+        suite = unique_suite({"type": "integer"}, minimum)
+
+        assert suite.cases == ()
+        assert [(item.code, item.source_pointer) for item in suite.diagnostics] == [
+            ("no_positive_schema_value", tags_schema_pointer())
+        ]
+
+
+def test_unique_arrays_with_max_items_below_min_items_are_not_generated() -> None:
+    suite = unique_suite({"type": "integer"}, 3, maxItems=2)
+
+    assert suite.cases == ()
+    assert codes(suite) == ["no_positive_schema_value"]
+
+
+def test_unique_arrays_with_unsupported_item_keywords_keep_their_diagnostic() -> None:
+    suite = unique_suite({"type": "string", "pattern": "^a$", "examples": ["a", "aa"]}, 2)
+
+    assert suite.cases == ()
+    assert [(item.code, item.source_pointer) for item in suite.diagnostics] == [
+        ("unsupported_schema_keyword", ITEMS_PATTERN_POINTER)
+    ]
+
+
+@pytest.mark.parametrize(
+    ("literals", "minimum", "expected"),
+    [
+        ([1, 1.0, True], 2, [1, True]),
+        ([1, 1.0], 2, None),
+        ([0, False, 0.0], 2, [0, False]),
+        ([1, True, "1"], 3, [1, True, "1"]),
+        ([1, 1.0, 2], 2, [1, 2]),
+        ([{"a": 1}, {"a": 1.0}, {"a": 2}], 2, [{"a": 1}, {"a": 2}]),
+        ([[1], [1.0], [True]], 2, [[1], [True]]),
+    ],
+)
+def test_distinct_item_values_use_json_schema_equality(
+    literals: list[object], minimum: int, expected: list[object] | None
+) -> None:
+    suite = unique_suite({"enum": literals}, minimum)
+
+    if expected is None:
+        assert suite.cases == ()
+        assert codes(suite) == ["no_positive_schema_value"]
+    else:
+        assert positive_tags(suite) == expected
+        assert [type(item) for item in positive_tags(suite)] == [type(item) for item in expected]  # type: ignore[union-attr]
+
+
+def test_array_level_literals_keep_their_existing_behavior() -> None:
+    example = unique_suite({"type": "string"}, 2, example=["b", "a"])
+    default = unique_suite({"type": "string"}, 2, default=["b", "a"])
+    enum = unique_suite({"type": "string"}, 2, enum=[["x", "x"], ["b", "a"]])
+    const = unique_suite({"type": "string"}, 2, const=["b", "a"])
+    duplicate = unique_suite({"type": "string", "enum": ["a"]}, 2, example=["a", "a"])
+
+    for suite in (example, default, enum, const):
+        assert positive_tags(suite) == ["b", "a"]
+    assert duplicate.cases == ()
+    assert codes(duplicate) == ["no_positive_schema_value"]
+
+
+@pytest.mark.parametrize(
+    "options",
+    [{}, {"uniqueItems": False}],
+    ids=["absent", "false"],
+)
+def test_arrays_without_unique_items_still_repeat_one_item(options: dict[str, object]) -> None:
+    schema = {"type": "array", "minItems": 2, "items": {"type": "string"}}
+    suite = empty_array_suite({**schema, **options})
+
+    assert positive_tags(suite) == ["sentinel", "sentinel"]
+
+
+@pytest.mark.parametrize("minimum", [0, 1])
+def test_unique_arrays_with_min_items_zero_or_one_are_unchanged(minimum: int) -> None:
+    suite = unique_suite({"type": "string"}, minimum)
+
+    assert positive_tags(suite) == (["sentinel"] if minimum else [])
+
+
+def test_unique_items_true_with_a_non_unique_minimum_keeps_the_single_item() -> None:
+    suite = unique_suite({"type": "string", "example": "x"}, 1)
+
+    assert positive_tags(suite) == ["x"]
+
+
+def test_negative_array_cases_still_work_after_a_distinct_positive_baseline() -> None:
+    two = unique_suite({"type": "integer"}, 2)
+    three = unique_suite({"type": "integer"}, 3)
+
+    assert [(case.violated_constraint, case.request_body.value["tags"]) for case in array_cases(two)] == [  # type: ignore[index, union-attr]
+        ("minItems", [0]),
+        ("uniqueItems", [0, 0]),
+    ]
+    assert [(case.violated_constraint, case.request_body.value["tags"]) for case in array_cases(three)] == [  # type: ignore[index, union-attr]
+        ("uniqueItems", [0, 0, 0])
+    ]
+    assert array_diagnostics(three) == [
+        ("array_bound_no_safe_candidate", tags_schema_pointer("minItems"))
+    ]
+
+
+def test_distinct_item_generation_is_deterministic_and_does_not_mutate_input() -> None:
+    result = make_result(
+        post_endpoint(
+            tags_body(
+                {
+                    "type": "array",
+                    "minItems": 3,
+                    "uniqueItems": True,
+                    "items": {"type": "integer", "enum": [3, 2, 1, 0]},
+                }
+            )
+        )
+    )
+    before = result.model_dump_json()
+
+    first = generate_test_suite(result)
+    second = generate_test_suite(result)
+
+    assert first.model_dump_json() == second.model_dump_json()
+    assert result.model_dump_json() == before
+    assert positive_tags(first) == [3, 2, 1]
+
+
+def test_mutating_one_case_array_does_not_change_other_cases_or_the_input_model() -> None:
+    enum = [{"a": [1]}, {"a": [2]}, {"a": [3]}]
+    result = make_result(
+        post_endpoint(
+            tags_body(
+                {"type": "array", "minItems": 2, "uniqueItems": True, "items": {"enum": enum}}
+            )
+        )
+    )
+    model_before = result.model_dump_json()
+    suite = generate_test_suite(result)
+
+    positive = suite.cases[0]
+    by_constraint = {case.violated_constraint: case for case in array_cases(suite)}
+    assert set(by_constraint) == {"minItems", "uniqueItems"}
+
+    def tags(case: GeneratedTestCase) -> list[dict[str, list[object]]]:
+        assert case.request_body is not None
+        return case.request_body.value["tags"]  # type: ignore[index, return-value]
+
+    positive_tags_list = tags(positive)
+    min_items_tags = tags(by_constraint["minItems"])
+    unique_tags = tags(by_constraint["uniqueItems"])
+    assert positive_tags_list == [{"a": [1]}, {"a": [2]}]
+    assert min_items_tags == [{"a": [1]}]
+    assert unique_tags == [{"a": [1]}, {"a": [1]}]
+    # Distinct list objects, and distinct item and nested-list objects across cases.
+    arrays = [positive_tags_list, min_items_tags, unique_tags]
+    assert len({id(array) for array in arrays}) == 3
+    items = [item for array in arrays for item in array]
+    assert len({id(item) for item in items}) == len(items)
+    assert len({id(item["a"]) for item in items}) == len(items)
+
+    # Mutate the positive case at array, item and nested level.
+    positive_tags_list[0]["a"].append("mutated")
+    positive_tags_list[0]["extra"] = True  # type: ignore[assignment]
+    positive_tags_list.append({"a": ["appended"]})
+    assert min_items_tags == [{"a": [1]}]
+    assert unique_tags == [{"a": [1]}, {"a": [1]}]
+
+    # Mutate a negative case: it must affect neither the positive nor the other negative case.
+    unique_tags[0]["a"].append("changed")
+    assert unique_tags[1] == {"a": [1]}
+    assert min_items_tags == [{"a": [1]}]
+    assert positive_tags_list[1] == {"a": [2]}
+
+    # The input model (the schema enum literals) is untouched.
+    assert result.model_dump_json() == model_before
+    assert enum == [{"a": [1]}, {"a": [2]}, {"a": [3]}]
+
+
+def test_distinct_item_expansion_budget_keeps_the_existing_budget_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    schemas = {
+        "A": {"$ref": "#/components/schemas/B"},
+        "B": {"$ref": "#/components/schemas/C"},
+        "C": {"type": "integer"},
+    }
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_EXPANSIONS", 3)
+
+    suite = unique_suite({"$ref": "#/components/schemas/A"}, 3, schemas=schemas)
+
+    assert suite.cases == ()
+    assert codes(suite) == ["generation_expansion_budget_exceeded"]
+
+
+def test_distinct_item_case_budget_keeps_the_existing_budget_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_CASES", 1)
+
+    suite = unique_suite({"type": "integer"}, 2)
+
+    assert [case.category for case in suite.cases] == ["positive"]
+    assert "generation_case_budget_exceeded" in codes(suite)
+
+
+def test_a_null_only_item_schema_admits_no_other_value() -> None:
+    nullable_property = empty_array_suite(
+        None,
+        body={
+            "type": "object",
+            "required": ["tags"],
+            "properties": {"tags": {"type": "null"}},
+        },
+    )
+
+    assert positive_tags(nullable_property) is None
+    assert generator_module._matches({"type": "null"}, None, "3.1.1", "request", 0)
+    for value in ({}, [], False, 0, ""):
+        assert not generator_module._matches({"type": "null"}, value, "3.1.1", "request", 0)
+    assert generator_module._matches({"type": ["null"]}, None, "3.1.1", "request", 0)
+    assert not generator_module._matches({"type": ["null"]}, 0, "3.1.1", "request", 0)

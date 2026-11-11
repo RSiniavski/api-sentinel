@@ -2877,6 +2877,55 @@ def _select_value(
     )
 
 
+def _distinct_item_values(
+    raw: Any, version: str, pointer: str, direction: str, count: int
+) -> list[Any]:
+    """Return `count` distinct valid values for an item schema, or [] if fewer exist.
+
+    Candidates follow the _select_value order (const/enum, example, examples,
+    default, then the existing fallbacks), are validated with _matches and
+    de-duplicated with _equal. No new values are invented.
+    """
+    raw, pointer, _ = _follow_schema_reference(raw, pointer)
+    schema = _check_schema(raw, version, pointer, direction, 0)
+    if schema is True or schema is False:
+        return []
+
+    candidates: list[Any] = []
+    if "const" in schema:
+        candidates.append(schema["const"])
+    elif "enum" in schema:
+        candidates.extend(schema["enum"])
+    if "example" in schema:
+        candidates.append(schema["example"])
+    candidates.extend(schema.get("examples", []))
+    if "default" in schema:
+        candidates.append(schema["default"])
+
+    values: list[Any] = []
+
+    def add(value: Any) -> None:
+        if not any(_equal(value, known) for known in values):
+            values.append(value)
+
+    for value in candidates:
+        try:
+            valid = _matches(schema, value, version, direction, 0)
+        except _UnsupportedOperation:
+            valid = False
+        if valid:
+            add(value)
+        if len(values) >= count or "const" in schema:
+            break
+    if len(values) < count and "const" not in schema and "enum" not in schema:
+        for value in _fallback_values(schema, version, pointer, direction):
+            if _matches(schema, value, version, direction, 0):
+                add(value)
+            if len(values) >= count:
+                break
+    return values if len(values) >= count else []
+
+
 def _check_schema(
     raw: Any, version: str, pointer: str, direction: str, depth: int
 ) -> bool | dict[str, Any]:
@@ -3037,6 +3086,9 @@ def _matches(schema: dict[str, Any], value: Any, version: str, direction: str, d
         return not types or "null" in types or (version.startswith("3.0.") and schema.get("nullable") is True)
     base_type = next((item for item in types if item != "null"), None)
     if base_type and not _has_type(value, base_type):
+        return False
+    if types and base_type is None:
+        # A schema whose only type is "null" admits no non-null value.
         return False
     if "const" in schema and not _equal(value, schema["const"]):
         return False
@@ -3225,15 +3277,21 @@ def _fallback_values(schema: dict[str, Any], version: str, pointer: str, directi
             return ()
         if minimum == 0:
             return ([],)
-        if minimum > 1 and schema.get("uniqueItems") is True:
-            return ()
         if "items" not in schema:
             return ()
         item_schema = _check_schema(schema["items"], version, _child(pointer, "items"), direction, 1)
+        unique = minimum > 1 and schema.get("uniqueItems") is True
         if item_schema is True:
+            if unique:
+                return ()
             item = None
         elif item_schema is False:
             return ()
+        elif unique:
+            values = _distinct_item_values(
+                item_schema, version, _child(pointer, "items"), direction, minimum
+            )
+            return (values,) if values else ()
         else:
             item, _ = _select_value(item_schema, version, [], _child(pointer, "items"), direction=direction)
         return ([item] * minimum,)
