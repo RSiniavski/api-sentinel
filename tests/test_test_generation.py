@@ -8555,3 +8555,217 @@ def test_optional_unsupported_parameter_generation_is_deterministic_and_keeps_th
     assert first.model_dump_json() == second.model_dump_json()
     assert result.model_dump_json() == before
     assert len(first.diagnostics) == 2
+
+
+# --- Step 8.10: reserved header parameters are ignored ---
+
+RESERVED_CODE = "reserved_header_parameter_ignored"
+
+
+def header_parameter(name: str, raw: object = None, *, required: bool = True) -> Parameter:
+    return Parameter(
+        name=name, location="header", required=required,
+        schema=Schema(raw=raw if raw is not None else {"type": "string"}),  # type: ignore[arg-type]
+        source_scope="operation",
+    )
+
+
+def assert_only_the_id_parameter(suite: GeneratedTestSuite) -> None:
+    """Positive plus one omission case for `id`; no reserved header anywhere."""
+    assert [(case.category, case.violated_constraint) for case in suite.cases] == [
+        ("positive", None), ("negative", "required_parameter"),
+    ]
+    assert [(p.name, p.location) for p in suite.cases[0].parameters] == [("id", "query")]
+    assert suite.cases[1].parameters == ()
+    assert all(p.location != "header" for case in suite.cases for p in case.parameters)
+
+
+@pytest.mark.parametrize("name", ["Accept", "Content-Type", "Authorization"])
+@pytest.mark.parametrize("required", [True, False])
+def test_reserved_header_parameter_is_ignored_with_a_diagnostic(name: str, required: bool) -> None:
+    suite = optional_suite(required_id(), header_parameter(name, required=required))
+
+    assert_only_the_id_parameter(suite)
+    [diagnostic] = suite.diagnostics
+    assert diagnostic.code == RESERVED_CODE
+    assert diagnostic.endpoint_path == "/items"
+    assert diagnostic.endpoint_method == "get"
+    assert diagnostic.source_pointer == f"{OPTIONAL_PARAMETER_BASE}/1"
+    assert diagnostic.reference_uri is None
+    assert diagnostic.message == (
+        f"Header parameter '{name}' was ignored because OpenAPI ignores header parameters "
+        "named Accept, Content-Type or Authorization; no header value or omission case was generated."
+    )
+
+
+@pytest.mark.parametrize("name", ["accept", "ACCEPT", "content-TYPE", "CONTENT-type", "authorization", "AuThOrIzAtIoN"])
+def test_reserved_header_names_match_case_insensitively(name: str) -> None:
+    suite = optional_suite(required_id(), header_parameter(name))
+
+    assert_only_the_id_parameter(suite)
+    assert [item.code for item in suite.diagnostics] == [RESERVED_CODE]
+    assert f"'{name}'" in suite.diagnostics[0].message
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        {"type": "array", "items": {"type": "string"}},
+        {"type": "string", "format": "hostname"},
+        {"$ref": "#/components/schemas/Missing"},
+        {"type": "object"},
+    ],
+)
+def test_unsupported_schema_on_a_reserved_header_does_not_skip_the_endpoint(raw: object) -> None:
+    suite = optional_suite(
+        required_id(), header_parameter("Authorization", raw), components={"Other": {"type": "string"}}
+    )
+
+    assert_only_the_id_parameter(suite)
+    assert [item.code for item in suite.diagnostics] == [RESERVED_CODE]
+
+
+def test_reserved_header_without_a_schema_or_with_content_is_ignored() -> None:
+    no_schema = Parameter(name="Accept", location="header", required=True, source_scope="operation")
+    with_content = Parameter(
+        name="Content-Type", location="header", required=True, source_scope="operation",
+        content={"application/json": MediaType(schema=Schema(raw={"type": "string"}))},
+    )
+
+    suite = optional_suite(required_id(), no_schema, with_content)
+
+    assert_only_the_id_parameter(suite)
+    assert [item.source_pointer for item in suite.diagnostics] == [
+        f"{OPTIONAL_PARAMETER_BASE}/1", f"{OPTIONAL_PARAMETER_BASE}/2"
+    ]
+
+
+def test_referenced_reserved_header_is_ignored_and_keeps_the_reference() -> None:
+    suite = optional_suite(
+        required_id(),
+        parameter_reference("Auth"),
+        parameter_components={"Auth": header_parameter("Authorization", {"type": "array", "items": {}})},
+    )
+
+    assert_only_the_id_parameter(suite)
+    [diagnostic] = suite.diagnostics
+    assert diagnostic.code == RESERVED_CODE
+    assert diagnostic.source_pointer == f"{OPTIONAL_PARAMETER_BASE}/1"
+    assert diagnostic.reference_uri == "#/components/parameters/Auth"
+
+
+def test_referenced_reserved_header_through_an_alias_chain_reports_the_first_reference() -> None:
+    suite = optional_suite(
+        required_id(),
+        parameter_reference("Alias"),
+        parameter_components={
+            "Alias": parameter_reference("Accept"),
+            "Accept": header_parameter("accept"),
+        },
+    )
+
+    assert_only_the_id_parameter(suite)
+    assert suite.diagnostics[0].reference_uri == "#/components/parameters/Alias"
+
+
+def test_non_reserved_header_parameters_are_unaffected() -> None:
+    suite = optional_suite(
+        required_id(),
+        header_parameter("X-Accept"),
+        header_parameter("Accept-Language"),
+        header_parameter("Authorization-Token"),
+        header_parameter("Accept", required=False),
+    )
+
+    assert [(p.name, p.location) for p in suite.cases[0].parameters] == [
+        ("id", "query"), ("X-Accept", "header"), ("Accept-Language", "header"), ("Authorization-Token", "header"),
+    ]
+    assert [(c.category, len(c.parameters)) for c in suite.cases] == [
+        ("positive", 4), ("negative", 3), ("negative", 3), ("negative", 3), ("negative", 3),
+    ]
+    assert [item.code for item in suite.diagnostics] == [RESERVED_CODE]
+
+
+def test_same_names_in_other_locations_are_not_reserved() -> None:
+    suite = optional_suite(
+        Parameter(name="Authorization", location="query", required=True, schema=Schema(raw={"type": "string"}), source_scope="operation"),
+        Parameter(name="Accept", location="cookie", required=True, schema=Schema(raw={"type": "string"}), source_scope="operation"),
+    )
+
+    assert [(p.name, p.location) for p in suite.cases[0].parameters] == [
+        ("Authorization", "query"), ("Accept", "cookie"),
+    ]
+    assert suite.diagnostics == ()
+
+
+def test_reserved_header_only_endpoint_still_generates_a_positive_case() -> None:
+    suite = optional_suite(header_parameter("Content-Type"), header_parameter("accept"))
+
+    assert [(c.category, c.parameters) for c in suite.cases] == [("positive", ())]
+    assert [item.code for item in suite.diagnostics] == [RESERVED_CODE, RESERVED_CODE]
+
+
+def test_reserved_header_does_not_hide_an_unsupported_required_parameter() -> None:
+    required_array = Parameter(
+        name="tags", location="query", required=True,
+        schema=Schema(raw={"type": "array", "items": {}}), source_scope="operation",
+    )
+
+    suite = optional_suite(header_parameter("Accept"), required_array)
+
+    assert suite.cases == ()
+    assert [item.code for item in suite.diagnostics] == ["unsupported_parameter_schema"]
+
+
+def test_reserved_and_optional_unsupported_diagnostics_keep_declaration_order() -> None:
+    suite = optional_suite(
+        optional_parameter({"type": "object"}, name="first"),
+        header_parameter("Authorization"),
+        required_id(),
+        header_parameter("content-type", required=False),
+    )
+
+    assert [(item.code, item.source_pointer) for item in suite.diagnostics] == [
+        (OPTIONAL_CODE, f"{OPTIONAL_PARAMETER_BASE}/0/schema"),
+        (RESERVED_CODE, f"{OPTIONAL_PARAMETER_BASE}/1"),
+        (RESERVED_CODE, f"{OPTIONAL_PARAMETER_BASE}/3"),
+    ]
+
+
+def test_reserved_header_diagnostics_respect_the_diagnostic_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_DIAGNOSTICS", 2)
+
+    suite = optional_suite(
+        required_id(), header_parameter("Accept"), header_parameter("Authorization"), header_parameter("Content-Type")
+    )
+
+    assert [case.category for case in suite.cases] == ["positive", "negative"]
+    assert [item.code for item in suite.diagnostics] == [
+        RESERVED_CODE, RESERVED_CODE, "generation_diagnostic_budget_exceeded"
+    ]
+
+
+def test_reserved_header_diagnostics_are_dropped_when_the_endpoint_is_skipped() -> None:
+    suite = optional_suite(header_parameter("Accept"), Parameter(
+        name="tags", location="query", required=True, schema=Schema(raw={"type": "object"}), source_scope="operation"
+    ))
+
+    assert [item.code for item in suite.diagnostics] == ["unsupported_parameter_schema"]
+
+
+def test_reserved_header_generation_is_deterministic_and_keeps_the_input() -> None:
+    endpoint = make_endpoint(
+        "/items",
+        parameters=(required_id(), header_parameter("ACCEPT"), header_parameter("Authorization", {"type": "object"})),
+    )
+    result = make_result(endpoint)
+    before = result.model_dump_json()
+
+    first = generate_test_suite(result)
+    second = generate_test_suite(result)
+
+    assert first.model_dump_json() == second.model_dump_json()
+    assert result.model_dump_json() == before
+    assert [item.code for item in first.diagnostics] == [RESERVED_CODE, RESERVED_CODE]

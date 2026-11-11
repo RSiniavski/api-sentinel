@@ -321,9 +321,9 @@ def _generate_suite(result: NormalizationResult, budget: _GenerationBudget) -> G
                 budget, lambda: _generate_endpoint(endpoint, result.api)
             )
             if exhausted is None:
-                positive, optional_diagnostics = positive
+                positive, parameter_diagnostics = positive
                 cases.append(positive)
-                diagnostics.extend(budget.admit(optional_diagnostics))
+                diagnostics.extend(budget.admit(parameter_diagnostics))
                 for step_name, step in _negative_steps(endpoint, positive, result.api):
                     try:
                         step_result, exhausted = _run_step(budget, step)
@@ -2378,12 +2378,32 @@ def _optional_parameter_diagnostic(
     )
 
 
+_RESERVED_HEADER_NAMES = frozenset({"accept", "content-type", "authorization"})
+
+
+def _reserved_header_diagnostic(
+    entry: Parameter, pointer: str, followed: tuple[str, ...], endpoint: Endpoint
+) -> GenerationDiagnostic:
+    return GenerationDiagnostic(
+        code="reserved_header_parameter_ignored",
+        message=(
+            f"Header parameter '{entry.name}' was ignored because OpenAPI ignores header "
+            "parameters named Accept, Content-Type or Authorization; no header value or "
+            "omission case was generated."
+        ),
+        endpoint_path=endpoint.path,
+        endpoint_method=endpoint.method,
+        source_pointer=pointer,
+        reference_uri=followed[0] if followed else None,
+    )
+
+
 def _generate_endpoint(
     endpoint: Endpoint, api: ApiModel
 ) -> tuple[GeneratedTestCase, tuple[GenerationDiagnostic, ...]]:
     root = _endpoint_pointer(endpoint)
     parameters: list[GeneratedParameterValue] = []
-    optional_diagnostics: list[GenerationDiagnostic] = []
+    parameter_diagnostics: list[GenerationDiagnostic] = []
     path_names: set[str] = set()
 
     for index, endpoint_entry in enumerate(endpoint.parameters):
@@ -2393,11 +2413,17 @@ def _generate_endpoint(
                 "unsupported_parameter", "Unsupported parameter entry.", pointer
             )
         entry, declaration, followed = _resolve_parameter(endpoint_entry, api, pointer)
+        if entry.location == "header" and entry.name.lower() in _RESERVED_HEADER_NAMES:
+            # The specification says such a definition SHALL be ignored.
+            parameter_diagnostics.append(
+                _reserved_header_diagnostic(entry, pointer, followed, endpoint)
+            )
+            continue
         if not entry.required and entry.location != "path":
             # Omitted by default: report an unsupported schema, but do not skip.
             issue = _optional_parameter_issue(entry, declaration, api)
             if issue is not None:
-                optional_diagnostics.append(_optional_parameter_diagnostic(entry, issue, endpoint))
+                parameter_diagnostics.append(_optional_parameter_diagnostic(entry, issue, endpoint))
             continue
         if entry.schema is None or entry.content is not None:
             raise _UnsupportedOperation(
@@ -2463,7 +2489,7 @@ def _generate_endpoint(
         response_expectations=expectations,
         provenance=(root, *body_provenance),
     )
-    return case, tuple(optional_diagnostics)
+    return case, tuple(parameter_diagnostics)
 
 
 _REQUEST_BODY_REFERENCE_PREFIX = "#/components/requestBodies/"
