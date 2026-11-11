@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from urllib.parse import unquote
 from typing import Any
 
@@ -325,6 +326,45 @@ def _parameter_identity(
     return current.name, current.location
 
 
+_TEMPLATE_EXPRESSION = re.compile(r"\{([^{}]+)\}")
+
+
+def _template_expressions(path: str) -> set[str] | None:
+    """Names of the path template expressions, or None for malformed braces."""
+    names = {match.group(1) for match in _TEMPLATE_EXPRESSION.finditer(path)}
+    remainder = _TEMPLATE_EXPRESSION.sub("", path)
+    return None if "{" in remainder or "}" in remainder else names
+
+
+def _check_path_parameters(
+    parameters: tuple[ParameterEntry, ...],
+    components: Components,
+    path: str,
+    method: str,
+) -> None:
+    """Reject effective path parameters that the path template does not use.
+
+    A malformed template is left to the generator, which reports it. A template
+    expression without a parameter is also left to the generator.
+    """
+    expressions = _template_expressions(path)
+    if expressions is None:
+        return
+    context = f"operation {method.upper()} {path}"
+    unused = [
+        name
+        for name, location in (
+            _parameter_identity(entry, components, context) for entry in parameters
+        )
+        if location == "path" and name not in expressions
+    ]
+    if unused:
+        listed = ", ".join(f"'{name}'" for name in unused)
+        raise OpenAPINormalizationError(
+            f"Path parameters not used by the path template at {context}: {listed}."
+        )
+
+
 def _parameter_list(
     value: Any,
     context: str,
@@ -425,6 +465,7 @@ def _operation(
     parameters, diagnostics = _merge_parameters(
         path_parameters, operation_parameters, components, path, method
     )
+    _check_path_parameters(parameters, components, path, method)
 
     request_body = (
         _request_body(source["requestBody"], f"{context}.requestBody")

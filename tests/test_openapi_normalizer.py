@@ -975,3 +975,167 @@ def test_normalization_error_is_exported_and_distinct_from_validation_errors() -
     from app.services.openapi.exceptions import OpenAPIValidationError
 
     assert OpenAPINormalizationError is not OpenAPIValidationError
+
+
+# --- Step 8.9: path parameters must be used by the path template ---
+
+
+def path_parameter(name: str, **extra: object) -> dict[str, object]:
+    return {"name": name, "in": "path", "required": True, "schema": {"type": "string"}, **extra}
+
+
+def path_document(
+    path: str,
+    *,
+    operation_parameters: list[dict[str, object]] | None = None,
+    path_parameters: list[dict[str, object]] | None = None,
+    components: dict[str, dict[str, object]] | None = None,
+) -> dict[str, object]:
+    document = openapi_document()
+    document["components"]["parameters"] = components or {}  # type: ignore[index]
+    item: dict[str, object] = {"get": operation(parameters=operation_parameters or [])}
+    if path_parameters is not None:
+        item["parameters"] = path_parameters
+    document["paths"] = {path: item}
+    return document
+
+
+def test_valid_single_and_multiple_path_parameters_are_accepted() -> None:
+    single = path_document("/items/{id}", operation_parameters=[path_parameter("id")])
+    multiple = path_document(
+        "/orgs/{org}/items/{id}/{id}",
+        operation_parameters=[path_parameter("org"), path_parameter("id")],
+    )
+
+    assert [p.name for p in normalize_openapi_document(single).api.endpoints[0].parameters] == ["id"]  # type: ignore[union-attr]
+    assert [p.name for p in normalize_openapi_document(multiple).api.endpoints[0].parameters] == ["org", "id"]  # type: ignore[union-attr]
+
+
+def test_declared_path_parameter_absent_from_the_template_is_rejected() -> None:
+    document = path_document("/items", operation_parameters=[path_parameter("id")])
+
+    with pytest.raises(OpenAPINormalizationError) as error:
+        normalize_openapi_document(document)
+
+    assert str(error.value) == (
+        "Path parameters not used by the path template at operation GET /items: 'id'."
+    )
+
+
+def test_every_unused_path_parameter_is_listed_in_declaration_order() -> None:
+    document = path_document(
+        "/items/{used}",
+        operation_parameters=[path_parameter("zeta"), path_parameter("used"), path_parameter("alpha")],
+    )
+
+    with pytest.raises(OpenAPINormalizationError) as error:
+        normalize_openapi_document(document)
+
+    assert str(error.value).endswith("operation GET /items/{used}: 'zeta', 'alpha'.")
+
+
+@pytest.mark.parametrize(
+    ("path", "name"),
+    [("/items/{item_id}", "id"), ("/items/{id}", "item_id"), ("/items/{Id}", "id"), ("/a/{x}/b", "x}")],
+)
+def test_a_partial_or_different_case_name_does_not_match_a_placeholder(path: str, name: str) -> None:
+    document = path_document(path, operation_parameters=[path_parameter(name)])
+
+    with pytest.raises(OpenAPINormalizationError, match="Path parameters not used by the path template"):
+        normalize_openapi_document(document)
+
+
+def test_unused_path_level_parameter_is_rejected_and_an_override_is_checked_as_effective() -> None:
+    unused_at_path_level = path_document("/items", path_parameters=[path_parameter("id")])
+    # The operation parameter overrides the path-level one, so only the effective list counts.
+    overridden = path_document(
+        "/items/{id}",
+        path_parameters=[path_parameter("id")],
+        operation_parameters=[path_parameter("id", description="operation")],
+    )
+
+    with pytest.raises(OpenAPINormalizationError, match="operation GET /items: 'id'"):
+        normalize_openapi_document(unused_at_path_level)
+    assert normalize_openapi_document(overridden).api.endpoints[0].parameters[0].description == "operation"  # type: ignore[union-attr]
+
+
+def test_path_and_operation_level_parameters_cover_different_expressions() -> None:
+    document = path_document(
+        "/orgs/{org}/items/{id}",
+        path_parameters=[path_parameter("org")],
+        operation_parameters=[path_parameter("id")],
+    )
+
+    endpoint = normalize_openapi_document(document).api.endpoints[0]
+
+    assert [(p.name, p.source_scope) for p in endpoint.parameters] == [("org", "path"), ("id", "operation")]  # type: ignore[union-attr]
+
+
+def test_referenced_path_parameters_are_checked_by_their_component_name_and_location() -> None:
+    components = {"ItemId": path_parameter("id")}
+    valid = path_document(
+        "/items/{id}", operation_parameters=[{"$ref": "#/components/parameters/ItemId"}], components=components
+    )
+    invalid = path_document(
+        "/items", operation_parameters=[{"$ref": "#/components/parameters/ItemId"}], components=components
+    )
+    query_reference = path_document(
+        "/items",
+        operation_parameters=[{"$ref": "#/components/parameters/Q"}],
+        components={"Q": {"name": "id", "in": "query", "schema": {"type": "string"}}},
+    )
+
+    assert normalize_openapi_document(valid).api.endpoints[0].parameters
+    with pytest.raises(OpenAPINormalizationError, match="operation GET /items: 'id'"):
+        normalize_openapi_document(invalid)
+    assert normalize_openapi_document(query_reference).api.endpoints[0].parameters
+
+
+def test_non_path_parameters_are_not_checked_against_the_template() -> None:
+    document = path_document(
+        "/items",
+        operation_parameters=[
+            {"name": "id", "in": "query", "schema": {"type": "string"}},
+            {"name": "id", "in": "header", "schema": {"type": "string"}},
+        ],
+    )
+
+    assert len(normalize_openapi_document(document).api.endpoints[0].parameters) == 2
+
+
+def test_template_expression_without_a_parameter_is_still_left_to_the_generator() -> None:
+    from app.services.test_generation.generator import generate_test_suite
+
+    result = normalize_openapi_document(path_document("/items/{id}"))
+
+    suite = generate_test_suite(result)
+
+    assert suite.cases == ()
+    assert [item.code for item in suite.diagnostics] == ["missing_path_parameter"]
+
+
+def test_malformed_templates_are_left_to_the_generator() -> None:
+    from app.services.test_generation.generator import generate_test_suite
+
+    result = normalize_openapi_document(
+        path_document("/items/{id", operation_parameters=[path_parameter("id")])
+    )
+
+    assert [item.code for item in generate_test_suite(result).diagnostics] == ["invalid_path_template"]
+
+
+def test_path_parameter_error_is_deterministic_and_does_not_mutate_the_input() -> None:
+    document = path_document(
+        "/items", operation_parameters=[path_parameter("b"), path_parameter("a")]
+    )
+    before = json.dumps(document, sort_keys=True)
+    messages = []
+
+    for _ in range(3):
+        with pytest.raises(OpenAPINormalizationError) as error:
+            normalize_openapi_document(document)
+        messages.append(str(error.value))
+
+    assert len(set(messages)) == 1
+    assert messages[0].endswith("operation GET /items: 'b', 'a'.")
+    assert json.dumps(document, sort_keys=True) == before
