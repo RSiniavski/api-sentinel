@@ -8222,3 +8222,336 @@ def test_object_root_bodies_and_property_arrays_are_unchanged() -> None:
         ("maxItems", "/tags"),
     ]
     assert {case.affected_property for case in suite.cases} >= {"/tags"}
+
+
+# --- Step 8.7: optional parameters with unsupported schemas ---
+
+OPTIONAL_CODE = "optional_parameter_unsupported_schema"
+OPTIONAL_PARAMETER_BASE = "/paths/~1items/get/parameters"
+
+
+def required_id() -> Parameter:
+    return Parameter(
+        name="id", location="query", required=True,
+        schema=Schema(raw={"type": "string"}), source_scope="operation",
+    )
+
+
+def optional_parameter(
+    raw: object | None, location: str = "query", name: str = "opt", **extra: object
+) -> Parameter:
+    return Parameter(
+        name=name, location=location, required=False,  # type: ignore[arg-type]
+        schema=Schema(raw=raw) if raw is not None else None,  # type: ignore[arg-type]
+        source_scope="operation", **extra,
+    )
+
+
+def optional_suite(
+    *parameters: Parameter | ParameterReference,
+    components: dict[str, object] | None = None,
+    parameter_components: dict[str, Parameter | ParameterReference] | None = None,
+) -> GeneratedTestSuite:
+    endpoint = make_endpoint("/items", parameters=tuple(parameters))
+    return generate_test_suite(
+        NormalizationResult(
+            api=ApiModel(
+                openapi_version="3.1.1",
+                info=ApiInfo(title="Generated API", version="1.0"),
+                endpoints=(endpoint,),
+                components=Components(
+                    schemas={k: Schema(raw=v) for k, v in (components or {}).items()},  # type: ignore[arg-type]
+                    parameters=parameter_components or {},
+                ),
+            )
+        )
+    )
+
+
+def assert_endpoint_generated_without(suite: GeneratedTestSuite, name: str = "opt") -> None:
+    """The positive and the required-parameter negative case exist; `name` is never sent."""
+    assert [case.category for case in suite.cases] == ["positive", "negative"]
+    assert suite.cases[1].violated_constraint == "required_parameter"
+    for case in suite.cases:
+        assert name not in {item.name for item in case.parameters}
+    assert [(item.name, item.location, item.value) for item in suite.cases[0].parameters] == [
+        ("id", "query", "sentinel")
+    ]
+
+
+@pytest.mark.parametrize(
+    ("raw", "components", "pointer", "reference_uri"),
+    [
+        ({"type": "array", "items": {"type": "string"}}, None, "/schema", None),
+        ({"type": "string", "format": "hostname"}, None, "/schema/format", None),
+        ({"$ref": "#/components/schemas/Missing"}, {"Other": {"type": "string"}}, "/schema", "#/components/schemas/Missing"),
+        ({"$ref": "#/components/schemas/Arr"}, {"Arr": {"type": "array", "items": {"type": "string"}}}, None, None),
+        ({"type": "object"}, None, "/schema", None),
+        ({"type": "string", "oneOf": [{"type": "string"}]}, None, "/schema/oneOf", None),
+        ({"allOf": [{"type": "string"}]}, None, "/schema", None),
+        ({"type": "string", "pattern": "^a$"}, None, "/schema/pattern", None),
+    ],
+)
+def test_optional_unsupported_schema_is_omitted_and_reported_without_skipping(
+    raw: object, components: dict[str, object] | None, pointer: str | None, reference_uri: str | None
+) -> None:
+    suite = optional_suite(required_id(), optional_parameter(raw), components=components)
+
+    assert_endpoint_generated_without(suite)
+    [diagnostic] = suite.diagnostics
+    assert diagnostic.code == OPTIONAL_CODE
+    assert diagnostic.endpoint_path == "/items"
+    assert diagnostic.endpoint_method == "get"
+    assert diagnostic.reference_uri == reference_uri
+    if pointer is not None:
+        assert diagnostic.source_pointer == f"{OPTIONAL_PARAMETER_BASE}/1{pointer}"
+    assert diagnostic.message.startswith("Optional query parameter 'opt' was omitted because its schema is unsupported: ")
+    assert diagnostic.message.endswith(" Endpoint generation continued.")
+
+
+def test_optional_parameter_through_a_reference_to_an_unsupported_type_points_at_the_target() -> None:
+    suite = optional_suite(
+        required_id(),
+        optional_parameter({"$ref": "#/components/schemas/Arr"}),
+        components={"Arr": {"type": "array", "items": {"type": "string"}}},
+    )
+
+    assert_endpoint_generated_without(suite)
+    assert suite.diagnostics[0].source_pointer == "/components/schemas/Arr"
+    assert "skipped" not in suite.diagnostics[0].message
+
+
+@pytest.mark.parametrize("location", ["query", "header", "cookie"])
+def test_optional_unsupported_schema_behaves_the_same_for_every_location(location: str) -> None:
+    suite = optional_suite(
+        required_id(), optional_parameter({"type": "array", "items": {"type": "string"}}, location)
+    )
+
+    assert_endpoint_generated_without(suite)
+    assert [item.code for item in suite.diagnostics] == [OPTIONAL_CODE]
+    assert f"Optional {location} parameter 'opt'" in suite.diagnostics[0].message
+
+
+def test_optional_parameter_without_schema_or_with_content_is_omitted_and_reported() -> None:
+    no_schema = optional_suite(required_id(), optional_parameter(None))
+    with_content = optional_suite(
+        required_id(),
+        optional_parameter(
+            None, content={"application/json": MediaType(schema=Schema(raw={"type": "string"}))}
+        ),
+    )
+
+    for suite in (no_schema, with_content):
+        assert_endpoint_generated_without(suite)
+        assert [(item.code, item.source_pointer) for item in suite.diagnostics] == [
+            (OPTIONAL_CODE, f"{OPTIONAL_PARAMETER_BASE}/1")
+        ]
+        assert "A direct primitive parameter schema is required." in suite.diagnostics[0].message
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"example": 5},
+        {"examples": {"bad": {"value": {"nested": True}}, "worse": {"value": 3}}},
+        {"example": "x", "examples": {"a": {"value": "y"}}},
+    ],
+)
+def test_optional_parameter_examples_are_not_processed_when_it_is_omitted(
+    extra: dict[str, object],
+) -> None:
+    suite = optional_suite(
+        required_id(), optional_parameter({"type": "string", "minLength": 2}, **extra)
+    )
+
+    assert_endpoint_generated_without(suite)
+    assert suite.diagnostics == ()
+
+
+def test_optional_parameter_with_unsatisfiable_value_constraints_no_longer_skips_the_endpoint() -> None:
+    suite = optional_suite(
+        required_id(), optional_parameter({"type": "string", "minLength": 5, "maxLength": 2})
+    )
+
+    assert_endpoint_generated_without(suite)
+    assert suite.diagnostics == ()
+
+
+def test_supported_optional_parameters_are_still_omitted_without_diagnostics() -> None:
+    suite = optional_suite(
+        required_id(), optional_parameter({"type": "integer"}, name="opt"),
+        optional_parameter({"type": "string", "format": "uuid"}, "header", name="trace"),
+    )
+
+    assert_endpoint_generated_without(suite)
+    assert "trace" not in {item.name for case in suite.cases for item in case.parameters}
+    assert suite.diagnostics == ()
+
+
+def test_one_unsupported_optional_among_supported_ones_reports_only_that_parameter() -> None:
+    suite = optional_suite(
+        required_id(),
+        optional_parameter({"type": "integer"}, name="good"),
+        optional_parameter({"type": "object"}, name="bad"),
+        optional_parameter({"type": "boolean"}, name="fine"),
+    )
+
+    assert_endpoint_generated_without(suite, "good")
+    for name in ("good", "bad", "fine"):
+        assert all(name not in {item.name for item in case.parameters} for case in suite.cases)
+    assert [(item.code, item.source_pointer) for item in suite.diagnostics] == [
+        (OPTIONAL_CODE, f"{OPTIONAL_PARAMETER_BASE}/2/schema")
+    ]
+    assert "'bad'" in suite.diagnostics[0].message
+
+
+def test_optional_diagnostics_follow_declaration_order_and_come_after_the_positive_case() -> None:
+    suite = optional_suite(
+        optional_parameter({"type": "object"}, name="z"),
+        required_id(),
+        optional_parameter({"type": "array", "items": {}}, "header", name="a"),
+    )
+
+    assert [case.category for case in suite.cases] == ["positive", "negative"]
+    assert [item.source_pointer for item in suite.diagnostics] == [
+        f"{OPTIONAL_PARAMETER_BASE}/0/schema",
+        f"{OPTIONAL_PARAMETER_BASE}/2/schema",
+    ]
+    assert ["'z'" in suite.diagnostics[0].message, "'a'" in suite.diagnostics[1].message] == [True, True]
+
+
+def test_required_unsupported_parameter_still_skips_the_endpoint() -> None:
+    required_array = Parameter(
+        name="tags", location="query", required=True,
+        schema=Schema(raw={"type": "array", "items": {"type": "string"}}), source_scope="operation",
+    )
+
+    suite = optional_suite(required_array, optional_parameter({"type": "object"}))
+
+    assert suite.cases == ()
+    assert [(item.code, item.source_pointer) for item in suite.diagnostics] == [
+        ("unsupported_parameter_schema", f"{OPTIONAL_PARAMETER_BASE}/0/schema")
+    ]
+    assert suite.diagnostics[0].message == "This stage supports direct primitive parameter schemas only."
+
+
+@pytest.mark.parametrize(
+    ("raw", "code"),
+    [
+        ({"type": "string", "format": "hostname"}, "unsupported_schema_keyword"),
+        ({"type": "string", "oneOf": [{"type": "string"}]}, "unsupported_schema_composition"),
+    ],
+)
+def test_required_unsupported_keyword_still_skips_with_the_original_diagnostic(
+    raw: object, code: str
+) -> None:
+    required = Parameter(
+        name="r", location="header", required=True, schema=Schema(raw=raw), source_scope="operation"  # type: ignore[arg-type]
+    )
+
+    suite = optional_suite(required)
+
+    assert suite.cases == ()
+    assert [item.code for item in suite.diagnostics] == [code]
+
+
+def test_required_only_endpoint_is_unchanged() -> None:
+    suite = optional_suite(
+        required_id(),
+        Parameter(name="h", location="header", required=True, schema=Schema(raw={"type": "integer"}), source_scope="operation"),
+    )
+
+    assert [(case.category, case.violated_constraint) for case in suite.cases] == [
+        ("positive", None), ("negative", "required_parameter"), ("negative", "required_parameter"),
+    ]
+    assert [(item.name, item.value) for item in suite.cases[0].parameters] == [("id", "sentinel"), ("h", 0)]
+    assert suite.diagnostics == ()
+
+
+def test_optional_parameter_does_not_change_body_negative_cases() -> None:
+    body = {"type": "object", "required": ["a"], "properties": {"a": {"type": "string"}}}
+    with_optional = generate_test_suite(
+        make_result(make_endpoint("/items", "post", parameters=(optional_parameter({"type": "object"}),), request_body=body_with_schema(body)))
+    )
+    without = generate_test_suite(
+        make_result(make_endpoint("/items", "post", request_body=body_with_schema(body)))
+    )
+
+    assert with_optional.cases == without.cases
+    assert [item.code for item in with_optional.diagnostics] == [OPTIONAL_CODE] + [
+        item.code for item in without.diagnostics
+    ]
+
+
+def test_referenced_optional_parameter_with_unsupported_schema_points_at_the_component() -> None:
+    suite = optional_suite(
+        required_id(),
+        parameter_reference("Tags"),
+        parameter_components={"Tags": optional_parameter({"type": "array", "items": {}}, name="tags")},
+    )
+
+    assert_endpoint_generated_without(suite, "tags")
+    assert [(item.code, item.source_pointer) for item in suite.diagnostics] == [
+        (OPTIONAL_CODE, "/components/parameters/Tags/schema")
+    ]
+    assert "parameter 'tags'" in suite.diagnostics[0].message
+
+
+@pytest.mark.parametrize(
+    "uri", ["#/components/parameters/Missing", "#/components/schemas/Tags", "#/components/parameters/a/b"]
+)
+def test_unresolved_parameter_reference_is_not_treated_as_a_safe_optional_parameter(uri: str) -> None:
+    reference = ParameterReference(reference=LocalReference(uri=uri), source_scope="operation")
+
+    suite = optional_suite(required_id(), reference)
+
+    assert suite.cases == ()
+    assert [item.code for item in suite.diagnostics] == ["unsupported_parameter_reference"]
+
+
+def test_parameter_reference_cycle_still_skips_the_endpoint() -> None:
+    suite = optional_suite(
+        required_id(),
+        parameter_reference("A"),
+        parameter_components={"A": parameter_reference("A")},
+    )
+
+    assert suite.cases == ()
+    assert [item.code for item in suite.diagnostics] == ["unsupported_parameter_reference"]
+
+
+def test_optional_unsupported_parameter_diagnostics_respect_the_diagnostic_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_DIAGNOSTICS", 2)
+
+    suite = optional_suite(
+        required_id(), *(optional_parameter({"type": "object"}, name=f"p{i}") for i in range(4))
+    )
+
+    assert [case.category for case in suite.cases] == ["positive", "negative"]
+    assert [item.code for item in suite.diagnostics][:2] == [OPTIONAL_CODE, OPTIONAL_CODE]
+    assert [item.source_pointer for item in suite.diagnostics][:2] == [
+        f"{OPTIONAL_PARAMETER_BASE}/1/schema", f"{OPTIONAL_PARAMETER_BASE}/2/schema"
+    ]
+    assert len(suite.diagnostics) == 3
+
+
+def test_optional_unsupported_parameter_generation_is_deterministic_and_keeps_the_input() -> None:
+    endpoint = make_endpoint(
+        "/items",
+        parameters=(
+            required_id(),
+            optional_parameter({"type": "array", "items": {}}, name="a"),
+            optional_parameter({"type": "string", "format": "hostname"}, "header", name="b"),
+        ),
+    )
+    result = make_result(endpoint)
+    before = result.model_dump_json()
+
+    first = generate_test_suite(result)
+    second = generate_test_suite(result)
+
+    assert first.model_dump_json() == second.model_dump_json()
+    assert result.model_dump_json() == before
+    assert len(first.diagnostics) == 2

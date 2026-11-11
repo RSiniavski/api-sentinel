@@ -321,7 +321,9 @@ def _generate_suite(result: NormalizationResult, budget: _GenerationBudget) -> G
                 budget, lambda: _generate_endpoint(endpoint, result.api)
             )
             if exhausted is None:
+                positive, optional_diagnostics = positive
                 cases.append(positive)
+                diagnostics.extend(budget.admit(optional_diagnostics))
                 for step_name, step in _negative_steps(endpoint, positive, result.api):
                     try:
                         step_result, exhausted = _run_step(budget, step)
@@ -2329,9 +2331,59 @@ def _resolve_parameter(
     return current, declaration, tuple(followed)
 
 
-def _generate_endpoint(endpoint: Endpoint, api: ApiModel) -> GeneratedTestCase:
+def _optional_parameter_issue(
+    entry: Parameter, declaration: str, api: ApiModel
+) -> _UnsupportedOperation | None:
+    """Why an omitted optional parameter's schema is unsupported, or None.
+
+    Only the schema form and keywords are inspected. No value or example is
+    generated, because the parameter is omitted from every generated request.
+    """
+    try:
+        if entry.schema is None or entry.content is not None:
+            raise _UnsupportedOperation(
+                "unsupported_parameter_schema",
+                "A direct primitive parameter schema is required.",
+                declaration,
+            )
+        raw, resolved_pointer, _ = _follow_schema_reference(
+            entry.schema.raw, _child(declaration, "schema")
+        )
+        if not _is_primitive_schema(raw, api.openapi_version, resolved_pointer):
+            raise _UnsupportedOperation(
+                "unsupported_parameter_schema",
+                "This stage supports direct primitive parameter schemas only.",
+                resolved_pointer,
+                _reference_uri(raw),
+            )
+        _check_schema(raw, api.openapi_version, resolved_pointer, "request", 0)
+    except _UnsupportedOperation as issue:
+        return issue
+    return None
+
+
+def _optional_parameter_diagnostic(
+    entry: Parameter, issue: _UnsupportedOperation, endpoint: Endpoint
+) -> GenerationDiagnostic:
+    return GenerationDiagnostic(
+        code="optional_parameter_unsupported_schema",
+        message=(
+            f"Optional {entry.location} parameter '{entry.name}' was omitted because "
+            f"its schema is unsupported: {issue} Endpoint generation continued."
+        ),
+        endpoint_path=endpoint.path,
+        endpoint_method=endpoint.method,
+        source_pointer=issue.pointer,
+        reference_uri=issue.reference_uri,
+    )
+
+
+def _generate_endpoint(
+    endpoint: Endpoint, api: ApiModel
+) -> tuple[GeneratedTestCase, tuple[GenerationDiagnostic, ...]]:
     root = _endpoint_pointer(endpoint)
     parameters: list[GeneratedParameterValue] = []
+    optional_diagnostics: list[GenerationDiagnostic] = []
     path_names: set[str] = set()
 
     for index, endpoint_entry in enumerate(endpoint.parameters):
@@ -2341,6 +2393,12 @@ def _generate_endpoint(endpoint: Endpoint, api: ApiModel) -> GeneratedTestCase:
                 "unsupported_parameter", "Unsupported parameter entry.", pointer
             )
         entry, declaration, followed = _resolve_parameter(endpoint_entry, api, pointer)
+        if not entry.required and entry.location != "path":
+            # Omitted by default: report an unsupported schema, but do not skip.
+            issue = _optional_parameter_issue(entry, declaration, api)
+            if issue is not None:
+                optional_diagnostics.append(_optional_parameter_diagnostic(entry, issue, endpoint))
+            continue
         if entry.schema is None or entry.content is not None:
             raise _UnsupportedOperation(
                 "unsupported_parameter_schema",
@@ -2366,28 +2424,27 @@ def _generate_endpoint(endpoint: Endpoint, api: ApiModel) -> GeneratedTestCase:
             resolved_pointer,
             direction="request",
         )
-        if entry.required or entry.location == "path":
-            parameters.append(
-                GeneratedParameterValue(
-                    name=entry.name,
-                    location=entry.location,
-                    value=deepcopy(value),
-                    provenance=tuple(
-                        dict.fromkeys(
-                            (
-                                pointer,
-                                *followed,
-                                schema_pointer,
-                                *schema_followed,
-                                resolved_pointer,
-                                candidate_pointer,
-                            )
+        parameters.append(
+            GeneratedParameterValue(
+                name=entry.name,
+                location=entry.location,
+                value=deepcopy(value),
+                provenance=tuple(
+                    dict.fromkeys(
+                        (
+                            pointer,
+                            *followed,
+                            schema_pointer,
+                            *schema_followed,
+                            resolved_pointer,
+                            candidate_pointer,
                         )
-                    ),
-                )
+                    )
+                ),
             )
-            if entry.location == "path":
-                path_names.add(entry.name)
+        )
+        if entry.location == "path":
+            path_names.add(entry.name)
 
     _check_path_placeholders(endpoint.path, path_names, _child(root, "parameters"))
     body, body_provenance = _generate_body(endpoint, api, root)
@@ -2395,7 +2452,7 @@ def _generate_endpoint(endpoint: Endpoint, api: ApiModel) -> GeneratedTestCase:
     security = endpoint.security if endpoint.security is not None else api.security
     _check_security_schemes(endpoint, api, root)
 
-    return _counted_case(
+    case = _counted_case(
         case_id=build_case_id("positive", endpoint.path, endpoint.method, "baseline"),
         category="positive",
         path=endpoint.path,
@@ -2406,6 +2463,7 @@ def _generate_endpoint(endpoint: Endpoint, api: ApiModel) -> GeneratedTestCase:
         response_expectations=expectations,
         provenance=(root, *body_provenance),
     )
+    return case, tuple(optional_diagnostics)
 
 
 _REQUEST_BODY_REFERENCE_PREFIX = "#/components/requestBodies/"
