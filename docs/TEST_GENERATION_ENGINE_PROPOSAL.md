@@ -192,7 +192,7 @@ The suite should preserve operation and variant order deterministically. `case_i
 3. Required body/property cases: *Implemented* for a required request body and for required writable object properties. An optional request body gets no omission case.
 4. Primitive type cases: *Implemented* (`violated_constraint` is `type`).
 5. Enum/const cases: *Implemented*.
-6. Boundary cases: *Partial* (invalid violations only, as noted above): numeric bounds, string length and array size (`minItems`/`maxItems`), plus `uniqueItems` duplicates (one case with an array of equal independent copies of one valid item; no distinct item values are generated). Array cases cover only arrays already present in the positive body; array elements and nested arrays are *Planned*.
+6. Boundary cases: *Partial* (invalid violations only, as noted above): numeric bounds, string length and array size (`minItems`/`maxItems`), plus `uniqueItems` duplicates (one case with an array of equal independent copies of one valid item; no distinct item values are generated). Array cases cover a root-level request body array and array properties of request body objects, only when the array is already present in the positive body; array elements and nested arrays are *Planned*.
 7. Response expectations: *Partial* (no headers or links).
 
 For the MVP, one baseline and a bounded, explicit set of negative variants are preferable to a Cartesian product of every parameter, property, enum value, auth alternative, body media type and boundary. A documented cap prevents combinatorial growth. Any cap is deterministic, with a stable truncation diagnostic.
