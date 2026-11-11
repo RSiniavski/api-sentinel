@@ -1139,3 +1139,273 @@ def test_path_parameter_error_is_deterministic_and_does_not_mutate_the_input() -
     assert len(set(messages)) == 1
     assert messages[0].endswith("operation GET /items: 'b', 'a'.")
     assert json.dumps(document, sort_keys=True) == before
+
+
+# --- Step 8.11: header parameter names are case-insensitive for identity ---
+
+
+def header_parameter(name: str, **extra: object) -> dict[str, object]:
+    return {"name": name, "in": "header", "required": True, "schema": {"type": "string"}, **extra}
+
+
+def effective_parameters(document: dict[str, object]) -> list[tuple[str, str, str]]:
+    endpoint = normalize_openapi_document(document).api.endpoints[0]
+    return [(p.name, p.location, p.source_scope) for p in endpoint.parameters]  # type: ignore[union-attr]
+
+
+@pytest.mark.parametrize("scope", ["path", "operation"])
+@pytest.mark.parametrize(("first", "second"), [("X-Token", "x-token"), ("x-token", "X-TOKEN")])
+def test_case_differing_header_duplicates_are_rejected_in_each_scope(
+    scope: str, first: str, second: str
+) -> None:
+    parameters = [header_parameter(first), header_parameter(second)]
+    document = path_document(
+        "/items",
+        path_parameters=parameters if scope == "path" else None,
+        operation_parameters=parameters if scope == "operation" else None,
+    )
+
+    with pytest.raises(OpenAPINormalizationError) as error:
+        normalize_openapi_document(document)
+
+    assert str(error.value) == (
+        f"Duplicate header parameters '{first}' and '{second}' at operation GET /items."
+    )
+
+
+def test_case_differing_header_duplicates_through_references_report_the_declared_names() -> None:
+    document = path_document(
+        "/items",
+        operation_parameters=[
+            {"$ref": "#/components/parameters/Alias"},
+            header_parameter("x-token"),
+        ],
+        components={
+            "Alias": {"$ref": "#/components/parameters/Token"},
+            "Token": header_parameter("X-Token"),
+        },
+    )
+
+    with pytest.raises(OpenAPINormalizationError, match="Duplicate header parameters 'X-Token' and 'x-token' at operation GET /items."):
+        normalize_openapi_document(document)
+
+
+def test_identical_header_duplicates_keep_the_existing_message() -> None:
+    document = path_document(
+        "/items", operation_parameters=[header_parameter("X-Token"), header_parameter("X-Token")]
+    )
+
+    with pytest.raises(OpenAPINormalizationError) as error:
+        normalize_openapi_document(document)
+
+    assert str(error.value) == "Duplicate Operation parameter ('X-Token', 'header') at operation GET /items."
+
+
+@pytest.mark.parametrize(("path_name", "operation_name"), [("X-Token", "x-token"), ("x-token", "X-Token")])
+def test_case_differing_operation_header_overrides_the_path_level_one(
+    path_name: str, operation_name: str
+) -> None:
+    document = path_document(
+        "/items",
+        path_parameters=[header_parameter(path_name, schema={"type": "string"}, example="path")],
+        operation_parameters=[
+            header_parameter(
+                operation_name, required=False, schema={"type": "integer"}, example=7,
+                description="operation wins",
+            )
+        ],
+    )
+
+    result = normalize_openapi_document(document)
+
+    [parameter] = result.api.endpoints[0].parameters
+    assert isinstance(parameter, Parameter)
+    assert (parameter.name, parameter.source_scope) == (operation_name, "operation")
+    assert (parameter.required, parameter.schema.raw, parameter.example, parameter.description) == (  # type: ignore[union-attr]
+        False, {"type": "integer"}, 7, "operation wins",
+    )
+    [diagnostic] = result.diagnostics
+    assert diagnostic.code == "parameter_overridden"
+    assert (diagnostic.path, diagnostic.parameter_name, diagnostic.parameter_location) == ("/items", path_name, "header")
+    assert (diagnostic.original_source_scope, diagnostic.overriding_source_scope) == ("path", "operation")
+
+
+@pytest.mark.parametrize(("path_required", "operation_required"), [(True, False), (False, True)])
+def test_header_override_replaces_the_required_flag_in_both_directions(
+    path_required: bool, operation_required: bool
+) -> None:
+    document = path_document(
+        "/items",
+        path_parameters=[header_parameter("X-Token", required=path_required)],
+        operation_parameters=[header_parameter("x-token", required=operation_required)],
+    )
+
+    [parameter] = normalize_openapi_document(document).api.endpoints[0].parameters
+
+    assert parameter.required is operation_required  # type: ignore[union-attr]
+
+
+def test_header_override_keeps_the_path_level_position() -> None:
+    document = path_document(
+        "/items",
+        path_parameters=[
+            {"name": "first", "in": "query", "schema": {"type": "string"}},
+            header_parameter("X-Token"),
+            {"name": "last", "in": "cookie", "schema": {"type": "string"}},
+        ],
+        operation_parameters=[
+            header_parameter("x-token"),
+            {"name": "extra", "in": "query", "schema": {"type": "string"}},
+        ],
+    )
+
+    assert effective_parameters(document) == [
+        ("first", "query", "path"), ("x-token", "header", "operation"),
+        ("last", "cookie", "path"), ("extra", "query", "operation"),
+    ]
+    assert len(normalize_openapi_document(document).diagnostics) == 1
+
+
+def test_header_override_with_references_on_either_side_records_reference_uris() -> None:
+    components = {
+        "Token": header_parameter("X-Token"),
+        "Alias": {"$ref": "#/components/parameters/Token"},
+        "Alias2": {"$ref": "#/components/parameters/Alias"},
+        "Lower": header_parameter("x-token", required=False),
+    }
+    cases = {
+        "inline path, reference operation": (
+            [header_parameter("x-token")], [{"$ref": "#/components/parameters/Token"}], None,
+            "#/components/parameters/Token",
+        ),
+        "reference path, inline operation": (
+            [{"$ref": "#/components/parameters/Alias2"}], [header_parameter("x-token")],
+            "#/components/parameters/Alias2", None,
+        ),
+        "reference both": (
+            [{"$ref": "#/components/parameters/Token"}], [{"$ref": "#/components/parameters/Lower"}],
+            "#/components/parameters/Token", "#/components/parameters/Lower",
+        ),
+    }
+
+    for label, (path_level, operation_level, original, overriding) in cases.items():
+        document = path_document(
+            "/items", path_parameters=path_level, operation_parameters=operation_level,
+            components=components,
+        )
+        result = normalize_openapi_document(document)
+        assert len(result.api.endpoints[0].parameters) == 1, label
+        [diagnostic] = result.diagnostics
+        assert (diagnostic.original_reference_uri, diagnostic.overriding_reference_uri) == (original, overriding), label
+        assert diagnostic.parameter_name in {"X-Token", "x-token"}, label
+
+
+def test_reference_override_reports_the_path_level_declared_spelling() -> None:
+    document = path_document(
+        "/items",
+        path_parameters=[{"$ref": "#/components/parameters/Token"}],
+        operation_parameters=[header_parameter("x-token")],
+        components={"Token": header_parameter("X-Token")},
+    )
+
+    [diagnostic] = normalize_openapi_document(document).diagnostics
+
+    assert diagnostic.parameter_name == "X-Token"
+
+
+@pytest.mark.parametrize("location", ["query", "cookie"])
+def test_query_and_cookie_names_stay_case_sensitive(location: str) -> None:
+    parameters = [
+        {"name": "q", "in": location, "schema": {"type": "string"}},
+        {"name": "Q", "in": location, "schema": {"type": "string"}},
+    ]
+    same_level = path_document("/items", operation_parameters=parameters)
+    across_levels = path_document(
+        "/items", path_parameters=parameters[:1], operation_parameters=parameters[1:]
+    )
+
+    assert [name for name, _, _ in effective_parameters(same_level)] == ["q", "Q"]
+    assert [name for name, _, _ in effective_parameters(across_levels)] == ["q", "Q"]
+    assert normalize_openapi_document(across_levels).diagnostics == ()
+
+
+def test_path_parameter_names_stay_case_sensitive() -> None:
+    document = path_document(
+        "/items/{id}/{ID}",
+        path_parameters=[path_parameter("id")],
+        operation_parameters=[path_parameter("ID")],
+    )
+
+    result = normalize_openapi_document(document)
+
+    assert [(p.name, p.source_scope) for p in result.api.endpoints[0].parameters] == [  # type: ignore[union-attr]
+        ("id", "path"), ("ID", "operation")
+    ]
+    assert result.diagnostics == ()
+
+
+def test_same_name_in_different_locations_stays_distinct() -> None:
+    document = path_document(
+        "/items",
+        path_parameters=[header_parameter("X-Token")],
+        operation_parameters=[
+            {"name": "x-token", "in": "query", "schema": {"type": "string"}},
+            {"name": "X-Token", "in": "cookie", "schema": {"type": "string"}},
+        ],
+    )
+
+    assert [(n, l) for n, l, _ in effective_parameters(document)] == [
+        ("X-Token", "header"), ("x-token", "query"), ("X-Token", "cookie")
+    ]
+    assert normalize_openapi_document(document).diagnostics == ()
+
+
+@pytest.mark.parametrize(
+    ("path_name", "operation_name"),
+    [("Accept", "accept"), ("authorization", "AUTHORIZATION"), ("Content-Type", "content-TYPE")],
+)
+def test_reserved_headers_overridden_across_casing_are_still_ignored_by_generation(
+    path_name: str, operation_name: str
+) -> None:
+    from app.services.test_generation.generator import generate_test_suite
+
+    document = path_document(
+        "/items",
+        path_parameters=[header_parameter(path_name)],
+        operation_parameters=[
+            header_parameter(operation_name, schema={"type": "array", "items": {}}),
+            {"name": "id", "in": "query", "required": True, "schema": {"type": "string"}},
+        ],
+    )
+
+    result = normalize_openapi_document(document)
+    suite = generate_test_suite(result)
+
+    assert len(result.api.endpoints[0].parameters) == 2
+    assert [(case.category, [(p.name, p.location) for p in case.parameters]) for case in suite.cases] == [
+        ("positive", [("id", "query")]), ("negative", []),
+    ]
+    assert [item.code for item in suite.diagnostics] == ["reserved_header_parameter_ignored"]
+
+
+def test_header_identity_results_and_errors_are_deterministic_and_do_not_mutate_the_input() -> None:
+    valid = path_document(
+        "/items",
+        path_parameters=[header_parameter("X-Token")],
+        operation_parameters=[header_parameter("x-token", required=False)],
+    )
+    invalid = path_document(
+        "/items", operation_parameters=[header_parameter("a-b"), header_parameter("A-B")]
+    )
+    snapshots = (json.dumps(valid, sort_keys=True), json.dumps(invalid, sort_keys=True))
+
+    outputs = {normalize_openapi_document(valid).model_dump_json() for _ in range(3)}
+    messages = set()
+    for _ in range(3):
+        with pytest.raises(OpenAPINormalizationError) as error:
+            normalize_openapi_document(invalid)
+        messages.add(str(error.value))
+
+    assert len(outputs) == 1
+    assert messages == {"Duplicate header parameters 'a-b' and 'A-B' at operation GET /items."}
+    assert (json.dumps(valid, sort_keys=True), json.dumps(invalid, sort_keys=True)) == snapshots

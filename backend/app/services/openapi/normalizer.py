@@ -290,7 +290,20 @@ def _parameter_identity(
     components: Components,
     context: str,
 ) -> tuple[str, str]:
-    """Inspect a component parameter's identity without expanding its reference edge."""
+    """Identity of a parameter: location plus name, folded for header names.
+
+    HTTP header field names are case-insensitive; other names are case sensitive.
+    """
+    name, location = _declared_parameter(entry, components, context)
+    return (name.lower() if location == "header" else name), location
+
+
+def _declared_parameter(
+    entry: ParameterEntry,
+    components: Components,
+    context: str,
+) -> tuple[str, str]:
+    """Inspect a component parameter's declared name and location without expanding its reference edge."""
     visited: set[str] = set()
     current: ParameterEntry = entry
     while isinstance(current, ParameterReference):
@@ -384,6 +397,19 @@ def _parameter_reference_uri(entry: ParameterEntry) -> str | None:
     return None
 
 
+def _duplicate_parameter_error(
+    scope: str,
+    first: tuple[str, str],
+    second: tuple[str, str],
+    context: str,
+) -> OpenAPINormalizationError:
+    if first != second:
+        return OpenAPINormalizationError(
+            f"Duplicate header parameters {first[0]!r} and {second[0]!r} at {context}."
+        )
+    return OpenAPINormalizationError(f"Duplicate {scope} parameter {first!r} at {context}.")
+
+
 def _merge_parameters(
     path_parameters: tuple[ParameterEntry, ...],
     operation_parameters: tuple[ParameterEntry, ...],
@@ -394,23 +420,27 @@ def _merge_parameters(
     context = f"operation {method.upper()} {path}"
     effective = list(path_parameters)
     index_by_identity: dict[tuple[str, str], int] = {}
+    declared_by_identity: dict[tuple[str, str], tuple[str, str]] = {}
     for index, entry in enumerate(path_parameters):
+        declared = _declared_parameter(entry, components, context)
         identity = _parameter_identity(entry, components, context)
         if identity in index_by_identity:
-            raise OpenAPINormalizationError(
-                f"Duplicate Path Item parameter {identity!r} at {context}."
+            raise _duplicate_parameter_error(
+                "Path Item", declared_by_identity[identity], declared, context
             )
         index_by_identity[identity] = index
+        declared_by_identity[identity] = declared
 
     diagnostics: list[ParameterOverrideDiagnostic] = []
-    operation_identities: set[tuple[str, str]] = set()
+    operation_declared: dict[tuple[str, str], tuple[str, str]] = {}
     for entry in operation_parameters:
+        declared = _declared_parameter(entry, components, context)
         identity = _parameter_identity(entry, components, context)
-        if identity in operation_identities:
-            raise OpenAPINormalizationError(
-                f"Duplicate Operation parameter {identity!r} at {context}."
+        if identity in operation_declared:
+            raise _duplicate_parameter_error(
+                "Operation", operation_declared[identity], declared, context
             )
-        operation_identities.add(identity)
+        operation_declared[identity] = declared
         existing_index = index_by_identity.get(identity)
         if existing_index is None:
             index_by_identity[identity] = len(effective)
@@ -422,7 +452,7 @@ def _merge_parameters(
         diagnostics.append(
             ParameterOverrideDiagnostic(
                 path=path,
-                parameter_name=identity[0],
+                parameter_name=declared_by_identity[identity][0],
                 parameter_location=identity[1],  # type: ignore[arg-type]
                 original_source_scope="path",
                 overriding_source_scope="operation",
