@@ -8769,3 +8769,266 @@ def test_reserved_header_generation_is_deterministic_and_keeps_the_input() -> No
     assert first.model_dump_json() == second.model_dump_json()
     assert result.model_dump_json() == before
     assert [item.code for item in first.diagnostics] == [RESERVED_CODE, RESERVED_CODE]
+
+
+# --- Step 8.13: unusable example candidates are skipped, not fatal ---
+
+EXAMPLE_REF = LocalReference(uri="#/components/examples/Shared")
+UNUSABLE_EXAMPLES: dict[str, object] = {
+    "reference": EXAMPLE_REF,
+    "external": {"externalValue": "https://example.invalid/value.txt"},
+    "no-value": {"summary": "no value here"},
+}
+UNUSABLE_CODES = {
+    "reference": "unsupported_example_reference",
+    "external": "unsupported_example_value",
+    "no-value": "unsupported_example_value",
+}
+KINDS = ["parameter", "body"]
+
+
+def example_suite(
+    kind: str,
+    schema: dict[str, object],
+    *,
+    example: object = None,
+    examples: dict[str, object] | None = None,
+) -> GeneratedTestSuite:
+    if kind == "parameter":
+        endpoint = make_endpoint(
+            "/items",
+            parameters=(
+                Parameter(
+                    name="q", location="query", required=True, schema=Schema(raw=schema),
+                    example=example, examples=examples or {}, source_scope="operation",  # type: ignore[arg-type]
+                ),
+            ),
+        )
+    else:
+        endpoint = make_endpoint(
+            "/items",
+            "post",
+            request_body=RequestBody(
+                required=True,
+                content={
+                    "application/json": MediaType(
+                        schema=Schema(raw=schema), example=example, examples=examples or {}  # type: ignore[arg-type]
+                    )
+                },
+            ),
+        )
+    return generate_test_suite(make_result(endpoint))
+
+
+def example_result(suite: GeneratedTestSuite, kind: str) -> tuple[object, str]:
+    """The generated value and the candidate pointer it came from."""
+    positive = suite.cases[0]
+    if kind == "parameter":
+        return positive.parameters[0].value, positive.parameters[0].provenance[-1]
+    assert positive.request_body is not None
+    return positive.request_body.value, positive.provenance[-1]
+
+
+@pytest.mark.parametrize("kind", KINDS)
+@pytest.mark.parametrize("unusable", sorted(UNUSABLE_EXAMPLES))
+def test_unusable_example_before_a_valid_inline_example_is_skipped(kind: str, unusable: str) -> None:
+    suite = example_suite(
+        kind, {"type": "string"}, examples={"a": UNUSABLE_EXAMPLES[unusable], "b": {"value": "B"}}
+    )
+
+    value, pointer = example_result(suite, kind)
+    assert value == "B"
+    assert pointer.endswith("/examples/b/value")
+    assert suite.diagnostics == ()
+
+
+@pytest.mark.parametrize("kind", KINDS)
+@pytest.mark.parametrize("unusable", sorted(UNUSABLE_EXAMPLES))
+def test_unusable_example_after_a_valid_inline_example_does_not_block_it(kind: str, unusable: str) -> None:
+    suite = example_suite(
+        kind, {"type": "string"}, examples={"a": {"value": "A"}, "b": UNUSABLE_EXAMPLES[unusable]}
+    )
+
+    value, pointer = example_result(suite, kind)
+    assert (value, suite.diagnostics) == ("A", ())
+    assert pointer.endswith("/examples/a/value")
+
+
+@pytest.mark.parametrize("kind", KINDS)
+def test_unusable_examples_fall_back_to_a_valid_schema_candidate(kind: str) -> None:
+    examples = dict(UNUSABLE_EXAMPLES)
+    by_schema_example = example_suite(
+        kind, {"type": "string", "example": "SCHEMA", "default": "DEFAULT"}, examples=examples
+    )
+    by_schema_examples = example_suite(
+        kind, {"type": "string", "examples": ["FROM-LIST"], "default": "DEFAULT"}, examples=examples
+    )
+    by_default = example_suite(kind, {"type": "string", "default": "DEFAULT"}, examples=examples)
+    by_enum = example_suite(kind, {"type": "string", "enum": ["E1", "E2"]}, examples=examples)
+
+    assert example_result(by_schema_example, kind)[0] == "SCHEMA"
+    assert example_result(by_schema_example, kind)[1].endswith("/example")
+    assert example_result(by_schema_examples, kind)[0] == "FROM-LIST"
+    assert example_result(by_default, kind)[0] == "DEFAULT"
+    assert example_result(by_default, kind)[1].endswith("/default")
+    assert example_result(by_enum, kind)[0] == "E1"
+    for suite in (by_schema_example, by_schema_examples, by_default, by_enum):
+        assert suite.diagnostics == ()
+
+
+@pytest.mark.parametrize("kind", KINDS)
+def test_unusable_examples_fall_back_to_the_fixed_fallback_without_a_diagnostic(kind: str) -> None:
+    suite = example_suite(kind, {"type": "integer"}, examples=dict(UNUSABLE_EXAMPLES))
+
+    value, pointer = example_result(suite, kind)
+    assert value == 0
+    assert pointer.endswith("/schema")
+    assert suite.diagnostics == ()
+
+
+@pytest.mark.parametrize("kind", KINDS)
+@pytest.mark.parametrize(
+    "schema",
+    [
+        {"type": "string", "minLength": 5, "maxLength": 2},
+        {"type": "string", "enum": ["abc"], "maxLength": 1},
+    ],
+)
+def test_all_candidates_unusable_keeps_the_original_example_diagnostic(
+    kind: str, schema: dict[str, object]
+) -> None:
+    suite = example_suite(
+        kind, schema, examples={"b": UNUSABLE_EXAMPLES["external"], "a": EXAMPLE_REF}
+    )
+
+    assert suite.cases == ()
+    [diagnostic] = suite.diagnostics
+    # Sorted by name, so "a" (the reference) is the first unusable example.
+    assert diagnostic.code == "unsupported_example_reference"
+    assert diagnostic.reference_uri == "#/components/examples/Shared"
+    assert diagnostic.source_pointer.endswith("/examples/a")  # type: ignore[union-attr]
+
+
+@pytest.mark.parametrize("kind", KINDS)
+@pytest.mark.parametrize("unusable", sorted(UNUSABLE_EXAMPLES))
+def test_each_unusable_example_form_keeps_its_own_diagnostic_when_nothing_is_usable(
+    kind: str, unusable: str
+) -> None:
+    suite = example_suite(
+        kind, {"type": "string", "minLength": 5, "maxLength": 2}, examples={"x": UNUSABLE_EXAMPLES[unusable]}
+    )
+
+    assert suite.cases == ()
+    assert [(item.code, item.source_pointer.rsplit("/", 2)[-2:]) for item in suite.diagnostics] == [  # type: ignore[union-attr]
+        (UNUSABLE_CODES[unusable], ["examples", "x"])
+    ]
+
+
+@pytest.mark.parametrize("kind", KINDS)
+def test_all_candidates_invalid_without_an_unusable_example_keeps_the_schema_diagnostic(kind: str) -> None:
+    suite = example_suite(
+        kind, {"type": "string", "minLength": 5, "maxLength": 2}, examples={"a": {"value": "ok"}}
+    )
+
+    assert suite.cases == ()
+    assert [item.code for item in suite.diagnostics] == ["no_positive_schema_value"]
+
+
+@pytest.mark.parametrize("kind", KINDS)
+def test_several_unusable_examples_are_skipped_in_sorted_name_order(kind: str) -> None:
+    suite = example_suite(
+        kind,
+        {"type": "string"},
+        examples={
+            "d": {"value": "D"}, "c": EXAMPLE_REF, "b": {"value": "B"},
+            "a": UNUSABLE_EXAMPLES["no-value"], "e": UNUSABLE_EXAMPLES["external"],
+        },
+    )
+
+    assert example_result(suite, kind)[0] == "B"
+    assert suite.diagnostics == ()
+
+
+@pytest.mark.parametrize("kind", KINDS)
+def test_example_precedence_is_unchanged_around_unusable_examples(kind: str) -> None:
+    schema = {"type": "string", "example": "SCHEMA", "default": "DEFAULT"}
+    with_example = example_suite(kind, schema, example="ONE", examples={"a": EXAMPLE_REF, "b": {"value": "TWO"}})
+    invalid_example = example_suite(kind, schema, example=5, examples={"a": EXAMPLE_REF, "b": {"value": "TWO"}})
+    const = example_suite(
+        kind, {"type": "string", "const": "FIXED"}, example="ONE", examples={"a": EXAMPLE_REF}
+    )
+
+    assert example_result(with_example, kind)[0] == "ONE"
+    assert example_result(invalid_example, kind)[0] == "TWO"
+    assert example_result(const, kind)[0] == "FIXED"
+
+
+@pytest.mark.parametrize("kind", KINDS)
+def test_schema_validation_still_rejects_invalid_example_values(kind: str) -> None:
+    schema = {"type": "string", "maxLength": 3, "example": "ok"}
+    suite = example_suite(
+        kind, schema, example="too long", examples={"a": EXAMPLE_REF, "b": {"value": 7}, "c": {"value": "also too long"}}
+    )
+    only_invalid = example_suite(
+        kind, {"type": "string", "maxLength": 3}, examples={"a": EXAMPLE_REF, "b": {"value": "way too long"}}
+    )
+
+    assert example_result(suite, kind)[0] == "ok"
+    assert example_result(only_invalid, kind)[0] == "sen"  # the fixed fallback, cut to maxLength
+
+
+@pytest.mark.parametrize("kind", KINDS)
+def test_unusable_example_handling_is_deterministic_and_does_not_mutate_the_input(kind: str) -> None:
+    if kind == "parameter":
+        endpoint = make_endpoint(
+            "/items",
+            parameters=(
+                Parameter(
+                    name="q", location="query", required=True, schema=Schema(raw={"type": "string"}),
+                    examples={"a": EXAMPLE_REF, "b": {"value": "B"}, "c": UNUSABLE_EXAMPLES["external"]},  # type: ignore[arg-type]
+                    source_scope="operation",
+                ),
+            ),
+        )
+    else:
+        endpoint = make_endpoint(
+            "/items", "post",
+            request_body=RequestBody(
+                required=True,
+                content={"application/json": MediaType(
+                    schema=Schema(raw={"type": "string"}),
+                    examples={"a": EXAMPLE_REF, "b": {"value": "B"}, "c": UNUSABLE_EXAMPLES["external"]},  # type: ignore[arg-type]
+                )},
+            ),
+        )
+    result = make_result(endpoint)
+    before = result.model_dump_json()
+
+    first = generate_test_suite(result)
+    second = generate_test_suite(result)
+
+    assert first.model_dump_json() == second.model_dump_json()
+    assert result.model_dump_json() == before
+    assert example_result(first, kind)[0] == "B"
+    assert first.diagnostics == ()
+
+
+def test_unusable_examples_do_not_affect_other_parameters_or_the_diagnostic_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_DIAGNOSTICS", 1)
+    endpoint = make_endpoint(
+        "/items",
+        parameters=(
+            Parameter(name="a", location="query", required=True, schema=Schema(raw={"type": "string"}),
+                      examples={"x": EXAMPLE_REF}, source_scope="operation"),  # type: ignore[arg-type]
+            Parameter(name="b", location="header", required=True, schema=Schema(raw={"type": "integer"}),
+                      example=9, source_scope="operation"),
+        ),
+    )
+
+    suite = generate_test_suite(make_result(endpoint))
+
+    assert [(p.name, p.value) for p in suite.cases[0].parameters] == [("a", "sentinel"), ("b", 9)]
+    assert suite.diagnostics == ()
+    assert [case.category for case in suite.cases] == ["positive", "negative", "negative"]

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from contextvars import ContextVar
 from copy import deepcopy
 import math
@@ -2443,12 +2443,14 @@ def _generate_endpoint(
                 resolved_pointer,
                 _reference_uri(raw),
             )
+        examples, unusable_examples = _parameter_examples(entry, declaration)
         value, candidate_pointer = _select_value(
             raw,
             api.openapi_version,
-            _parameter_examples(entry, declaration),
+            examples,
             resolved_pointer,
             direction="request",
+            unusable=unusable_examples,
         )
         parameters.append(
             GeneratedParameterValue(
@@ -2578,12 +2580,14 @@ def _generate_body(
     schema_pointer = _child(media_pointer, "schema")
     raw = media.schema.raw if media.schema is not None else {}
     raw, resolved_pointer, schema_followed = _follow_schema_reference(raw, schema_pointer)
+    examples, unusable_examples = _media_examples(media, media_pointer)
     value, candidate_pointer = _select_value(
         raw,
         version,
-        _media_examples(media, media_pointer),
+        examples,
         resolved_pointer,
         direction="request",
+        unusable=unusable_examples,
     )
     return (
         GeneratedBody(media_type="application/json", value=deepcopy(value)),
@@ -2799,23 +2803,43 @@ def _resolve_security_scheme(name: str, api: ApiModel, pointer: str) -> Security
     )
 
 
-def _parameter_examples(parameter: Parameter, pointer: str) -> list[tuple[Any, str]]:
+def _parameter_examples(
+    parameter: Parameter, pointer: str
+) -> tuple[list[tuple[Any, str]], list[_UnsupportedOperation]]:
     candidates: list[tuple[Any, str]] = []
     # The current Normalizer collapses absent and explicit-null example fields.
     if parameter.example is not None:
         candidates.append((parameter.example, _child(pointer, "example")))
-    for name, example in sorted(parameter.examples.items()):
-        candidates.append(_example_value(example, _child(pointer, "examples", name)))
-    return candidates
+    unusable = _named_example_candidates(parameter.examples, pointer, candidates)
+    return candidates, unusable
 
 
-def _media_examples(media: MediaType, pointer: str) -> list[tuple[Any, str]]:
+def _media_examples(
+    media: MediaType, pointer: str
+) -> tuple[list[tuple[Any, str]], list[_UnsupportedOperation]]:
     candidates: list[tuple[Any, str]] = []
     if media.example is not None:
         candidates.append((media.example, _child(pointer, "example")))
-    for name, example in sorted(media.examples.items()):
-        candidates.append(_example_value(example, _child(pointer, "examples", name)))
-    return candidates
+    unusable = _named_example_candidates(media.examples, pointer, candidates)
+    return candidates, unusable
+
+
+def _named_example_candidates(
+    examples: dict[str, Any], pointer: str, candidates: list[tuple[Any, str]]
+) -> list[_UnsupportedOperation]:
+    """Append the usable named examples, by sorted name, and return the unusable ones.
+
+    An unusable example (an unresolved reference or no inline value) is skipped so
+    that later candidates are still considered; `_select_value` reports the first
+    one only when no candidate at all can be used.
+    """
+    unusable: list[_UnsupportedOperation] = []
+    for name, example in sorted(examples.items()):
+        try:
+            candidates.append(_example_value(example, _child(pointer, "examples", name)))
+        except _UnsupportedOperation as issue:
+            unusable.append(issue)
+    return unusable
 
 
 def _example_value(example: Any, pointer: str) -> tuple[Any, str]:
@@ -2923,6 +2947,7 @@ def _select_value(
     pointer: str,
     *,
     direction: str,
+    unusable: Sequence[_UnsupportedOperation] = (),
 ) -> tuple[Any, str]:
     raw, pointer, _ = _follow_schema_reference(raw, pointer)
     schema = _check_schema(raw, version, pointer, direction, 0)
@@ -2959,6 +2984,8 @@ def _select_value(
         if "const" in schema:
             break
 
+    if unusable and ("const" in schema or "enum" in schema):
+        raise unusable[0]
     if "const" in schema or "enum" in schema:
         raise _UnsupportedOperation(
             "no_positive_schema_value",
@@ -2968,6 +2995,8 @@ def _select_value(
     for value in _fallback_values(schema, version, pointer, direction):
         if _matches(schema, value, version, direction, 0):
             return value, pointer
+    if unusable:
+        raise unusable[0]
     raise _UnsupportedOperation(
         "no_positive_schema_value",
         "No deterministic fallback satisfies the supported schema constraints.",
