@@ -114,7 +114,7 @@ Implemented so far:
 
 Still planned:
 
-- Array bound cases for optional arrays, array elements and nested arrays.
+- Array bound cases for optional arrays inside absent parent objects, array elements and nested arrays.
 - Support for further schema keywords (for example `pattern`, formats beyond the closed set) and compositions.
 - Request media types other than `application/json`.
 - OAuth2 scope validation against declared flows and resolved scheme metadata in generated cases.
