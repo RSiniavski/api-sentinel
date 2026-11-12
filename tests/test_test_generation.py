@@ -5420,7 +5420,6 @@ def test_arrays_inside_nested_objects_are_covered() -> None:
 
 
 def test_out_of_scope_arrays_are_not_generated() -> None:
-    optional = array_suite({"type": "array", "minItems": 2, "items": ITEM_SCHEMA}, required=False)
     nested_array = generate_test_suite(
         make_result(
             post_endpoint(
@@ -5435,8 +5434,6 @@ def test_out_of_scope_arrays_are_not_generated() -> None:
         )
     )
 
-    assert array_cases(optional) == []
-    assert array_diagnostics(optional) == []
     assert array_summary(nested_array) == [("/tags", "minItems", 0)]
 
 
@@ -5958,7 +5955,6 @@ def test_unique_items_case_follows_the_existing_cases_of_its_property() -> None:
 
 
 def test_unique_items_out_of_scope_arrays_are_not_generated() -> None:
-    optional = array_suite({"type": "array", "uniqueItems": True, "items": ITEM_SCHEMA}, required=False)
     nested_array = array_suite(
         {
             "type": "array",
@@ -5984,7 +5980,6 @@ def test_unique_items_out_of_scope_arrays_are_not_generated() -> None:
         )
     )
 
-    assert array_cases(optional) == [] and array_diagnostics(optional) == []
     assert unique_cases(nested_array.cases) == [] and array_diagnostics(nested_array) == []
     assert [(case.affected_property, case.violated_constraint) for case in array_cases(nested_object)] == [
         ("/outer/tags", "uniqueItems")
@@ -9032,3 +9027,321 @@ def test_unusable_examples_do_not_affect_other_parameters_or_the_diagnostic_budg
     assert [(p.name, p.value) for p in suite.cases[0].parameters] == [("a", "sentinel"), ("b", 9)]
     assert suite.diagnostics == ()
     assert [case.category for case in suite.cases] == ["positive", "negative", "negative"]
+
+
+# --- Step 8.16: optional arrays absent from the positive body (parent present) ---
+
+TAGS_BASE = ARRAY_BODY_POINTER + "/properties/tags"
+
+
+def optional_body(properties: dict[str, object], required: tuple[str, ...] = ()) -> dict[str, object]:
+    return {"type": "object", "required": list(required), "properties": properties}
+
+
+def optional_array_suite(body: dict[str, object], schemas: dict[str, dict[str, object]] | None = None) -> GeneratedTestSuite:
+    endpoint = post_endpoint(body)
+    if schemas:
+        return generate_test_suite(make_result_with_schemas(endpoint, schemas))
+    return generate_test_suite(make_result(endpoint))
+
+
+def array_values(suite: GeneratedTestSuite) -> list[tuple[str | None, str | None, object]]:
+    return [
+        (case.affected_property, case.violated_constraint, case.request_body.value)  # type: ignore[union-attr]
+        for case in array_cases(suite)
+    ]
+
+
+@pytest.mark.parametrize(
+    ("schema", "constraint", "expected"),
+    [
+        ({"type": "array", "minItems": 2, "items": ITEM_SCHEMA}, "minItems", ["x"]),
+        ({"type": "array", "maxItems": 2, "items": ITEM_SCHEMA}, "maxItems", ["x", "x", "x"]),
+        ({"type": "array", "uniqueItems": True, "items": ITEM_SCHEMA}, "uniqueItems", ["x", "x"]),
+        ({"type": "array", "minItems": 1, "items": ITEM_SCHEMA}, "minItems", []),
+    ],
+)
+def test_optional_root_level_array_gets_a_boundary_case_added_to_the_baseline(
+    schema: dict[str, object], constraint: str, expected: list[object]
+) -> None:
+    suite = array_suite(schema, required=False)
+
+    assert suite.cases[0].request_body.value == {}  # type: ignore[union-attr]
+    assert array_values(suite) == [("/tags", constraint, {"tags": expected})]
+    case = array_cases(suite)[0]
+    assert case.category == "negative"
+    assert case.provenance[-3:] == (
+        tags_schema_pointer(), tags_schema_pointer(constraint), f"violated_constraint:{constraint}:/tags",
+    )
+    assert array_diagnostics(suite) == []
+
+
+def test_optional_array_keeps_the_other_required_properties_of_the_baseline() -> None:
+    body = optional_body(
+        {"id": {"type": "integer"}, "name": ITEM_SCHEMA, "tags": {"type": "array", "minItems": 1, "items": ITEM_SCHEMA}},
+        required=("id", "name"),
+    )
+
+    suite = optional_array_suite(body)
+
+    assert suite.cases[0].request_body.value == {"id": 0, "name": "x"}  # type: ignore[union-attr]
+    assert array_values(suite) == [("/tags", "minItems", {"id": 0, "name": "x", "tags": []})]
+
+
+def test_optional_array_combining_all_constraints_matches_the_same_required_array() -> None:
+    schema = {"type": "array", "minItems": 2, "maxItems": 3, "uniqueItems": True, "items": {"type": "integer"}}
+
+    optional = array_suite(schema, required=False)
+    required = array_suite(schema)
+
+    assert [(c, v["tags"]) for _, c, v in array_values(optional)] == [  # type: ignore[index]
+        (c, v["tags"]) for _, c, v in array_values(required)  # type: ignore[index]
+    ] == [("minItems", [0]), ("uniqueItems", [0, 0])]
+    assert array_diagnostics(optional) == array_diagnostics(required) == [
+        ("array_bound_no_safe_candidate", tags_schema_pointer("maxItems"))
+    ]
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [
+        {"type": "array", "maxItems": 2},
+        {"type": "array", "maxItems": 100, "items": ITEM_SCHEMA},
+        {"type": "string", "minItems": 1},
+        {"type": "array", "minItems": 3, "uniqueItems": True, "items": {"type": "integer"}},
+    ],
+)
+def test_optional_array_diagnostics_and_candidates_match_the_required_array(
+    schema: dict[str, object]
+) -> None:
+    optional = array_suite(schema, required=False)
+    required = array_suite(schema)
+
+    assert [(c, v["tags"]) for _, c, v in array_values(optional)] == [  # type: ignore[index]
+        (c, v["tags"]) for _, c, v in array_values(required)  # type: ignore[index]
+    ]
+    assert array_diagnostics(optional) == array_diagnostics(required)
+    assert [d.message for d in optional.diagnostics if d.code.startswith("array_bound_")] == [
+        d.message for d in required.diagnostics if d.code.startswith("array_bound_")
+    ]
+
+
+def test_optional_array_with_unsupported_items_reports_the_existing_diagnostic() -> None:
+    suite = array_suite(
+        {"type": "array", "minItems": 1, "maxItems": 2, "items": {"type": "string", "pattern": "^a$"}},
+        required=False,
+    )
+
+    assert array_values(suite) == [("/tags", "minItems", {"tags": []})]
+    assert array_diagnostics(suite) == [
+        ("array_bound_unsupported_schema", tags_schema_pointer("items", "pattern"))
+    ]
+
+
+def test_optional_array_inside_a_present_nested_object_is_added_to_that_object() -> None:
+    body = optional_body(
+        {
+            "outer": optional_body(
+                {
+                    "label": ITEM_SCHEMA,
+                    "inner": optional_body({"tags": {"type": "array", "minItems": 1, "items": ITEM_SCHEMA}}),
+                },
+                ("label", "inner"),
+            ),
+        },
+        ("outer",),
+    )
+
+    suite = optional_array_suite(body)
+
+    assert suite.cases[0].request_body.value == {"outer": {"label": "x", "inner": {}}}  # type: ignore[union-attr]
+    assert array_values(suite) == [
+        ("/outer/inner/tags", "minItems", {"outer": {"label": "x", "inner": {"tags": []}}})
+    ]
+
+
+def test_optional_array_inside_an_absent_parent_is_not_materialized() -> None:
+    absent_parent = optional_body(
+        {"a": ITEM_SCHEMA, "outer": optional_body({"tags": {"type": "array", "minItems": 1, "items": ITEM_SCHEMA}}, ("tags",))},
+        ("a",),
+    )
+    absent_optional_in_absent = optional_body(
+        {"outer": optional_body({"tags": {"type": "array", "maxItems": 1, "items": ITEM_SCHEMA}})}
+    )
+
+    for body in (absent_parent, absent_optional_in_absent):
+        suite = optional_array_suite(body)
+        assert array_cases(suite) == []
+        assert array_diagnostics(suite) == []
+        assert "outer" not in (suite.cases[0].request_body.value or {})  # type: ignore[union-attr]
+
+
+def test_optional_array_reached_through_a_property_reference() -> None:
+    body = optional_body({"a": ITEM_SCHEMA, "tags": {"$ref": "#/components/schemas/Tags"}}, ("a",))
+    schemas = {"Tags": {"type": "array", "minItems": 1, "maxItems": 2, "items": {"$ref": "#/components/schemas/Name"}}, "Name": ITEM_SCHEMA}
+
+    suite = optional_array_suite(body, schemas)
+
+    assert array_values(suite) == [
+        ("/tags", "minItems", {"a": "x", "tags": []}),
+        ("/tags", "maxItems", {"a": "x", "tags": ["x", "x", "x"]}),
+    ]
+    assert array_cases(suite)[0].provenance[-2] == "/components/schemas/Tags/minItems"
+    assert array_diagnostics(suite) == []
+
+
+@pytest.mark.parametrize("through_reference", [False, True])
+def test_optional_read_only_array_is_excluded_and_write_only_is_targeted(
+    through_reference: bool,
+) -> None:
+    read_only = {"type": "array", "minItems": 1, "items": ITEM_SCHEMA, "readOnly": True}
+    write_only = {"type": "array", "minItems": 1, "items": ITEM_SCHEMA, "writeOnly": True}
+    read_write = {"type": "array", "minItems": 1, "items": ITEM_SCHEMA, "readOnly": False}
+    schemas = {"RO": read_only, "WO": write_only, "RW": read_write}
+    pick = (lambda name, raw: {"$ref": f"#/components/schemas/{name}"}) if through_reference else (lambda name, raw: raw)
+    body = optional_body({"ro": pick("RO", read_only), "wo": pick("WO", write_only), "rw": pick("RW", read_write)})
+
+    suite = optional_array_suite(body, schemas if through_reference else None)
+
+    assert [(case.affected_property, case.request_body.value) for case in array_cases(suite)] == [  # type: ignore[union-attr]
+        ("/rw", {"rw": []}), ("/wo", {"wo": []}),
+    ]
+    assert array_diagnostics(suite) == []
+
+
+def test_unresolvable_optional_property_reference_does_not_add_diagnostics() -> None:
+    body = optional_body({"a": ITEM_SCHEMA, "ghost": {"$ref": "#/components/schemas/Missing"}}, ("a",))
+
+    suite = optional_array_suite(body, {"Other": ITEM_SCHEMA})
+
+    assert array_cases(suite) == []
+    assert array_diagnostics(suite) == []
+
+
+def test_optional_non_array_property_with_array_keywords_reports_the_existing_diagnostic() -> None:
+    suite = array_suite({"type": "string", "minItems": 1}, required=False)
+
+    assert array_cases(suite) == []
+    assert array_diagnostics(suite) == [
+        ("array_bound_non_array_type", tags_schema_pointer("minItems"))
+    ]
+
+
+def test_required_and_optional_arrays_are_ordered_by_property_name_and_required_cases_are_unchanged() -> None:
+    props = {
+        "c": {"type": "array", "minItems": 1, "items": ITEM_SCHEMA},
+        "b": {"type": "array", "minItems": 1, "items": ITEM_SCHEMA},
+        "a": {"type": "array", "minItems": 1, "items": ITEM_SCHEMA},
+    }
+    mixed = optional_array_suite(optional_body(props, ("b",)))
+    required_only = optional_array_suite(optional_body({"b": props["b"]}, ("b",)))
+
+    assert [(c.affected_property, c.request_body.value) for c in array_cases(mixed)] == [  # type: ignore[union-attr]
+        ("/a", {"b": ["x"], "a": []}), ("/b", {"b": []}), ("/c", {"b": ["x"], "c": []}),
+    ]
+    required_case = next(c for c in array_cases(mixed) if c.affected_property == "/b")
+    assert required_case == array_cases(required_only)[0]
+
+
+def test_positive_bodies_are_unchanged_and_negative_bodies_only_add_the_array() -> None:
+    body = optional_body(
+        {"id": {"type": "integer"}, "tags": {"type": "array", "minItems": 2, "maxItems": 3, "items": ITEM_SCHEMA}}, ("id",)
+    )
+    without = optional_array_suite(optional_body({"id": {"type": "integer"}}, ("id",)))
+
+    suite = optional_array_suite(body)
+
+    assert suite.cases[0] == without.cases[0]
+    positive = suite.cases[0].request_body.value  # type: ignore[union-attr]
+    assert positive == {"id": 0}
+    for case in array_cases(suite):
+        value = dict(case.request_body.value)  # type: ignore[union-attr, arg-type]
+        assert value.pop("tags") is not None
+        assert value == positive
+
+
+def test_optional_array_cases_are_deterministic_isolated_and_do_not_mutate_the_input() -> None:
+    enum = [{"a": [1]}, {"a": [2]}]
+    body = optional_body(
+        {"tags": {"type": "array", "minItems": 2, "uniqueItems": True, "items": {"enum": enum}}}
+    )
+    result = make_result(post_endpoint(body))
+    before = result.model_dump_json()
+
+    first = generate_test_suite(result)
+    second = generate_test_suite(result)
+
+    assert first.model_dump_json() == second.model_dump_json()
+    assert result.model_dump_json() == before
+    ids = [case.case_id for case in first.cases]
+    assert len(ids) == len(set(ids))
+    cases = array_cases(first)
+    assert [c.violated_constraint for c in cases] == ["minItems", "uniqueItems"]
+    min_items, unique = (c.request_body.value["tags"] for c in cases)  # type: ignore[union-attr, index]
+    assert (min_items, unique) == ([{"a": [1]}], [{"a": [1]}, {"a": [1]}])
+    min_items[0]["a"].append("mutated")
+    assert unique[0] == {"a": [1]} and unique[1] == {"a": [1]}
+    assert enum == [{"a": [1]}, {"a": [2]}]
+
+
+def test_case_budget_is_shared_by_required_and_optional_arrays(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = optional_body(
+        {
+            "r": {"type": "array", "minItems": 1, "items": ITEM_SCHEMA},
+            "o": {"type": "array", "minItems": 1, "maxItems": 2, "items": ITEM_SCHEMA},
+        },
+        ("r",),
+    )
+    reference = optional_array_suite(body)
+    array_total = len(array_cases(reference))
+    before_array = len(reference.cases) - array_total
+    assert array_total == 3
+
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_CASES", before_array + array_total)
+    fits = optional_array_suite(body)
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_CASES", before_array + array_total - 1)
+    overflows = optional_array_suite(body)
+
+    assert [c.affected_property for c in array_cases(fits)] == ["/o", "/o", "/r"]
+    assert array_cases(overflows) == []
+    assert overflows.cases == reference.cases[:before_array]
+    assert [d.code for d in overflows.diagnostics][-1] == "generation_case_budget_exceeded"
+    assert "'array_bounds'" in overflows.diagnostics[-1].message
+
+
+def test_optional_array_reached_through_a_reference_is_resolved_once_in_the_expansion_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def build(required: bool) -> NormalizationResult:
+        body = optional_body(
+            {"tags": {"$ref": "#/components/schemas/Tags"}}, ("tags",) if required else ()
+        )
+        return make_result_with_schemas(
+            post_endpoint(body),
+            {"Tags": {"type": "array", "minItems": 1, "items": ITEM_SCHEMA, "writeOnly": True}},
+        )
+
+    def array_step_hops(required: bool) -> int:
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(generator_module, "_array_bound_negative_cases", lambda *args: ((), ()))
+            without_step = count_expansions(build(required))
+        return count_expansions(build(required)) - without_step
+
+    # The present (required) property path resolves the reference exactly once.
+    assert array_step_hops(required=True) == 1
+    assert array_step_hops(required=False) == 1
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(generator_module, "_array_bound_negative_cases", lambda *args: ((), ()))
+        without_step = count_expansions(build(False))
+    # One extra expansion is enough for the optional array; a second resolution would exhaust it.
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_EXPANSIONS", without_step + 1)
+
+    suite = generate_test_suite(build(False))
+
+    assert [(c.affected_property, c.request_body.value) for c in array_cases(suite)] == [  # type: ignore[union-attr]
+        ("/tags", {"tags": []})
+    ]
+    assert "generation_expansion_budget_exceeded" not in {d.code for d in suite.diagnostics}

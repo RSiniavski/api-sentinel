@@ -1276,10 +1276,12 @@ class _ArrayItemUnavailable(Exception):
 def _array_bound_negative_cases(
     endpoint: Endpoint, positive: GeneratedTestCase, api: ApiModel
 ) -> tuple[tuple[GeneratedTestCase, ...], tuple[GenerationDiagnostic, ...]]:
-    """Generate minItems, maxItems and uniqueItems violations for arrays present in the body.
+    """Generate minItems, maxItems and uniqueItems violations for body arrays.
 
-    Only properties that already exist in the positive request body are
-    considered, and array elements are not traversed.
+    Targets are a root array, array properties present in the positive request
+    body, and optional (writable) array properties that are absent from it when
+    their parent object is present. Missing parents are not created, and array
+    elements are not traversed.
     """
     version = api.openapi_version
     resolved = _resolved_request_body(endpoint, api)
@@ -1475,9 +1477,22 @@ def _array_bound_negative_cases(
         if not isinstance(properties, dict):
             return
         for name in sorted(properties):
-            if name not in value:
-                continue
             child_pointer = _child(pointer, "properties", name)
+            if name not in value:
+                # An optional property absent from the positive body: its parent
+                # is present, so the array can be added. Reference problems are
+                # not reported here, because the property is not known to be an
+                # array. Nothing below an absent property is traversed.
+                absent = _follow_property_schema(
+                    properties[name], child_pointer, lambda issue: None
+                )
+                if (
+                    absent is not None
+                    and isinstance(absent[0], dict)
+                    and absent[0].get("readOnly") is not True
+                ):
+                    target_array(absent[0], absent[1], (*path, name))
+                continue
             followed_child = _follow_property_schema(
                 properties[name], child_pointer, report_issue
             )
