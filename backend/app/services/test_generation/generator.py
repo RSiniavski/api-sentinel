@@ -44,7 +44,7 @@ _SCHEMA_KEYS = {
     "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf",
     "minLength", "maxLength", "minItems", "maxItems", "uniqueItems",
     "properties", "required", "items", "readOnly", "writeOnly", "title",
-    "description", "deprecated", "format",
+    "description", "deprecated", "format", "additionalProperties",
 }
 _COMPOSITIONS = {"allOf", "oneOf", "anyOf", "not"}
 
@@ -1588,7 +1588,7 @@ def _array_candidate(
                     schema["items"], version, _child(pointer, "items"), "request", 1
                 )
                 items_checked = True
-            if _matches(other_constraints_schema, candidate, version, "request", 0):
+            if _matches(other_constraints_schema, candidate, version, "request", 0, pointer):
                 return deepcopy(candidate)
         return None
     if length == 0:
@@ -2991,7 +2991,7 @@ def _select_value(
 
     for value, candidate_pointer in candidates:
         try:
-            valid = _matches(schema, value, version, direction, 0)
+            valid = _matches(schema, value, version, direction, 0, pointer)
         except _UnsupportedOperation:
             valid = False
         if valid:
@@ -3008,7 +3008,7 @@ def _select_value(
             pointer,
         )
     for value in _fallback_values(schema, version, pointer, direction):
-        if _matches(schema, value, version, direction, 0):
+        if _matches(schema, value, version, direction, 0, pointer):
             return value, pointer
     if unusable:
         raise unusable[0]
@@ -3052,7 +3052,7 @@ def _distinct_item_values(
 
     for value in candidates:
         try:
-            valid = _matches(schema, value, version, direction, 0)
+            valid = _matches(schema, value, version, direction, 0, pointer)
         except _UnsupportedOperation:
             valid = False
         if valid:
@@ -3061,7 +3061,7 @@ def _distinct_item_values(
             break
     if len(values) < count and "const" not in schema and "enum" not in schema:
         for value in _fallback_values(schema, version, pointer, direction):
-            if _matches(schema, value, version, direction, 0):
+            if _matches(schema, value, version, direction, 0, pointer):
                 add(value)
             if len(values) >= count:
                 break
@@ -3145,6 +3145,12 @@ def _check_schema(
     for key in ("enum", "examples"):
         if key in raw and not isinstance(raw[key], list):
             raise _UnsupportedOperation("unsupported_schema_form", f"Schema {key} must be an array.", _child(pointer, key))
+    if "additionalProperties" in raw and not isinstance(raw["additionalProperties"], (bool, dict)):
+        raise _UnsupportedOperation(
+            "unsupported_schema_form",
+            "additionalProperties must be a boolean or a schema object.",
+            _child(pointer, "additionalProperties"),
+        )
     properties = raw.get("properties", {})
     required = raw.get("required", [])
     if not isinstance(properties, dict):
@@ -3218,7 +3224,9 @@ def _is_primitive_schema(raw: Any, version: str, pointer: str) -> bool:
     return all(item in _PRIMITIVE_TYPES for item in _types(raw["type"], version, _child(pointer, "type")))
 
 
-def _matches(schema: dict[str, Any], value: Any, version: str, direction: str, depth: int) -> bool:
+def _matches(
+    schema: dict[str, Any], value: Any, version: str, direction: str, depth: int, pointer: str = ""
+) -> bool:
     if depth > _MAX_DEPTH:
         return False
     if isinstance(value, float) and not math.isfinite(value):
@@ -3257,7 +3265,7 @@ def _matches(schema: dict[str, Any], value: Any, version: str, direction: str, d
         if "items" in schema and value:
             item_schema = _check_schema(schema["items"], version, "/items", direction, depth + 1)
             for item in value:
-                if item_schema is False or (isinstance(item_schema, dict) and not _matches(item_schema, item, version, direction, depth + 1)):
+                if item_schema is False or (isinstance(item_schema, dict) and not _matches(item_schema, item, version, direction, depth + 1, _child(pointer, "items"))):
                     return False
     if isinstance(value, dict):
         properties = schema.get("properties", {})
@@ -3268,14 +3276,39 @@ def _matches(schema: dict[str, Any], value: Any, version: str, direction: str, d
                 continue
             if name not in value:
                 return False
+        additional = schema.get("additionalProperties", True)
         for name, child_value in value.items():
+            if name not in properties:
+                # Undeclared property: `additionalProperties` decides (absent means true).
+                if additional is False:
+                    return False
+                if isinstance(additional, dict):
+                    additional_pointer = _child(pointer, "additionalProperties")
+                    try:
+                        additional_schema = _check_schema(
+                            additional, version, additional_pointer, direction, depth + 1
+                        )
+                        if additional_schema is False or (
+                            isinstance(additional_schema, dict)
+                            and not _matches(
+                                additional_schema, child_value, version, direction,
+                                depth + 1, additional_pointer,
+                            )
+                        ):
+                            return False
+                    except _UnsupportedOperation:
+                        # An unusable additionalProperties schema rejects only this
+                        # candidate. Budget exhaustion is a different exception and
+                        # still propagates.
+                        return False
+                continue
             child = properties.get(name)
             if child is None:
                 continue
             if _is_request_read_only(child, direction, f"/properties/{name}"):
                 return False
             child_schema = _check_schema(child, version, f"/properties/{name}", direction, depth + 1)
-            if child_schema is False or (isinstance(child_schema, dict) and not _matches(child_schema, child_value, version, direction, depth + 1)):
+            if child_schema is False or (isinstance(child_schema, dict) and not _matches(child_schema, child_value, version, direction, depth + 1, _child(pointer, "properties", name))):
                 return False
     return True
 

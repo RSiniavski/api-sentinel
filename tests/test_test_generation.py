@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 
 import pytest
 from pydantic import ValidationError
@@ -998,11 +999,11 @@ def test_const_candidate_search_includes_enum_values_after_index_100(
     original_matches = generator_module._matches
 
     def record_candidate_validation(
-        schema: dict[str, object], value: object, version: str, direction: str, depth: int
+        schema: dict[str, object], value: object, version: str, direction: str, depth: int, *rest: str
     ) -> bool:
         if type(value) is int and value in (103, 101) and "const" not in schema:
             match_checks.append((dict(schema), value))  # type: ignore[arg-type]
-        return original_matches(schema, value, version, direction, depth)  # type: ignore[arg-type]
+        return original_matches(schema, value, version, direction, depth, *rest)  # type: ignore[arg-type]
 
     monkeypatch.setattr(generator_module, "_matches", record_candidate_validation)
     endpoint = make_endpoint(
@@ -9345,3 +9346,495 @@ def test_optional_array_reached_through_a_reference_is_resolved_once_in_the_expa
         ("/tags", {"tags": []})
     ]
     assert "generation_expansion_budget_exceeded" not in {d.code for d in suite.diagnostics}
+
+
+# --- additionalProperties (request side) -----------------------------------
+
+AP_VERSIONS = ("3.0.3", "3.1.1")
+AP_STRING: dict[str, object] = {"type": "string"}
+
+
+def additional_suite(
+    schema: object,
+    *,
+    version: str = "3.1.1",
+    example: object = None,
+    schemas: dict[str, object] | None = None,
+) -> GeneratedTestSuite:
+    media = (
+        MediaType(schema=Schema(raw=schema))
+        if example is None
+        else MediaType(schema=Schema(raw=schema), example=example)
+    )
+    endpoint = make_endpoint(
+        "/items",
+        "post",
+        request_body=RequestBody(required=True, content={"application/json": media}),
+        responses=BAD_REQUEST,
+    )
+    components = (
+        Components(schemas={name: Schema(raw=raw) for name, raw in schemas.items()})
+        if schemas
+        else None
+    )
+    return generate_test_suite(make_result(endpoint, version=version, components=components))
+
+
+def additional_object(additional: object = ..., **extra: object) -> dict[str, object]:
+    schema: dict[str, object] = {
+        "type": "object",
+        "required": ["a"],
+        "properties": {"a": AP_STRING},
+        **extra,
+    }
+    if additional is not ...:
+        schema["additionalProperties"] = additional
+    return schema
+
+
+def positive_body(suite: GeneratedTestSuite) -> object:
+    assert suite.cases[0].category == "positive"
+    assert suite.cases[0].request_body is not None
+    return suite.cases[0].request_body.value
+
+
+def negative_summary(suite: GeneratedTestSuite) -> list[tuple[str | None, str | None, object]]:
+    return [
+        (c.violated_constraint, c.affected_property, c.request_body.value if c.request_body else None)
+        for c in suite.cases
+        if c.category == "negative" and c.request_body is not None and c.affected_property is not None
+    ]
+
+
+@pytest.mark.parametrize("version", AP_VERSIONS)
+def test_root_object_with_additional_properties_false_keeps_positive_and_negative_cases(version: str) -> None:
+    schema = additional_object(
+        False, properties={"a": AP_STRING, "n": {"type": "integer", "maximum": 5}}
+    )
+
+    suite = additional_suite(schema, version=version)
+
+    assert positive_body(suite) == {"a": "sentinel"}
+    assert negative_summary(suite) == [
+        ("required_property", "/a", {}),
+        ("maximum", "/n", {"a": "sentinel", "n": 6}),
+        ("type", "/a", {"a": 0}),
+    ]
+    assert suite.diagnostics == ()
+
+
+def test_nested_required_object_with_additional_properties_false_is_generated() -> None:
+    schema = {
+        "type": "object",
+        "required": ["o"],
+        "properties": {"o": additional_object(False)},
+    }
+
+    suite = additional_suite(schema)
+
+    assert positive_body(suite) == {"o": {"a": "sentinel"}}
+    assert {(c, p) for c, p, _ in negative_summary(suite)} >= {("required_property", "/o/a"), ("type", "/o/a")}
+    assert suite.diagnostics == ()
+
+
+@pytest.mark.parametrize("version", AP_VERSIONS)
+def test_required_map_property_with_schema_valued_additional_properties_is_generated(version: str) -> None:
+    schema = {
+        "type": "object",
+        "required": ["m"],
+        "properties": {"m": {"type": "object", "additionalProperties": {"type": "string"}}},
+    }
+
+    suite = additional_suite(schema, version=version)
+
+    # No arbitrary map keys are invented.
+    assert positive_body(suite) == {"m": {}}
+    assert ("required_property", "/m", {}) in negative_summary(suite)
+    assert suite.diagnostics == ()
+
+
+def test_additional_properties_true_and_absent_keep_extra_properties_of_an_example() -> None:
+    example = {"a": "x", "extra": 1}
+
+    for additional in (True, ...):
+        suite = additional_suite(additional_object(additional), example=example)
+        assert positive_body(suite) == example
+
+
+def test_additional_properties_false_rejects_an_example_with_extra_properties() -> None:
+    suite = additional_suite(additional_object(False), example={"a": "x", "extra": 1})
+
+    assert positive_body(suite) == {"a": "sentinel"}
+    assert suite.diagnostics == ()
+
+
+def test_additional_properties_false_accepts_an_example_with_declared_properties_only() -> None:
+    suite = additional_suite(additional_object(False), example={"a": "x"})
+
+    assert positive_body(suite) == {"a": "x"}
+
+
+def test_additional_property_values_are_validated_against_the_schema() -> None:
+    schema = additional_object({"type": "integer", "minimum": 0})
+
+    accepted = additional_suite(schema, example={"a": "x", "count": 3})
+    wrong_type = additional_suite(schema, example={"a": "x", "count": "three"})
+    out_of_range = additional_suite(schema, example={"a": "x", "count": -1})
+
+    assert positive_body(accepted) == {"a": "x", "count": 3}
+    assert positive_body(wrong_type) == {"a": "sentinel"}
+    assert positive_body(out_of_range) == {"a": "sentinel"}
+
+
+def test_additional_property_schema_can_be_a_local_reference() -> None:
+    schema = additional_object({"$ref": "#/components/schemas/Count"})
+    schemas = {"Count": {"type": "integer"}}
+
+    accepted = additional_suite(schema, example={"a": "x", "n": 1}, schemas=schemas)
+    rejected = additional_suite(schema, example={"a": "x", "n": "1"}, schemas=schemas)
+
+    assert positive_body(accepted) == {"a": "x", "n": 1}
+    assert positive_body(rejected) == {"a": "sentinel"}
+
+
+def test_unusable_additional_property_schema_only_rejects_the_candidate() -> None:
+    for unusable in ({"$ref": "#/components/schemas/Missing"}, {"type": "string", "pattern": "^x$"}):
+        schema = additional_object(unusable)
+
+        with_extra = additional_suite(schema, example={"a": "x", "extra": "x"})
+        without_extra = additional_suite(schema, example={"a": "x"})
+
+        assert positive_body(with_extra) == {"a": "sentinel"}
+        assert positive_body(without_extra) == {"a": "x"}
+        assert with_extra.diagnostics == ()
+
+
+def test_additional_properties_are_validated_recursively() -> None:
+    inner = {
+        "type": "object",
+        "required": ["k"],
+        "properties": {"k": AP_STRING},
+        "additionalProperties": False,
+    }
+    schema = {
+        "type": "object",
+        "required": ["m"],
+        "properties": {"m": {"type": "object", "additionalProperties": inner}},
+    }
+
+    accepted = additional_suite(schema, example={"m": {"first": {"k": "v"}}})
+    rejected = additional_suite(schema, example={"m": {"first": {"k": "v", "extra": 1}}})
+    wrong_inner = additional_suite(schema, example={"m": {"first": {"k": 1}}})
+
+    assert positive_body(accepted) == {"m": {"first": {"k": "v"}}}
+    assert positive_body(rejected) == {"m": {}}
+    assert positive_body(wrong_inner) == {"m": {}}
+
+
+def test_nested_declared_object_rules_apply_inside_an_example() -> None:
+    schema = {
+        "type": "object",
+        "required": ["o"],
+        "properties": {"o": additional_object(False)},
+    }
+
+    accepted = additional_suite(schema, example={"o": {"a": "x"}})
+    rejected = additional_suite(schema, example={"o": {"a": "x", "extra": 1}})
+
+    assert positive_body(accepted) == {"o": {"a": "x"}}
+    assert positive_body(rejected) == {"o": {"a": "sentinel"}}
+
+
+def test_required_property_without_a_schema_keeps_its_diagnostic_without_additional_properties() -> None:
+    schema = {"type": "object", "required": ["a", "u"], "properties": {"a": AP_STRING}}
+
+    suite = additional_suite(schema)
+
+    assert positive_body(suite) == {"a": "sentinel", "u": None}
+    assert [d.code for d in suite.diagnostics] == ["required_property_schema_missing"]
+
+
+@pytest.mark.parametrize("additional", [False, {"type": "string"}])
+def test_required_property_without_a_schema_is_not_invented_under_restrictive_additional_properties(
+    additional: object,
+) -> None:
+    schema = {
+        "type": "object",
+        "required": ["a", "u"],
+        "properties": {"a": AP_STRING},
+        "additionalProperties": additional,
+    }
+
+    suite = additional_suite(schema)
+
+    assert suite.cases == ()
+    assert [d.code for d in suite.diagnostics] == ["no_positive_schema_value"]
+
+
+def test_required_property_without_a_schema_is_kept_when_additional_properties_allow_null() -> None:
+    for additional in (True, {"type": ["string", "null"]}, {}):
+        suite = additional_suite(
+            {
+                "type": "object",
+                "required": ["a", "u"],
+                "properties": {"a": AP_STRING},
+                "additionalProperties": additional,
+            }
+        )
+
+        assert positive_body(suite) == {"a": "sentinel", "u": None}
+        assert [d.code for d in suite.diagnostics] == ["required_property_schema_missing"]
+
+
+@pytest.mark.parametrize("malformed", ["no", None, 1, ["x"], 0])
+def test_malformed_additional_properties_is_an_unsupported_schema_form(malformed: object) -> None:
+    suite = additional_suite(additional_object(malformed))
+
+    assert suite.cases == ()
+    assert [(d.code, d.source_pointer) for d in suite.diagnostics] == [
+        (
+            "unsupported_schema_form",
+            "/paths/~1items/post/requestBody/content/application~1json/schema/additionalProperties",
+        )
+    ]
+
+
+def test_additional_properties_is_not_a_negative_case_target() -> None:
+    suite = additional_suite(additional_object(False))
+
+    assert all(c.affected_property in (None, "/a") for c in suite.cases)
+    assert {c.violated_constraint for c in suite.cases} == {
+        None,
+        "required_property",
+        "type",
+        "required_request_body",
+    }
+
+
+def test_additional_properties_on_a_primitive_schema_does_not_change_its_value() -> None:
+    schema = {
+        "type": "object",
+        "required": ["a"],
+        "properties": {"a": {"type": "string", "additionalProperties": False}},
+    }
+
+    suite = additional_suite(schema)
+
+    assert positive_body(suite) == {"a": "sentinel"}
+
+
+@pytest.mark.parametrize("version", AP_VERSIONS)
+def test_additional_properties_generation_is_deterministic_and_does_not_mutate_input(version: str) -> None:
+    schema = additional_object(
+        {"$ref": "#/components/schemas/Count"},
+        properties={"a": AP_STRING, "n": {"type": "integer", "maximum": 5}},
+    )
+    schemas = {"Count": {"type": "integer"}}
+    endpoint = make_endpoint(
+        "/items",
+        "post",
+        request_body=RequestBody(
+            required=True,
+            content={"application/json": MediaType(schema=Schema(raw=schema), example={"a": "x", "extra": 2})},
+        ),
+        responses=BAD_REQUEST,
+    )
+    result = make_result(
+        endpoint,
+        version=version,
+        components=Components(schemas={name: Schema(raw=raw) for name, raw in schemas.items()}),
+    )
+    before = result.model_dump_json()
+    schema_before = deepcopy(schema)
+
+    first = generate_test_suite(result)
+    second = generate_test_suite(result)
+
+    assert first == second
+    assert first.model_dump_json() == second.model_dump_json()
+    assert positive_body(first) == {"a": "x", "extra": 2}
+    assert result.model_dump_json() == before
+    assert schema == schema_before
+
+
+# --- additionalProperties: failure isolation and pointers -------------------
+
+AP_UNSUPPORTED = {"type": "string", "pattern": "^x$"}
+AP_ITEMS_PATH = "/paths/~1items/post/requestBody/content/application~1json/schema"
+
+
+def additional_array_body(additional: object, **array: object) -> dict[str, object]:
+    item = {
+        "type": "object",
+        "required": ["a"],
+        "properties": {"a": AP_STRING},
+        "additionalProperties": additional,
+    }
+    return {
+        "type": "object",
+        "required": ["a"],
+        "properties": {
+            "a": AP_STRING,
+            "n": {"type": "integer", "maximum": 3},
+            "t": {"type": "array", "items": item, **array},
+        },
+    }
+
+
+def test_array_candidate_with_an_unusable_additional_schema_is_rejected_without_aborting_other_steps() -> None:
+    body = additional_array_body(AP_UNSUPPORTED, enum=[[{"a": "x", "z": "s"}]], minItems=2)
+
+    suite = additional_suite(body)
+
+    # Only the array candidate is rejected, with the ordinary "no safe candidate"
+    # diagnostic at the violated keyword; no unsupported-schema diagnostic leaks.
+    assert [(d.code, d.source_pointer) for d in suite.diagnostics] == [
+        ("array_bound_no_safe_candidate", f"{AP_ITEMS_PATH}/properties/t/minItems")
+    ]
+    assert all("additionalProperties" not in (d.source_pointer or "") for d in suite.diagnostics)
+    assert negative_summary(suite) == [
+        ("required_property", "/a", {}),
+        ("maximum", "/n", {"a": "sentinel", "n": 4}),
+        ("type", "/a", {"a": 0}),
+    ]
+
+
+def test_array_candidate_with_a_usable_additional_schema_is_still_generated() -> None:
+    body = additional_array_body({"type": "string"}, enum=[[{"a": "x", "z": "s"}]], minItems=2)
+
+    suite = additional_suite(body)
+
+    assert suite.diagnostics == ()
+    assert ("minItems", "/t", {"a": "sentinel", "t": [{"a": "x", "z": "s"}]}) in negative_summary(suite)
+
+
+def test_array_candidate_violating_the_additional_schema_is_rejected() -> None:
+    body = additional_array_body({"type": "integer"}, enum=[[{"a": "x", "z": "s"}]], minItems=2)
+
+    suite = additional_suite(body)
+
+    assert [d.code for d in suite.diagnostics] == ["array_bound_no_safe_candidate"]
+    assert [c for c, p, _ in negative_summary(suite) if p == "/t"] == []
+
+
+def test_distinct_item_candidates_with_an_unusable_additional_schema_are_skipped_individually() -> None:
+    item = additional_array_body(AP_UNSUPPORTED)["properties"]["t"]["items"]  # type: ignore[index]
+    body = {
+        "type": "object",
+        "required": ["t"],
+        "properties": {
+            "t": {
+                "type": "array",
+                "uniqueItems": True,
+                "minItems": 2,
+                "items": {**item, "examples": [{"a": "x", "z": "s"}, {"a": "y"}]},
+            }
+        },
+    }
+
+    suite = additional_suite(body)
+
+    assert positive_body(suite) == {"t": [{"a": "y"}, {"a": "sentinel"}]}
+
+
+def test_required_undeclared_property_with_an_unusable_additional_schema_has_no_positive_value() -> None:
+    other = make_endpoint("/other", "get")
+    schema = {
+        "type": "object",
+        "required": ["a", "u"],
+        "properties": {"a": AP_STRING},
+        "additionalProperties": AP_UNSUPPORTED,
+    }
+    bad = make_endpoint(
+        "/items",
+        "post",
+        request_body=body_with_schema(schema),
+        responses=BAD_REQUEST,
+    )
+
+    suite = generate_test_suite(make_result(bad, other))
+
+    assert [(c.method, c.path) for c in suite.cases] == [("get", "/other")]
+    assert [(d.code, d.source_pointer) for d in suite.diagnostics] == [
+        ("no_positive_schema_value", AP_ITEMS_PATH)
+    ]
+
+
+def nested_additional_result(schemas: dict[str, object] | None, example: object) -> NormalizationResult:
+    user = additional_object({"$ref": "#/components/schemas/Count"})
+    body = {"type": "object", "required": ["user"], "properties": {"user": user}}
+    endpoint = make_endpoint(
+        "/items",
+        "post",
+        request_body=RequestBody(
+            required=True,
+            content={"application/json": MediaType(schema=Schema(raw=body), example=example)},
+        ),
+        responses=BAD_REQUEST,
+    )
+    components = Components(schemas={k: Schema(raw=v) for k, v in (schemas or {}).items()})
+    return make_result(endpoint, components=components)
+
+
+def test_nested_additional_schema_reference_keeps_its_source_pointer_in_the_budget_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = nested_additional_result({"Count": {"type": "integer"}}, {"user": {"a": "x", "extra": 1}})
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_EXPANSIONS", 0)
+
+    suite = generate_test_suite(result)
+
+    assert suite.cases == ()
+    assert [(d.code, d.source_pointer, d.reference_uri) for d in suite.diagnostics] == [
+        (
+            "generation_expansion_budget_exceeded",
+            f"{AP_ITEMS_PATH}/properties/user/additionalProperties",
+            "#/components/schemas/Count",
+        )
+    ]
+
+
+def test_additional_schema_reference_costs_one_expansion_per_validated_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = nested_additional_result({"Count": {"type": "integer"}}, {"user": {"a": "x", "extra": 1}})
+
+    needed = count_expansions(result)
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_EXPANSIONS", needed)
+    enough = generate_test_suite(result)
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_EXPANSIONS", needed - 1)
+    short = generate_test_suite(result)
+
+    assert needed == 1
+    assert positive_body(enough) == {"user": {"a": "x", "extra": 1}}
+    assert "generation_expansion_budget_exceeded" not in {d.code for d in enough.diagnostics}
+    assert short.cases == ()
+    assert [d.code for d in short.diagnostics] == ["generation_expansion_budget_exceeded"]
+
+
+def test_unresolvable_nested_additional_schema_reference_rejects_only_the_candidate() -> None:
+    suite = generate_test_suite(
+        nested_additional_result(None, {"user": {"a": "x", "extra": 1}})
+    )
+
+    assert positive_body(suite) == {"user": {"a": "sentinel"}}
+    assert suite.diagnostics == ()
+    assert {c.affected_property for c in suite.cases if c.category == "negative"} >= {"/user/a"}
+
+
+def test_additional_properties_isolation_is_deterministic_and_does_not_mutate_input() -> None:
+    body = additional_array_body(AP_UNSUPPORTED, enum=[[{"a": "x", "z": "s"}]], minItems=2)
+    body_before = deepcopy(body)
+    endpoint = make_endpoint(
+        "/items", "post", request_body=body_with_schema(body), responses=BAD_REQUEST
+    )
+    result = make_result(endpoint)
+    before = result.model_dump_json()
+
+    first = generate_test_suite(result)
+    second = generate_test_suite(result)
+
+    assert first == second
+    assert first.model_dump_json() == second.model_dump_json()
+    assert result.model_dump_json() == before
+    assert body == body_before

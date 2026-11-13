@@ -111,6 +111,7 @@ Implemented so far:
 - Generator security scheme validation: schemes named by the effective security requirements are looked up, local `#/components/securitySchemes/` alias chains are resolved, and the scheme type is checked; all failures of an endpoint are reported together and the endpoint is skipped.
 - Schema `format` support for a closed set (`int32`, `int64`, `float`, `double`, `date`, `date-time`, `uuid`, `email`): type compatibility rules, deterministic fixed values, restricted validation profiles for `date-time`, `uuid` and `email`, and implicit numeric ranges in numeric boundary generation. Wrong-format negative cases are not generated; `pattern`, other request media types and `style`/`explode` remain unsupported.
 - Failure isolation: an unsupported schema in one negative step does not stop the other negative steps of the endpoint.
+- Request schema `additionalProperties` (boolean or schema object): enforced when validating example, default, enum and const candidates, which may keep undeclared properties that satisfy it; synthesized values contain declared properties only (no invented map keys). An unsupported or unresolvable `additionalProperties` schema rejects only the candidate being validated. No negative cases target additional properties, and `patternProperties`, `minProperties` and `maxProperties` remain unsupported.
 
 Still planned:
 
