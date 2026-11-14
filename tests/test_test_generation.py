@@ -5160,7 +5160,7 @@ def test_one_malformed_bound_gives_exactly_one_diagnostic(
 def test_unsupported_items_do_not_block_a_case_that_needs_no_item() -> None:
     cases, diagnostics = run_array_step(
         tags_body(
-            {"type": "array", "minItems": 1, "items": {"type": "string", "pattern": "^a$"}}
+            {"type": "array", "minItems": 1, "items": {"type": "string", "pattern": "^(a)$"}}
         ),
         {"tags": ["a"]},
     )
@@ -5180,7 +5180,7 @@ def test_unsupported_items_are_reported_once_for_all_candidates_that_need_an_ite
                 "type": "array",
                 "minItems": 2,
                 "maxItems": 3,
-                "items": {"type": "string", "pattern": "^a$"},
+                "items": {"type": "string", "pattern": "^(a)$"},
             }
         ),
         {"tags": ["a", "b"]},
@@ -5199,7 +5199,7 @@ def test_unsupported_items_still_allow_the_candidate_that_needs_no_item() -> Non
                 "type": "array",
                 "minItems": 1,
                 "maxItems": 3,
-                "items": {"type": "string", "pattern": "^a$"},
+                "items": {"type": "string", "pattern": "^(a)$"},
             }
         ),
         {"tags": ["a"]},
@@ -5211,7 +5211,7 @@ def test_unsupported_items_still_allow_the_candidate_that_needs_no_item() -> Non
     ]
 
 
-UNSUPPORTED_ITEMS: dict[str, object] = {"type": "string", "pattern": "^a$"}
+UNSUPPORTED_ITEMS: dict[str, object] = {"type": "string", "pattern": "^(a)$"}
 
 
 @pytest.mark.parametrize(
@@ -5323,7 +5323,7 @@ def test_missing_or_unusable_items_are_diagnosed_when_an_item_is_needed() -> Non
     no_items = array_suite({"type": "array", "maxItems": 1})
     false_items = array_suite({"type": "array", "maxItems": 0, "items": False})
     unsupported_items = run_array_step(
-        tags_body({"type": "array", "maxItems": 1, "items": {"type": "string", "pattern": "^a$"}}),
+        tags_body({"type": "array", "maxItems": 1, "items": {"type": "string", "pattern": "^(a)$"}}),
         {"tags": []},
     )
 
@@ -7271,7 +7271,7 @@ def test_format_generation_is_deterministic_and_does_not_mutate_input() -> None:
 
 # --- Step 8.2.1: empty arrays with unsupported item schemas ---
 
-UNSUPPORTED_ITEMS: dict[str, object] = {"type": "string", "pattern": "^a$"}
+UNSUPPORTED_ITEMS: dict[str, object] = {"type": "string", "pattern": "^(a)$"}
 ITEMS_PATTERN_POINTER = tags_schema_pointer("items", "pattern")
 
 
@@ -7668,7 +7668,7 @@ def test_unique_arrays_with_max_items_below_min_items_are_not_generated() -> Non
 
 
 def test_unique_arrays_with_unsupported_item_keywords_keep_their_diagnostic() -> None:
-    suite = unique_suite({"type": "string", "pattern": "^a$", "examples": ["a", "aa"]}, 2)
+    suite = unique_suite({"type": "string", "pattern": "^(a)$", "examples": ["a", "aa"]}, 2)
 
     assert suite.cases == ()
     assert [(item.code, item.source_pointer) for item in suite.diagnostics] == [
@@ -7996,7 +7996,7 @@ def test_root_array_combining_all_constraints() -> None:
         {"type": "array", "minItems": 1, "items": {"type": "integer", "minimum": 5}},
         {"type": "array", "maxItems": 1, "uniqueItems": True, "items": {"type": "integer"}},
         {"type": "array", "minItems": 3, "uniqueItems": True, "items": {"type": "integer"}},
-        {"type": "array", "minItems": 1, "items": {"type": "string", "pattern": "^a$"}},
+        {"type": "array", "minItems": 1, "items": {"type": "string", "pattern": "^(a)$"}},
         {"type": "array", "maxItems": 100, "items": ITEM_SCHEMA},
         {"type": "array", "maxItems": 2, "items": {"type": "string", "enum": ["a", "b"]}},
     ],
@@ -8073,7 +8073,7 @@ def test_root_array_with_unresolvable_reference_is_reported_once() -> None:
 
 
 def test_root_array_unsupported_and_insufficient_candidates_keep_existing_diagnostics() -> None:
-    unsupported = root_suite({"type": "array", "minItems": 2, "maxItems": 3, "items": {"type": "string", "pattern": "^a$"}})
+    unsupported = root_suite({"type": "array", "minItems": 2, "maxItems": 3, "items": {"type": "string", "pattern": "^(a)$"}})
     no_items = root_suite({"type": "array", "maxItems": 2})
     limit = root_suite({"type": "array", "maxItems": 100, "items": ITEM_SCHEMA})
     non_array = root_suite({"type": "string", "minItems": 1})
@@ -8100,12 +8100,12 @@ def test_root_array_unsupported_and_insufficient_candidates_keep_existing_diagno
 
 def test_root_array_items_unsupported_still_allow_the_candidate_without_items() -> None:
     suite = root_suite(
-        {"type": "array", "minItems": 1, "maxItems": 3, "items": {"type": "string", "pattern": "^a$"}}
+        {"type": "array", "minItems": 1, "maxItems": 3, "items": {"type": "string", "pattern": "^(a)$"}}
     )
 
     # The positive baseline needs an item here, so nothing is generated at all.
     assert suite.cases == ()
-    empty_ok = root_suite({"type": "array", "maxItems": 2, "items": {"type": "string", "pattern": "^a$"}})
+    empty_ok = root_suite({"type": "array", "maxItems": 2, "items": {"type": "string", "pattern": "^(a)$"}})
     assert body_value(empty_ok.cases[0]) == []
     assert [(item.code, item.source_pointer) for item in empty_ok.diagnostics] == [
         ("array_bound_unsupported_schema", f"{ROOT_PATH}/items/pattern")
@@ -8285,7 +8285,7 @@ def assert_endpoint_generated_without(suite: GeneratedTestSuite, name: str = "op
         ({"type": "object"}, None, "/schema", None),
         ({"type": "string", "oneOf": [{"type": "string"}]}, None, "/schema/oneOf", None),
         ({"allOf": [{"type": "string"}]}, None, "/schema", None),
-        ({"type": "string", "pattern": "^a$"}, None, "/schema/pattern", None),
+        ({"type": "string", "pattern": "^(a)$"}, None, "/schema/pattern", None),
     ],
 )
 def test_optional_unsupported_schema_is_omitted_and_reported_without_skipping(
@@ -9129,7 +9129,7 @@ def test_optional_array_diagnostics_and_candidates_match_the_required_array(
 
 def test_optional_array_with_unsupported_items_reports_the_existing_diagnostic() -> None:
     suite = array_suite(
-        {"type": "array", "minItems": 1, "maxItems": 2, "items": {"type": "string", "pattern": "^a$"}},
+        {"type": "array", "minItems": 1, "maxItems": 2, "items": {"type": "string", "pattern": "^(a)$"}},
         required=False,
     )
 
@@ -9498,7 +9498,7 @@ def test_additional_property_schema_can_be_a_local_reference() -> None:
 
 
 def test_unusable_additional_property_schema_only_rejects_the_candidate() -> None:
-    for unusable in ({"$ref": "#/components/schemas/Missing"}, {"type": "string", "pattern": "^x$"}):
+    for unusable in ({"$ref": "#/components/schemas/Missing"}, {"type": "string", "pattern": "^(x)$"}):
         schema = additional_object(unusable)
 
         with_extra = additional_suite(schema, example={"a": "x", "extra": "x"})
@@ -9659,7 +9659,7 @@ def test_additional_properties_generation_is_deterministic_and_does_not_mutate_i
 
 # --- additionalProperties: failure isolation and pointers -------------------
 
-AP_UNSUPPORTED = {"type": "string", "pattern": "^x$"}
+AP_UNSUPPORTED = {"type": "string", "pattern": "^(x)$"}
 AP_ITEMS_PATH = "/paths/~1items/post/requestBody/content/application~1json/schema"
 
 
@@ -9838,3 +9838,710 @@ def test_additional_properties_isolation_is_deterministic_and_does_not_mutate_in
     assert first.model_dump_json() == second.model_dump_json()
     assert result.model_dump_json() == before
     assert body == body_before
+
+
+# --- string pattern (bounded subset, existing candidates only) -------------
+
+PATTERN_ACCEPTED = [
+    "", "^", "$", "^$", "a", "abc", "^abc$", "abc$", "^abc", r"\d", r"\w+", r"^\d{3}-\d{4}$",
+    "[a-z]+", "[a-zA-Z0-9_]", "[-a]", "[a-]", "[-]", r"[\d\w]", r"[\-a]", r"[\.\]]", r"\.", r"\/",
+    r"\\", r"\$", r"\^", r"^\^$", r"^\$", r"\\$", r"a\$", "a*", "a+", "a?", "a{3}", "a{2,}",
+    "a{2,5}", "a{0}", "a{0,0}", "^[A-Z]{2}[0-9]{3}$", "a b", "^a+b*$", "x{2}y{3}z{4}", "a" * 128,
+    "a{128}", "a{0,128}", "a{128,}", "[ -}]",
+]
+PATTERN_REJECTED = [
+    "(a)", "(?i)a", "(?<n>a)", "a|b", ".", "a.b", "[^a]", "[]", "[a", "a]", "a}", "{", "a{",
+    "a{,3}", "a{3,2}", "a{129}", "a{1,129}", "a{1,}}", "a{01}", "a{1 }", "a**", "a+?", "a*?",
+    "a*+", "a{2}{3}", "a{2}*", "*a", "+", "?", "{3}", "^*", "^^", "a$b", "$a", "$$", "^$$",
+    "\\", "a\\", "[a\\", "[\\", r"\b", r"\B", r"\1", r"\p{L}+", r"\n", r"\t", r"\x41", "\\" + "u0041",
+    r"\-", "[z-a]", "[a--]", "[--a]", "[a-]]", r"[a-\d]", r"[\d-z]", r"[\--z]", r"[a-\-]", "[[a]",
+    "[a&b]", "[a|b]", "[a~b]", "[a^b]", "[^]", "é", "a\tb", "a\nb", "a\x7f", "[é]", "[a-é]",
+    "a*b*c*", "^a*b*c*$", "a*b*", "a+b?", "a{1,2}b{1,2}", "a" * 129, "a{999999999999999999999}",
+    r"[\p]", r"[\q]",
+]
+
+
+def clear_pattern_scan_cache() -> None:
+    generator_module._scan_pattern.cache_clear()
+
+
+@pytest.mark.parametrize("pattern", PATTERN_ACCEPTED)
+def test_supported_patterns_are_accepted_and_compile_cleanly(pattern: str) -> None:
+    import re
+    import warnings
+
+    source, reason = generator_module._scan_pattern(pattern)
+
+    assert source is not None and reason == ""
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        re.compile(source, re.ASCII)
+
+
+@pytest.mark.parametrize("pattern", PATTERN_REJECTED)
+def test_unsupported_patterns_are_rejected_with_a_reason(pattern: str) -> None:
+    source, reason = generator_module._scan_pattern(pattern)
+
+    assert source is None
+    assert reason
+
+
+@pytest.mark.parametrize("value", [None, 5, 1.5, True, [], ["a"], {}, {"a": 1}, b"a", ("a",)])
+def test_non_string_patterns_are_rejected_before_the_cache(value: object) -> None:
+    assert generator_module._pattern_source(value) == (None, "the pattern is not a string")
+
+
+def test_scan_translates_anchors_and_keeps_escaped_anchors_literal() -> None:
+    scan = generator_module._scan_pattern
+
+    assert scan("^a$") == ("\\Aa\\Z", "")
+    assert scan("a") == ("a", "")
+    assert scan("") == ("", "")
+    assert scan("^") == ("\\A", "")
+    assert scan("$") == ("\\Z", "")
+    assert scan(r"\^a") == (r"\^a", "")
+    assert scan(r"^\$") == (r"\A\$", "")
+    assert scan(r"\\$") == (r"\\\Z", "")
+    assert scan("[a-c]{2,3}") == ("[a-c]{2,3}", "")
+
+
+def test_scanner_is_pure_and_its_cache_is_bounded() -> None:
+    info = generator_module._scan_pattern.cache_info()
+
+    assert info.maxsize == 256
+    assert generator_module._scan_pattern("^(a)$") == generator_module._scan_pattern("^(a)$")
+    assert generator_module._scan_pattern("^a$") == ("\\Aa\\Z", "")
+
+
+def test_scanner_never_fails_unexpectedly_on_every_short_input() -> None:
+    import itertools
+
+    alphabet = ["^", "$", "\\", "[", "]", "-", "a", "0", "d", "w", "{", "}", "1", ",", "*", "+", "?", "."]
+    scan = generator_module._scan_pattern_source
+    rejected = generator_module._PatternRejected
+    accepted = 0
+    total = 0
+    for length in range(5):
+        for chars in itertools.product(alphabet, repeat=length):
+            pattern = "".join(chars)
+            total += 1
+            try:
+                source = scan(pattern)
+            except rejected:
+                continue
+            assert isinstance(source, str)
+            accepted += 1
+    assert total == sum(len(alphabet) ** n for n in range(5))
+    assert accepted > 1000
+
+
+def test_every_accepted_short_pattern_compiles_without_warnings() -> None:
+    import itertools
+    import re
+    import warnings
+
+    alphabet = ["^", "$", "\\", "[", "]", "-", "a", "0", "d", "w", "{", "}", "1", ",", "*", "+", "?"]
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        for length in range(5):
+            for chars in itertools.product(alphabet, repeat=length):
+                source, _ = generator_module._scan_pattern("".join(chars))
+                if source is not None:
+                    re.compile(source, re.ASCII)
+
+
+def test_scanner_handles_truncated_and_random_inputs_without_unexpected_errors() -> None:
+    import random
+
+    samples = [r"^[a-z]{2,5}\d+$", r"[\w\-.]+", r"^\$a{3}[-x]$", r"\\\^\/"]
+    for sample in samples:
+        for end in range(len(sample) + 1):
+            generator_module._scan_pattern(sample[:end])
+            generator_module._scan_pattern(sample[end:])
+    rng = random.Random(8_20)
+    alphabet = "^$\\[]-a0dw{}1,*+?.()|é\n"
+    for _ in range(5_000):
+        pattern = "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 140)))
+        source, reason = generator_module._scan_pattern(pattern)
+        assert (source is None) == bool(reason)
+
+
+@pytest.mark.parametrize(
+    ("pattern", "value", "expected"),
+    [
+        ("^a$", "a", True),
+        ("^a$", "ab", False),
+        ("^a$", "ba", False),
+        ("^a$", "a\n", False),
+        ("a$", "ba", True),
+        ("a$", "ba\n", False),
+        ("^a", "ab", True),
+        ("^a", "ba", False),
+        ("a", "xax", True),
+        ("a", "xyz", False),
+        ("", "anything", True),
+        ("", "", True),
+        ("^$", "", True),
+        ("^$", "\n", False),
+        (r"^\d+$", "123", True),
+        (r"^\d+$", "٣", False),
+        (r"^\w+$", "ab_9", True),
+        (r"^\w+$", "café", False),
+        (r"^[a-c]+$", "abc", True),
+        (r"^[a-c]+$", "abd", False),
+        (r"^[-a]+$", "-a-", True),
+        (r"^\$a$", "$a", True),
+        (r"^\^$", "^", True),
+        (r"^a{2,3}$", "aaa", True),
+        (r"^a{2,3}$", "aaaa", False),
+        (r"^a{2}$", "aa", True),
+    ],
+)
+def test_pattern_matching_semantics(pattern: str, value: str, expected: bool) -> None:
+    assert generator_module._pattern_accepts(pattern, value, None) is expected
+
+
+def test_pattern_candidate_length_boundary_is_128_code_points() -> None:
+    accepts = generator_module._pattern_accepts
+
+    assert accepts("^a+$", "a" * 128, None) is True
+    assert accepts("^a+$", "a" * 129, None) is False
+    assert accepts("", "a" * 129, None) is False
+    assert accepts("^é$", "x", None) is False
+
+
+def test_unsupported_patterns_never_accept_a_candidate() -> None:
+    for pattern in ("(a)", "(?i)a", "a{,3}", 5, None):
+        assert generator_module._pattern_accepts(pattern, "a", None) is False
+
+
+def test_pattern_applies_only_to_string_candidates() -> None:
+    schema = {"pattern": "^a$"}
+
+    assert generator_module._matches(schema, 5, "3.1.1", "request", 0) is True
+    assert generator_module._matches(schema, ["x"], "3.1.1", "request", 0) is True
+    assert generator_module._matches(schema, "a", "3.1.1", "request", 0) is True
+    assert generator_module._matches(schema, "b", "3.1.1", "request", 0) is False
+    assert generator_module._matches({"type": "string", "pattern": "^a$"}, None, "3.1.1", "request", 0) is False
+
+
+def pattern_object(prop: dict[str, object], **extra: object) -> dict[str, object]:
+    return {"type": "object", "required": ["a"], "properties": {"a": prop}, **extra}
+
+
+def pattern_codes(suite: GeneratedTestSuite) -> list[str]:
+    return [item.code for item in suite.diagnostics]
+
+
+@pytest.mark.parametrize("version", AP_VERSIONS)
+def test_pattern_fallback_value_must_satisfy_the_pattern(version: str) -> None:
+    ok = additional_suite(pattern_object({"type": "string", "pattern": "^sentinel$"}), version=version)
+    none = additional_suite(pattern_object({"type": "string", "pattern": "^[0-9]+$"}), version=version)
+
+    assert positive_body(ok) == {"a": "sentinel"}
+    assert ok.diagnostics == ()
+    assert none.cases == ()
+    assert pattern_codes(none) == ["no_positive_schema_value"]
+
+
+def test_pattern_fallbacks_include_the_empty_and_min_length_values() -> None:
+    empty = additional_suite(pattern_object({"type": "string", "pattern": "^$", "maxLength": 0}))
+    padded = additional_suite(pattern_object({"type": "string", "pattern": "^x{3}$", "minLength": 3}))
+
+    assert positive_body(empty) == {"a": ""}
+    assert positive_body(padded) == {"a": "xxx"}
+
+
+def test_pattern_filters_examples_defaults_enum_and_const_in_order() -> None:
+    example = additional_suite(
+        pattern_object({"type": "string", "pattern": "^[0-9]{3}$", "example": "123"})
+    )
+    skipped = additional_suite(
+        pattern_object(
+            {"type": "string", "pattern": "^[0-9]{3}$", "example": "zzz", "default": "456"}
+        )
+    )
+    in_list = additional_suite(
+        pattern_object({"type": "string", "pattern": "^[0-9]{3}$", "examples": ["a", "789", "123"]})
+    )
+    enum = additional_suite(
+        pattern_object({"type": "string", "pattern": "^[a-c]$", "enum": ["x", "b", "c"]})
+    )
+    const_ok = additional_suite(pattern_object({"type": "string", "pattern": "^b$", "const": "b"}))
+    const_bad = additional_suite(pattern_object({"type": "string", "pattern": "^c$", "const": "b"}))
+
+    assert positive_body(example) == {"a": "123"}
+    assert positive_body(skipped) == {"a": "456"}
+    assert positive_body(in_list) == {"a": "789"}
+    assert positive_body(enum) == {"a": "b"}
+    assert positive_body(const_ok) == {"a": "b"}
+    assert const_bad.cases == ()
+    assert pattern_codes(const_bad) == ["no_positive_schema_value"]
+
+
+def test_pattern_string_boundary_candidates_must_satisfy_the_pattern() -> None:
+    fits = additional_suite(
+        pattern_object({"type": "string", "pattern": "^x+$", "minLength": 2, "maxLength": 3})
+    )
+    misfit = additional_suite(
+        pattern_object(
+            {"type": "string", "pattern": "^[0-9]+$", "maxLength": 3, "example": "123"}
+        )
+    )
+
+    assert ("maxLength", "/a", {"a": "xxxx"}) in negative_summary(fits)
+    assert ("minLength", "/a", {"a": "x"}) in negative_summary(fits)
+    assert ("maxLength", "/a", {"a": "xxxx"}) not in negative_summary(misfit)
+    assert "string_boundary_no_safe_candidate" in pattern_codes(misfit)
+
+
+def test_pattern_negative_candidates_still_satisfy_the_pattern() -> None:
+    suite = additional_suite(
+        pattern_object({"type": "string", "pattern": "^[a-c]$", "enum": ["a", "b", "c"]})
+    )
+    for case in suite.cases:
+        if case.request_body is None or not isinstance(case.request_body.value, dict):
+            continue
+        value = case.request_body.value.get("a")
+        if isinstance(value, str):
+            assert generator_module._pattern_accepts("^[a-c]$", value, None)
+
+
+def test_pattern_on_array_items_applies_to_every_item_candidate() -> None:
+    schema = {
+        "type": "object",
+        "required": ["t"],
+        "properties": {
+            "t": {
+                "type": "array", "minItems": 1, "maxItems": 2,
+                "items": {"type": "string", "pattern": "^[0-9]+$", "example": "12"},
+            }
+        },
+    }
+    suite = additional_suite(schema)
+    bad = additional_suite(
+        {**schema, "properties": {"t": {**schema["properties"]["t"], "items": {  # type: ignore[index]
+            "type": "string", "pattern": "^[0-9]+$"}}}}
+    )
+
+    assert positive_body(suite) == {"t": ["12"]}
+    assert ("maxItems", "/t", {"t": ["12", "12", "12"]}) in negative_summary(suite)
+    assert bad.cases == ()
+    assert "no_positive_schema_value" in pattern_codes(bad)
+
+
+def test_pattern_in_a_local_reference_is_enforced() -> None:
+    schemas = {"P": {"type": "string", "pattern": "^[a-z]+$", "example": "abc"}}
+    bad = {"P": {"type": "string", "pattern": "^[0-9]+$"}}
+    prop = {"$ref": "#/components/schemas/P"}
+
+    assert positive_body(additional_suite(pattern_object(prop), schemas=schemas)) == {"a": "abc"}
+    failing = additional_suite(pattern_object(prop), schemas=bad)
+    assert failing.cases == ()
+    assert pattern_codes(failing) == ["no_positive_schema_value"]
+    unsupported = additional_suite(
+        pattern_object(prop), schemas={"P": {"type": "string", "pattern": "^(a)$"}}
+    )
+    assert pattern_codes(unsupported) == ["unsupported_schema_keyword"]
+    assert unsupported.diagnostics[0].source_pointer == "/components/schemas/P/pattern"
+
+
+def test_pattern_combines_with_format() -> None:
+    ok = additional_suite(
+        pattern_object({"type": "string", "format": "date", "pattern": "^2024-", "example": "2024-01-02"})
+    )
+    mismatch = additional_suite(
+        pattern_object({"type": "string", "format": "date", "pattern": "^2023-", "example": "2024-01-02"})
+    )
+
+    assert positive_body(ok) == {"a": "2024-01-02"}
+    assert mismatch.cases == ()
+    assert pattern_codes(mismatch) == ["no_positive_schema_value"]
+
+
+@pytest.mark.parametrize(
+    ("pattern", "code", "pointer_tail"),
+    [
+        ("^(a)$", "unsupported_schema_keyword", "/pattern"),
+        ("(?i)a", "unsupported_schema_keyword", "/pattern"),
+        ("a{,3}", "unsupported_schema_keyword", "/pattern"),
+        (r"\p{L}+", "unsupported_schema_keyword", "/pattern"),
+        ("(?<n>a)", "unsupported_schema_keyword", "/pattern"),
+        ("a" * 129, "unsupported_schema_keyword", "/pattern"),
+        (5, "unsupported_schema_form", "/pattern"),
+        (None, "unsupported_schema_form", "/pattern"),
+        (["a"], "unsupported_schema_form", "/pattern"),
+    ],
+)
+def test_unsupported_pattern_gets_a_diagnostic_at_the_keyword(
+    pattern: object, code: str, pointer_tail: str
+) -> None:
+    suite = additional_suite(pattern_object({"type": "string", "pattern": pattern}))
+
+    assert suite.cases == ()
+    assert pattern_codes(suite) == [code]
+    assert suite.diagnostics[0].source_pointer.endswith("/properties/a" + pointer_tail)  # type: ignore[union-attr]
+    assert "pattern" in suite.diagnostics[0].message
+
+
+def test_pattern_on_an_optional_property_keeps_the_property_omitted() -> None:
+    for pattern in ("^[0-9]+$", "^(a)$"):
+        suite = additional_suite(
+            {"type": "object", "properties": {"o": {"type": "string", "pattern": pattern, "example": "7"}}}
+        )
+
+        assert positive_body(suite) == {}
+        assert suite.diagnostics == ()
+
+
+def pattern_parameter_suite(schema: dict[str, object], *, required: bool) -> GeneratedTestSuite:
+    parameter = Parameter(
+        name="code", location="query", required=required, schema=Schema(raw=schema),
+        source_scope="operation",
+    )
+    return generate_test_suite(
+        make_result(make_endpoint("/items", "get", parameters=(parameter,), responses=BAD_REQUEST))
+    )
+
+
+def test_pattern_on_parameters_filters_candidates() -> None:
+    ok = pattern_parameter_suite(
+        {"type": "string", "pattern": "^[0-9]{3}$", "example": "123"}, required=True
+    )
+    bad = pattern_parameter_suite({"type": "string", "pattern": "^[0-9]{3}$"}, required=True)
+    unsupported = pattern_parameter_suite({"type": "string", "pattern": "^(a)$"}, required=True)
+
+    assert [(p.name, p.value) for p in ok.cases[0].parameters] == [("code", "123")]
+    assert bad.cases == ()
+    assert pattern_codes(bad) == ["no_positive_schema_value"]
+    assert pattern_codes(unsupported) == ["unsupported_schema_keyword"]
+    assert unsupported.diagnostics[0].source_pointer.endswith("/schema/pattern")  # type: ignore[union-attr]
+
+
+def test_pattern_on_an_optional_parameter_keeps_it_omitted_and_reports_unsupported_patterns() -> None:
+    supported = pattern_parameter_suite(
+        {"type": "string", "pattern": "^[0-9]{3}$", "example": "123"}, required=False
+    )
+    unsupported = pattern_parameter_suite({"type": "string", "pattern": "^(a)$"}, required=False)
+
+    assert supported.cases[0].parameters == () and supported.diagnostics == ()
+    assert unsupported.cases[0].parameters == ()
+    assert [(d.code, d.source_pointer) for d in unsupported.diagnostics] == [
+        ("optional_parameter_unsupported_schema", "/paths/~1items/get/parameters/0/schema/pattern")
+    ]
+
+
+def pattern_result(patterns: list[str], values: list[str]) -> NormalizationResult:
+    endpoints = tuple(
+        make_endpoint(
+            f"/items{index}",
+            "post",
+            request_body=RequestBody(
+                required=True,
+                content={
+                    "application/json": MediaType(
+                        schema=Schema(
+                            raw=pattern_object(
+                                {"type": "string", "pattern": pattern, "enum": values}
+                            )
+                        )
+                    )
+                },
+            ),
+            responses=BAD_REQUEST,
+        )
+        for index, pattern in enumerate(patterns)
+    )
+    return make_result(*endpoints)
+
+
+def count_pattern_evaluations(result: NormalizationResult) -> int:
+    counter = {"count": 0}
+    original = generator_module._GenerationBudget.charge_pattern_evaluation
+
+    def counting(self: object, pointer: object) -> None:
+        counter["count"] += 1
+        original(self, pointer)  # type: ignore[arg-type]
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(generator_module._GenerationBudget, "charge_pattern_evaluation", counting)
+        generate_test_suite(result)
+    return counter["count"]
+
+
+def with_budget() -> tuple[object, "generator_module._GenerationBudget"]:
+    budget = generator_module._GenerationBudget()
+    return generator_module._BUDGET.set(budget), budget
+
+
+def test_pattern_budget_constants_and_code() -> None:
+    assert generator_module._MAX_ENDPOINT_PATTERN_EVALUATIONS == 2_000
+    assert generator_module._MAX_SUITE_PATTERN_EVALUATIONS == 20_000
+    assert generator_module._PATTERN_BUDGET_CODE == "generation_pattern_budget_exceeded"
+
+
+def test_identical_pattern_candidate_pairs_are_charged_once_and_distinct_pairs_separately() -> None:
+    token, budget = with_budget()
+    try:
+        accepts = generator_module._pattern_accepts
+        assert accepts("^a$", "a", None) is True
+        assert accepts("^a$", "a", None) is True
+        assert budget.suite_pattern_evaluations == 1
+        assert accepts("^a$", "b", None) is False
+        assert accepts("^b$", "a", None) is False
+        assert accepts("^b$", "b", None) is True
+        assert budget.suite_pattern_evaluations == 4
+        assert budget.endpoint_pattern_evaluations == 4
+        assert accepts("^b$", "b", None) is True
+        assert budget.suite_pattern_evaluations == 4
+    finally:
+        generator_module._BUDGET.reset(token)  # type: ignore[arg-type]
+
+
+def test_rejected_patterns_and_long_candidates_are_not_charged() -> None:
+    token, budget = with_budget()
+    try:
+        accepts = generator_module._pattern_accepts
+        assert accepts("(a)", "a", None) is False
+        assert accepts(5, "a", None) is False
+        assert accepts("^a+$", "a" * 129, None) is False
+        assert budget.suite_pattern_evaluations == 0
+        assert budget.pattern_memo == {}
+        assert accepts("^a+$", "a" * 128, None) is True
+        assert budget.suite_pattern_evaluations == 1
+    finally:
+        generator_module._BUDGET.reset(token)  # type: ignore[arg-type]
+
+
+def test_pattern_evaluation_without_a_budget_is_unlimited_uncharged_and_unmemoized() -> None:
+    assert generator_module._BUDGET.get() is None
+    for index in range(generator_module._MAX_ENDPOINT_PATTERN_EVALUATIONS + 5):
+        assert generator_module._pattern_accepts("^a+$", "a" * (index % 100 + 1), None) is True
+    assert generator_module._matches({"type": "string", "pattern": "^a$"}, "a", "3.1.1", "request", 0)
+    assert not [name for name in vars(generator_module) if "memo" in name.lower()]
+
+
+def test_endpoint_pattern_limit_stops_the_step_with_a_deterministic_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_PATTERN_EVALUATIONS", 3)
+    result = pattern_result(["^ok$"], ["a1", "a2", "a3", "a4", "ok"])
+
+    suite = generate_test_suite(result)
+
+    assert suite.cases == ()
+    assert [item.code for item in suite.diagnostics] == ["generation_pattern_budget_exceeded"]
+    diagnostic = suite.diagnostics[0]
+    assert diagnostic.endpoint_path == "/items0"
+    assert "per-endpoint limit of 3 pattern evaluations" in diagnostic.message
+    assert "'positive_baseline' step" in diagnostic.message
+    assert diagnostic.source_pointer is not None
+    assert diagnostic.source_pointer.endswith("/properties/a/pattern")
+    assert generate_test_suite(result) == suite
+
+
+def test_suite_pattern_limit_stops_the_remaining_endpoints(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    values = ["no", "ok1", "ok2", "ok3"]
+    patterns = ["^ok1$", "^ok2$", "^ok3$"]
+    one = count_pattern_evaluations(pattern_result(patterns[:1], values))
+    assert one > 0
+    monkeypatch.setattr(generator_module, "_MAX_SUITE_PATTERN_EVALUATIONS", one)
+
+    suite = generate_test_suite(pattern_result(patterns, values))
+
+    assert {case.path for case in suite.cases} == {"/items0"}
+    budget = [item for item in suite.diagnostics if item.code == "generation_pattern_budget_exceeded"]
+    assert len(budget) == 1
+    assert budget[0].endpoint_path == "/items1"
+    assert f"per-suite limit of {one} pattern evaluations" in budget[0].message
+    assert "'positive_baseline' step" in budget[0].message
+    assert "1 following endpoint(s)" in budget[0].message
+    assert generate_test_suite(pattern_result(patterns, values)) == suite
+
+
+def test_identical_pairs_are_charged_once_across_endpoints_in_one_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    values = ["no", "ok"]
+    single = count_pattern_evaluations(pattern_result(["^ok$"], values))
+    triple = count_pattern_evaluations(pattern_result(["^ok$"] * 3, values))
+
+    assert single > 0
+    assert triple == single
+    monkeypatch.setattr(generator_module, "_MAX_SUITE_PATTERN_EVALUATIONS", single)
+    suite = generate_test_suite(pattern_result(["^ok$"] * 3, values))
+    assert {case.path for case in suite.cases} == {"/items0", "/items1", "/items2"}
+    assert "generation_pattern_budget_exceeded" not in pattern_codes(suite)
+
+
+def test_dropped_step_does_not_refund_pattern_evaluations() -> None:
+    token, budget = with_budget()
+    try:
+        def step() -> None:
+            generator_module._pattern_accepts("^a$", "a", None)
+            generator_module._pattern_accepts("^a$", "b", None)
+            raise generator_module._BudgetExhausted("generation_case_budget_exceeded", "endpoint", 1, None, None)
+
+        _, exhausted = generator_module._run_step(budget, step)  # type: ignore[arg-type]
+
+        assert exhausted is not None
+        assert budget.endpoint_pattern_evaluations == 2
+        assert budget.suite_pattern_evaluations == 2
+        assert len(budget.pattern_memo) == 2
+
+        def failing() -> None:
+            generator_module._pattern_accepts("^a$", "c", None)
+            raise generator_module._UnsupportedOperation("unsupported_schema_keyword", "x", "/p")
+
+        with pytest.raises(generator_module._UnsupportedOperation):
+            generator_module._run_step(budget, failing)  # type: ignore[arg-type]
+        assert budget.suite_pattern_evaluations == 3
+    finally:
+        generator_module._BUDGET.reset(token)  # type: ignore[arg-type]
+
+
+def test_budget_exhaustion_inside_matches_is_not_swallowed_by_additional_properties(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_PATTERN_EVALUATIONS", 1)
+    token, budget = with_budget()
+    try:
+        schema = {"type": "object", "additionalProperties": {"type": "string", "pattern": "^a$"}}
+        with pytest.raises(generator_module._BudgetExhausted) as raised:
+            generator_module._matches(schema, {"p": "a", "q": "b"}, "3.1.1", "request", 0)
+        assert raised.value.code == "generation_pattern_budget_exceeded"
+        assert raised.value.scope == "endpoint"
+        assert raised.value.limit == 1
+        assert budget.endpoint_pattern_evaluations == 2
+    finally:
+        generator_module._BUDGET.reset(token)  # type: ignore[arg-type]
+
+
+def test_budgets_do_not_leak_between_generation_runs() -> None:
+    result = pattern_result(["^ok$"], ["no", "ok"])
+    first = count_pattern_evaluations(result)
+    second = count_pattern_evaluations(result)
+
+    assert first == second > 0
+    assert generator_module._BUDGET.get() is None
+
+
+def test_pattern_generation_is_deterministic_and_does_not_mutate_the_input() -> None:
+    result = pattern_result(["^ok$", "^[a-z]+$"], ["no", "ok"])
+    before = result.model_dump_json()
+
+    first = generate_test_suite(result)
+    second = generate_test_suite(result)
+
+    assert first == second
+    assert first.model_dump_json() == second.model_dump_json()
+    assert result.model_dump_json() == before
+
+
+def test_scanner_cache_clearing_or_eviction_does_not_change_output_or_counts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = pattern_result(["^ok$", "^[a-z]+$", "ok", "^o{1,2}k$"], ["no", "ok"])
+    clear_pattern_scan_cache()
+    warm = generate_test_suite(result)
+    warm_count = count_pattern_evaluations(result)
+    clear_pattern_scan_cache()
+    cold = generate_test_suite(result)
+    cold_count = count_pattern_evaluations(result)
+
+    tiny = lru_cache_one()
+    monkeypatch.setattr(generator_module, "_scan_pattern", tiny)
+    evicting = generate_test_suite(result)
+    evicting_count = count_pattern_evaluations(result)
+
+    assert warm == cold == evicting
+    assert warm.model_dump_json() == evicting.model_dump_json()
+    assert warm_count == cold_count == evicting_count > 0
+
+
+def lru_cache_one():  # type: ignore[no-untyped-def]
+    from functools import lru_cache
+
+    return lru_cache(maxsize=1)(generator_module._scan_pattern.__wrapped__)
+
+
+def count_pattern_compilations(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    compiled: list[str] = []
+    original = generator_module.re.compile
+
+    def counting(source: str, *args: object, **kwargs: object) -> object:
+        compiled.append(source)
+        return original(source, *args, **kwargs)
+
+    monkeypatch.setattr(generator_module.re, "compile", counting)
+    return compiled
+
+
+def test_repeated_pattern_pair_is_compiled_once_and_cached_results_skip_compilation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token, budget = with_budget()
+    try:
+        compiled = count_pattern_compilations(monkeypatch)
+        accepts = generator_module._pattern_accepts
+
+        assert [accepts("^a$", "a", None) for _ in range(5)] == [True] * 5
+        assert compiled == ["\\Aa\\Z"]
+        assert accepts("^a$", "b", None) is False
+        assert accepts("^b$", "a", None) is False
+        assert compiled == ["\\Aa\\Z", "\\Aa\\Z", "\\Ab\\Z"]
+        assert accepts("^a$", "b", None) is False
+        assert accepts("^b$", "a", None) is False
+        assert len(compiled) == 3
+        assert budget.suite_pattern_evaluations == 3
+    finally:
+        generator_module._BUDGET.reset(token)  # type: ignore[arg-type]
+
+
+def test_pair_over_the_evaluation_budget_is_not_compiled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_PATTERN_EVALUATIONS", 1)
+    token, budget = with_budget()
+    try:
+        compiled = count_pattern_compilations(monkeypatch)
+        assert generator_module._pattern_accepts("^a$", "a", None) is True
+        assert len(compiled) == 1
+
+        with pytest.raises(generator_module._BudgetExhausted):
+            generator_module._pattern_accepts("^b$", "b", None)
+
+        assert len(compiled) == 1
+        assert ("^b$", "b") not in budget.pattern_memo
+        assert generator_module._pattern_accepts("^a$", "a", None) is True
+        assert len(compiled) == 1
+    finally:
+        generator_module._BUDGET.reset(token)  # type: ignore[arg-type]
+
+
+def test_pattern_evaluation_without_a_budget_still_evaluates_directly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    compiled = count_pattern_compilations(monkeypatch)
+
+    assert generator_module._BUDGET.get() is None
+    assert generator_module._pattern_accepts("^a$", "a", None) is True
+    assert generator_module._pattern_accepts("^a$", "a", None) is True
+    assert generator_module._pattern_accepts("^a$", "b", None) is False
+    assert len(compiled) == 3
+
+
+def test_unsupported_pattern_and_long_candidate_are_not_compiled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token, budget = with_budget()
+    try:
+        compiled = count_pattern_compilations(monkeypatch)
+        assert generator_module._pattern_accepts("(a)", "a", None) is False
+        assert generator_module._pattern_accepts("^a+$", "a" * 129, None) is False
+        assert compiled == []
+        assert budget.suite_pattern_evaluations == 0
+    finally:
+        generator_module._BUDGET.reset(token)  # type: ignore[arg-type]

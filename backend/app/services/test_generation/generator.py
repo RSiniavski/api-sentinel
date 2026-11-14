@@ -9,6 +9,7 @@ import math
 import re
 from datetime import date
 from decimal import Decimal, InvalidOperation, localcontext
+from functools import lru_cache
 from hashlib import sha256
 from types import MappingProxyType
 from typing import Any
@@ -44,7 +45,7 @@ _SCHEMA_KEYS = {
     "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf",
     "minLength", "maxLength", "minItems", "maxItems", "uniqueItems",
     "properties", "required", "items", "readOnly", "writeOnly", "title",
-    "description", "deprecated", "format", "additionalProperties",
+    "description", "deprecated", "format", "additionalProperties", "pattern",
 }
 _COMPOSITIONS = {"allOf", "oneOf", "anyOf", "not"}
 
@@ -106,9 +107,14 @@ _MAX_ENDPOINT_CASES = 1_000
 _MAX_SUITE_CASES = 50_000
 _MAX_ENDPOINT_DIAGNOSTICS = 100
 _MAX_SUITE_DIAGNOSTICS = 5_000
+# Pattern evaluations are regular-expression searches of a distinct
+# (pattern, candidate) pair. Each one is charged once per generation run.
+_MAX_ENDPOINT_PATTERN_EVALUATIONS = 2_000
+_MAX_SUITE_PATTERN_EVALUATIONS = 20_000
 _EXPANSION_BUDGET_CODE = "generation_expansion_budget_exceeded"
 _CASE_BUDGET_CODE = "generation_case_budget_exceeded"
 _DIAGNOSTIC_BUDGET_CODE = "generation_diagnostic_budget_exceeded"
+_PATTERN_BUDGET_CODE = "generation_pattern_budget_exceeded"
 
 
 class _GenerationBudget:
@@ -119,6 +125,11 @@ class _GenerationBudget:
         self.suite_cases = 0
         self.suite_diagnostics = 0
         self.suite_suppressed = 0
+        self.suite_pattern_evaluations = 0
+        # Results of the (pattern, candidate) pairs already evaluated in this
+        # run. It lives on the budget, never at module level, so charges cannot
+        # depend on an earlier generation call.
+        self.pattern_memo: dict[tuple[str, str], bool] = {}
         self.begin_endpoint()
 
     def begin_endpoint(self) -> None:
@@ -126,6 +137,7 @@ class _GenerationBudget:
         self.endpoint_cases = 0
         self.endpoint_diagnostics = 0
         self.endpoint_suppressed = 0
+        self.endpoint_pattern_evaluations = 0
 
     def charge_expansion(self, pointer: str, reference_uri: str) -> None:
         self.endpoint_expansions += 1
@@ -139,6 +151,20 @@ class _GenerationBudget:
             raise _BudgetExhausted(
                 _EXPANSION_BUDGET_CODE, "suite", _MAX_SUITE_EXPANSIONS,
                 pointer, reference_uri,
+            )
+
+    def charge_pattern_evaluation(self, pointer: str | None) -> None:
+        self.endpoint_pattern_evaluations += 1
+        self.suite_pattern_evaluations += 1
+        if self.endpoint_pattern_evaluations > _MAX_ENDPOINT_PATTERN_EVALUATIONS:
+            raise _BudgetExhausted(
+                _PATTERN_BUDGET_CODE, "endpoint", _MAX_ENDPOINT_PATTERN_EVALUATIONS,
+                pointer, None,
+            )
+        if self.suite_pattern_evaluations > _MAX_SUITE_PATTERN_EVALUATIONS:
+            raise _BudgetExhausted(
+                _PATTERN_BUDGET_CODE, "suite", _MAX_SUITE_PATTERN_EVALUATIONS,
+                pointer, None,
             )
 
     def charge_case(self) -> None:
@@ -415,11 +441,10 @@ def _unsupported_diagnostic(
 def _budget_diagnostic(
     exhausted: _BudgetExhausted, step: str, endpoint: Endpoint, remaining: int
 ) -> GenerationDiagnostic:
-    what = (
-        "schema reference expansions"
-        if exhausted.code == _EXPANSION_BUDGET_CODE
-        else "generated test cases"
-    )
+    what = {
+        _EXPANSION_BUDGET_CODE: "schema reference expansions",
+        _PATTERN_BUDGET_CODE: "pattern evaluations",
+    }.get(exhausted.code, "generated test cases")
     if exhausted.scope == "endpoint":
         message = (
             f"The per-endpoint limit of {exhausted.limit} {what} was reached during "
@@ -3140,6 +3165,8 @@ def _check_schema(
             )
     if "type" in raw:
         _types(raw["type"], version, _child(pointer, "type"))
+    if "pattern" in raw:
+        _check_pattern(raw["pattern"], _child(pointer, "pattern"))
     if "format" in raw:
         _check_format(raw, version, pointer)
     for key in ("enum", "examples"):
@@ -3250,6 +3277,10 @@ def _matches(
     if isinstance(value, str):
         if len(value) < schema.get("minLength", 0) or len(value) > schema.get("maxLength", math.inf):
             return False
+        if "pattern" in schema and not _pattern_accepts(
+            schema["pattern"], value, _child(pointer, "pattern") if pointer else None
+        ):
+            return False
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         if not _number_matches(schema, value, version):
             return False
@@ -3311,6 +3342,231 @@ def _matches(
             if child_schema is False or (isinstance(child_schema, dict) and not _matches(child_schema, child_value, version, direction, depth + 1, _child(pointer, "properties", name))):
                 return False
     return True
+
+
+# ---------------------------------------------------------------------------
+# String `pattern` support.
+#
+# Only a small, deterministic regular-expression subset is supported. It is
+# validated here and not by the Parser, which accepts anything Python's `re`
+# can compile. Patterns are only used to check candidate values that already
+# exist; no value is ever synthesized from a pattern.
+# ---------------------------------------------------------------------------
+_PATTERN_MAX_LENGTH = 128
+_PATTERN_MAX_CANDIDATE_LENGTH = 128
+_PATTERN_MAX_BOUND = 128
+_PATTERN_MAX_VARIABLE_TERMS_ANCHORED = 2
+_PATTERN_MAX_VARIABLE_TERMS_UNANCHORED = 1
+_PATTERN_SYNTAX = "\\^$.*+?()[]{}|"
+_PATTERN_ESCAPABLE = _PATTERN_SYNTAX + "/"
+_PATTERN_CLASS_FORBIDDEN = "[]^-&|~"
+_PATTERN_BRACE = re.compile(r"\{(0|[1-9][0-9]*)(,(0|[1-9][0-9]*)?)?\}")
+
+
+class _PatternRejected(Exception):
+    """Internal to the scanner: the pattern is outside the supported subset."""
+
+
+def _pattern_printable(char: str) -> bool:
+    return " " <= char <= "~"
+
+
+@lru_cache(maxsize=256)
+def _scan_pattern(pattern: str) -> tuple[str | None, str]:
+    """Scan one pattern in a single pass.
+
+    Returns ``(regex_source, "")`` for a supported pattern or ``(None, reason)``
+    for an unsupported one. It is pure and never raises, so the bounded cache
+    only affects speed, never results.
+    """
+    try:
+        return _scan_pattern_source(pattern), ""
+    except _PatternRejected as rejected:
+        return None, str(rejected)
+
+
+def _pattern_source(pattern: Any) -> tuple[str | None, str]:
+    """Scan any value; anything but a string is rejected before the cache."""
+    if type(pattern) is not str:
+        return None, "the pattern is not a string"
+    return _scan_pattern(pattern)
+
+
+def _scan_pattern_source(pattern: str) -> str:
+    length = len(pattern)
+    if length > _PATTERN_MAX_LENGTH:
+        raise _PatternRejected(f"the pattern is longer than {_PATTERN_MAX_LENGTH} characters")
+
+    def at(index: int) -> str:
+        # Bounds-safe lookahead: "" past the end. Callers always compare with
+        # "" first because `"" in "*+?"` is True.
+        return pattern[index] if 0 <= index < length else ""
+
+    anchored = at(0) == "^"
+    index = 1 if anchored else 0
+    parts = ["\\A"] if anchored else []
+    variable_terms = 0
+    end_anchored = False
+    while index < length:
+        char = pattern[index]
+        if char == "$":
+            if index != length - 1:
+                raise _PatternRejected("'$' is only supported at the end of the pattern")
+            end_anchored = True
+            break
+        if char == "[":
+            atom, index = _scan_pattern_class(pattern, index)
+        elif char == "\\":
+            escaped = at(index + 1)
+            if escaped == "":
+                raise _PatternRejected("the pattern ends with a dangling backslash")
+            if escaped not in "dw" and escaped not in _PATTERN_ESCAPABLE:
+                raise _PatternRejected("an unsupported escape sequence")
+            atom = pattern[index:index + 2]
+            index += 2
+        elif _pattern_printable(char) and char not in _PATTERN_SYNTAX:
+            atom = char
+            index += 1
+        else:
+            raise _PatternRejected("an unsupported character or construct")
+
+        quantifier = ""
+        following = at(index)
+        if following != "" and following in "*+?":
+            quantifier = following
+            index += 1
+            variable_terms += 1
+        elif following == "{":
+            match = _PATTERN_BRACE.match(pattern, index)
+            if match is None:
+                raise _PatternRejected("a malformed or unsupported quantifier")
+            low = int(match.group(1))
+            if match.group(2) is None:
+                high: int | None = low
+            elif match.group(3) is None:
+                high = None
+            else:
+                high = int(match.group(3))
+            if low > _PATTERN_MAX_BOUND or (high is not None and high > _PATTERN_MAX_BOUND):
+                raise _PatternRejected(
+                    f"a quantifier bound is larger than {_PATTERN_MAX_BOUND}"
+                )
+            if high is not None and high < low:
+                raise _PatternRejected("a quantifier range is reversed")
+            if high is None or high > low:
+                variable_terms += 1
+            quantifier = match.group(0)
+            index = match.end()
+        following = at(index)
+        if following != "" and following in "*+?{":
+            raise _PatternRejected("stacked or lazy quantifiers are unsupported")
+        parts.append(atom + quantifier)
+
+    limit = (
+        _PATTERN_MAX_VARIABLE_TERMS_ANCHORED
+        if anchored
+        else _PATTERN_MAX_VARIABLE_TERMS_UNANCHORED
+    )
+    if variable_terms > limit:
+        raise _PatternRejected(
+            f"more than {limit} variable-width term(s) in a "
+            f"{'start-anchored' if anchored else 'non-anchored'} pattern"
+        )
+    if end_anchored:
+        parts.append("\\Z")
+    return "".join(parts)
+
+
+def _scan_pattern_class(pattern: str, start: int) -> tuple[str, int]:
+    """Scan the character class beginning at `start`; return it and its end."""
+    length = len(pattern)
+
+    def at(index: int) -> str:
+        return pattern[index] if 0 <= index < length else ""
+
+    def class_atom(index: int) -> tuple[str, int]:
+        char = at(index)
+        if char == "":
+            raise _PatternRejected("an unterminated character class")
+        if char == "\\":
+            escaped = at(index + 1)
+            if escaped == "":
+                raise _PatternRejected("the pattern ends with a dangling backslash")
+            if escaped in "dw":
+                return "class", index + 2
+            if escaped == "-":
+                return "hyphen", index + 2
+            if escaped in _PATTERN_ESCAPABLE:
+                return escaped, index + 2
+            raise _PatternRejected("an unsupported escape sequence")
+        if char in _PATTERN_CLASS_FORBIDDEN or not _pattern_printable(char):
+            raise _PatternRejected("an unsupported character in a character class")
+        return char, index + 1
+
+    index = start + 1
+    items = 0
+    if at(index) == "-":
+        if at(index + 1) == "-":
+            raise _PatternRejected("an unsupported hyphen in a character class")
+        index += 1
+        items += 1
+    while True:
+        char = at(index)
+        if char == "":
+            raise _PatternRejected("an unterminated character class")
+        if char == "]":
+            break
+        if char == "-":
+            if at(index + 1) == "]":
+                items += 1
+                index += 1
+                break
+            raise _PatternRejected("an unsupported hyphen in a character class")
+        first, index = class_atom(index)
+        if at(index) == "-" and at(index + 1) not in ("", "]"):
+            last, index = class_atom(index + 1)
+            if (
+                first in ("class", "hyphen")
+                or last in ("class", "hyphen")
+                or ord(last) < ord(first)
+            ):
+                raise _PatternRejected("an invalid character range")
+        items += 1
+    if items == 0:
+        raise _PatternRejected("an empty character class")
+    return pattern[start:index + 1], index + 1
+
+
+def _check_pattern(value: Any, pointer: str) -> None:
+    if not isinstance(value, str):
+        raise _UnsupportedOperation(
+            "unsupported_schema_form", "Schema pattern must be a string.", pointer
+        )
+    source, reason = _scan_pattern(value)
+    if source is None:
+        raise _UnsupportedOperation(
+            "unsupported_schema_keyword",
+            f"Schema keyword 'pattern' is outside the supported subset: {reason}.",
+            pointer,
+        )
+
+
+def _pattern_accepts(pattern: Any, value: str, pointer: str | None) -> bool:
+    """Whether a string candidate satisfies a pattern; unsupported means no."""
+    source, _ = _pattern_source(pattern)
+    if source is None or len(value) > _PATTERN_MAX_CANDIDATE_LENGTH:
+        return False
+    budget = _BUDGET.get()
+    if budget is None:
+        return re.compile(source, re.ASCII).search(value) is not None
+    key = (pattern, value)
+    result = budget.pattern_memo.get(key)
+    if result is None:
+        # Charge before compiling, so a pair over the limit costs no compilation.
+        budget.charge_pattern_evaluation(pointer)
+        result = re.compile(source, re.ASCII).search(value) is not None
+        budget.pattern_memo[key] = result
+    return result
 
 
 def _format_matches(name: Any, value: Any) -> bool:
