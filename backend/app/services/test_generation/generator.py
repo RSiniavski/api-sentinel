@@ -594,6 +594,21 @@ def _required_request_body_negative_case(
     )
 
 
+def _without_property(value: Any, path: tuple[str, ...]) -> Any:
+    """Copy `value` without the property at `path`, copying only the objects on it.
+
+    Every other subtree is shared with `value`. That is safe here because the
+    result is passed to `GeneratedBody`, whose validation builds an independent
+    copy; the shared parts never reach a generated case.
+    """
+    result = dict(value)
+    if len(path) == 1:
+        del result[path[0]]
+    else:
+        result[path[0]] = _without_property(value[path[0]], path[1:])
+    return result
+
+
 def _required_property_negative_cases(
     endpoint: Endpoint, positive: GeneratedTestCase, api: ApiModel
 ) -> tuple[tuple[GeneratedTestCase, ...], tuple[GenerationDiagnostic, ...]]:
@@ -618,14 +633,22 @@ def _required_property_negative_cases(
     if not property_paths and not undeclared_required:
         return (), ()
 
+    # This step is all-or-nothing. If its cases cannot all fit, fail now with the
+    # exhaustion the loop below would raise, before any body is copied or
+    # validated. Charging and restoring touches only the two case counters.
+    budget = _BUDGET.get()
+    if budget is not None:
+        counts = budget.case_counts()
+        try:
+            for _ in property_paths:
+                budget.charge_case()
+        finally:
+            budget.restore_case_counts(counts)
+
     root = _endpoint_pointer(endpoint)
     cases: list[GeneratedTestCase] = []
     for property_path, property_schema_pointer in property_paths:
-        body_value = deepcopy(positive.request_body.value)
-        target = body_value
-        for name in property_path[:-1]:
-            target = target[name]
-        del target[property_path[-1]]
+        body_value = _without_property(positive.request_body.value, property_path)
 
         property_reference = _json_pointer(property_path)
         cases.append(

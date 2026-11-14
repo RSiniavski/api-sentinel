@@ -11091,3 +11091,395 @@ def test_is_finite_number_accepts_every_int_and_checks_floats() -> None:
     assert generator_module._is_finite_number(1.5)
     assert not generator_module._is_finite_number(float("inf"))
     assert not generator_module._is_finite_number(float("nan"))
+
+
+def required_body_result(*schemas: dict[str, object]) -> NormalizationResult:
+    endpoints = tuple(
+        make_endpoint(
+            f"/e{index}",
+            "post",
+            request_body=RequestBody(
+                required=True,
+                content={"application/json": MediaType(schema=Schema(raw=schema))},
+            ),
+            responses=BAD_REQUEST,
+        )
+        for index, schema in enumerate(schemas)
+    )
+    return make_result(*endpoints)
+
+
+FLAT_REQUIRED_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "required": [f"p{index:02d}" for index in range(12)],
+    "properties": {
+        f"p{index:02d}": {"type": "string" if index % 2 else "integer"} for index in range(12)
+    },
+}
+NESTED_REQUIRED_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "required": ["a", "b"],
+    "properties": {
+        "a": {
+            "type": "object",
+            "required": ["x", "y"],
+            "properties": {
+                "x": {"type": "string"},
+                "y": {
+                    "type": "object",
+                    "required": ["z", "w"],
+                    "properties": {"z": {"type": "integer"}, "w": {"type": "string"}},
+                },
+            },
+        },
+        "b": {"type": "string"},
+        "c": {"type": "string"},
+    },
+}
+ARRAY_REQUIRED_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "required": ["tags", "owner"],
+    "properties": {
+        "tags": {
+            "type": "array",
+            "minItems": 2,
+            "items": {
+                "type": "object",
+                "required": ["k"],
+                "properties": {"k": {"type": "string"}},
+            },
+        },
+        "owner": {
+            "type": "object",
+            "required": ["id"],
+            "properties": {
+                "id": {"type": "integer"},
+                "history": {"type": "array", "items": {"type": "integer"}},
+            },
+        },
+    },
+}
+REQUIRED_BODY_SCHEMAS = [FLAT_REQUIRED_SCHEMA, NESTED_REQUIRED_SCHEMA, ARRAY_REQUIRED_SCHEMA]
+
+
+def required_property_cases(suite: GeneratedTestSuite) -> list[GeneratedTestCase]:
+    return [case for case in suite.cases if case.violated_constraint == "required_property"]
+
+
+def required_positive_body(suite: GeneratedTestSuite, path: str = "/e0") -> object:
+    case = next(case for case in suite.cases if case.path == path and case.category == "positive")
+    assert case.request_body is not None
+    return case.request_body.value
+
+
+def pointer_parts(pointer: str) -> tuple[str, ...]:
+    return tuple(part.replace("~1", "/").replace("~0", "~") for part in pointer.split("/")[1:])
+
+
+def container_ids(value: object) -> set[int]:
+    found: set[int] = set()
+    if isinstance(value, dict):
+        found.add(id(value))
+        for item in value.values():
+            found |= container_ids(item)
+    elif isinstance(value, list):
+        found.add(id(value))
+        for item in value:
+            found |= container_ids(item)
+    return found
+
+
+@pytest.mark.parametrize("schema", REQUIRED_BODY_SCHEMAS)
+def test_required_property_bodies_are_the_positive_body_without_that_property(
+    schema: dict[str, object],
+) -> None:
+    suite = generate_test_suite(required_body_result(schema))
+    positive = required_positive_body(suite)
+    cases = required_property_cases(suite)
+
+    assert cases
+    for case in cases:
+        assert case.affected_property is not None and case.request_body is not None
+        path = pointer_parts(case.affected_property)
+        expected = deepcopy(positive)
+        target = expected
+        for name in path[:-1]:
+            target = target[name]  # type: ignore[index]
+        del target[path[-1]]  # type: ignore[arg-type]
+        assert case.request_body.value == expected
+        # The positive body itself still has the property.
+        present = positive
+        for name in path:
+            present = present[name]  # type: ignore[index]
+
+
+@pytest.mark.parametrize("schema", REQUIRED_BODY_SCHEMAS)
+def test_path_copy_matches_the_deepcopy_reference_for_the_whole_suite(
+    monkeypatch: pytest.MonkeyPatch, schema: dict[str, object]
+) -> None:
+    result = required_body_result(schema)
+    with_path_copy = generate_test_suite(result)
+
+    def reference(value: object, path: tuple[str, ...]) -> object:
+        copied = deepcopy(value)
+        target = copied
+        for name in path[:-1]:
+            target = target[name]  # type: ignore[index]
+        del target[path[-1]]  # type: ignore[arg-type]
+        return copied
+
+    monkeypatch.setattr(generator_module, "_without_property", reference)
+    with_deepcopy = generate_test_suite(result)
+
+    assert required_property_cases(with_path_copy)
+    assert with_path_copy.model_dump() == with_deepcopy.model_dump()
+    assert with_path_copy.model_dump_json() == with_deepcopy.model_dump_json()
+
+
+def test_required_property_cases_cover_every_depth_in_a_fixed_order() -> None:
+    result = required_body_result(NESTED_REQUIRED_SCHEMA)
+    suite = generate_test_suite(result)
+    cases = required_property_cases(suite)
+
+    assert [case.affected_property for case in cases] == [
+        "/a",
+        "/a/x",
+        "/a/y",
+        "/a/y/w",
+        "/a/y/z",
+        "/b",
+    ]
+    assert len({case.case_id for case in cases}) == len(cases)
+    again = generate_test_suite(result)
+    assert [c.case_id for c in again.cases] == [c.case_id for c in suite.cases]
+    assert again == suite
+    assert required_positive_body(suite) == {"a": {"x": "sentinel", "y": {"z": 0, "w": "sentinel"}}, "b": "sentinel"}
+    assert cases[3].request_body is not None
+    assert cases[3].request_body.value == {"a": {"x": "sentinel", "y": {"z": 0}}, "b": "sentinel"}
+
+
+def test_required_property_inside_array_items_is_not_a_separate_case() -> None:
+    suite = generate_test_suite(required_body_result(ARRAY_REQUIRED_SCHEMA))
+    positive = required_positive_body(suite)
+
+    assert [case.affected_property for case in required_property_cases(suite)] == [
+        "/owner",
+        "/owner/id",
+        "/tags",
+    ]
+    assert isinstance(positive, dict) and isinstance(positive["tags"], list)  # type: ignore[index]
+    # The array and its items are kept intact in every other case.
+    for case in required_property_cases(suite):
+        assert case.request_body is not None
+        body = case.request_body.value
+        if case.affected_property != "/tags":
+            assert body["tags"] == positive["tags"]  # type: ignore[index]
+
+
+@pytest.mark.parametrize("schema", [NESTED_REQUIRED_SCHEMA, ARRAY_REQUIRED_SCHEMA])
+def test_required_property_bodies_share_no_mutable_objects(schema: dict[str, object]) -> None:
+    suite = generate_test_suite(required_body_result(schema))
+    positive = required_positive_body(suite)
+    snapshot = deepcopy(positive)
+    cases = required_property_cases(suite)
+    positive_ids = container_ids(positive)
+    id_sets = [container_ids(case.request_body.value) for case in cases if case.request_body]
+
+    assert len(id_sets) == len(cases) > 1
+    for index, ids in enumerate(id_sets):
+        assert ids.isdisjoint(positive_ids)
+        for other in id_sets[index + 1 :]:
+            assert ids.isdisjoint(other)
+
+    first = cases[0].request_body
+    assert first is not None and isinstance(first.value, dict)
+    first.value["injected"] = {"mutated": True}  # type: ignore[index]
+    for nested in first.value.values():
+        if isinstance(nested, dict):
+            nested["mutated"] = True
+        elif isinstance(nested, list):
+            nested.append("mutated")
+    assert positive == snapshot
+    for case in cases[1:]:
+        assert case.request_body is not None
+        assert "injected" not in case.request_body.value  # type: ignore[operator]
+
+
+def generate_flat_required_suite(
+    monkeypatch: pytest.MonkeyPatch, *, endpoint_limit: int | None = None, suite_limit: int | None = None
+) -> GeneratedTestSuite:
+    if endpoint_limit is not None:
+        monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_CASES", endpoint_limit)
+    if suite_limit is not None:
+        monkeypatch.setattr(generator_module, "_MAX_SUITE_CASES", suite_limit)
+    return generate_test_suite(required_body_result(FLAT_REQUIRED_SCHEMA))
+
+
+def test_required_property_step_fits_exactly_at_the_endpoint_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    count = 12  # the required properties of FLAT_REQUIRED_SCHEMA
+    fits = generate_flat_required_suite(monkeypatch, endpoint_limit=count + 1)
+
+    assert len(required_property_cases(fits)) == count
+    assert [d.code for d in fits.diagnostics].count("generation_case_budget_exceeded") <= 1
+    assert all(d.message.find("'required_property'") < 0 for d in fits.diagnostics)
+
+
+def test_required_property_step_one_case_over_the_endpoint_limit_is_dropped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    suite = generate_flat_required_suite(monkeypatch, endpoint_limit=12)
+
+    assert [case.category for case in suite.cases] == ["positive"]
+    assert [(d.code, d.message, d.endpoint_path, d.source_pointer) for d in suite.diagnostics] == [
+        (
+            "generation_case_budget_exceeded",
+            "The per-endpoint limit of 12 generated test cases was reached during "
+            "the 'required_property' step. That step produced no cases and the remaining "
+            "steps for this endpoint were skipped.",
+            "/e0",
+            "/paths/~1e0/post",
+        )
+    ]
+
+
+def test_required_property_step_over_the_suite_limit_reports_the_suite_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = required_body_result(FLAT_REQUIRED_SCHEMA, FLAT_REQUIRED_SCHEMA, FLAT_REQUIRED_SCHEMA)
+    full = generate_test_suite(result)
+    first_endpoint = [case for case in full.cases if case.path == "/e0"]
+    limit = len(first_endpoint) + 1 + 3  # the second endpoint's baseline, then too few
+    monkeypatch.setattr(generator_module, "_MAX_SUITE_CASES", limit)
+
+    suite = generate_test_suite(result)
+
+    assert [case.path for case in suite.cases] == [case.path for case in first_endpoint] + ["/e1"]
+    assert suite.cases[-1].category == "positive"
+    assert [(d.code, d.message, d.endpoint_path) for d in suite.diagnostics] == [
+        (
+            "generation_case_budget_exceeded",
+            f"The per-suite limit of {limit} generated test cases was reached during "
+            "the 'required_property' step of this endpoint. That step produced no cases; the "
+            "remaining steps of this endpoint and 1 following endpoint(s) were not generated.",
+            "/e1",
+        )
+    ]
+
+
+def prepare_required_step(
+    result: NormalizationResult,
+) -> tuple[object, object, GeneratedTestCase]:
+    suite = generate_test_suite(result)
+    positive = next(case for case in suite.cases if case.category == "positive")
+    return result.api.endpoints[0], result.api, positive
+
+
+def run_required_step(prepared: tuple[object, object, GeneratedTestCase], budget: object) -> tuple[object, object]:
+    endpoint, api, positive = prepared
+    token = generator_module._BUDGET.set(budget)  # type: ignore[arg-type]
+    try:
+        return generator_module._run_step(  # type: ignore[arg-type]
+            budget,
+            lambda: generator_module._required_property_negative_cases(endpoint, positive, api),  # type: ignore[arg-type]
+        )
+    finally:
+        generator_module._BUDGET.reset(token)
+
+
+def count_required_step_work(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
+    calls = {"copy": 0, "body": 0, "case": 0, "deepcopy": 0}
+    originals = {
+        "copy": generator_module._without_property,
+        "body": generator_module.GeneratedBody,
+        "case": generator_module.GeneratedTestCase,
+        "deepcopy": generator_module.deepcopy,
+    }
+
+    def counting(name: str) -> object:
+        def wrapper(*args: object, **kwargs: object) -> object:
+            calls[name] += 1
+            return originals[name](*args, **kwargs)  # type: ignore[operator]
+
+        return wrapper
+
+    monkeypatch.setattr(generator_module, "_without_property", counting("copy"))
+    monkeypatch.setattr(generator_module, "GeneratedBody", counting("body"))
+    monkeypatch.setattr(generator_module, "GeneratedTestCase", counting("case"))
+    monkeypatch.setattr(generator_module, "deepcopy", counting("deepcopy"))
+    return calls
+
+
+@pytest.mark.parametrize("remaining", [0, 1, 3, 11])
+def test_step_that_cannot_fit_builds_no_bodies_and_validates_nothing(
+    monkeypatch: pytest.MonkeyPatch, remaining: int
+) -> None:
+    # FLAT_REQUIRED_SCHEMA needs 12 cases; with 11 left it is one case short.
+    prepared = prepare_required_step(required_body_result(FLAT_REQUIRED_SCHEMA))
+    budget = generator_module._GenerationBudget()
+    budget.endpoint_cases = generator_module._MAX_ENDPOINT_CASES - remaining
+    budget.suite_cases = 100
+    before = budget.case_counts()
+    calls = count_required_step_work(monkeypatch)
+
+    outcome, exhausted = run_required_step(prepared, budget)
+
+    assert outcome is None
+    assert (exhausted.code, exhausted.scope, exhausted.limit) == (  # type: ignore[attr-defined]
+        "generation_case_budget_exceeded",
+        "endpoint",
+        generator_module._MAX_ENDPOINT_CASES,
+    )
+    assert calls == {"copy": 0, "body": 0, "case": 0, "deepcopy": 0}
+    assert budget.case_counts() == before
+
+
+def test_step_that_fits_exactly_builds_every_case(monkeypatch: pytest.MonkeyPatch) -> None:
+    prepared = prepare_required_step(required_body_result(FLAT_REQUIRED_SCHEMA))
+    budget = generator_module._GenerationBudget()
+    budget.endpoint_cases = generator_module._MAX_ENDPOINT_CASES - 12
+    calls = count_required_step_work(monkeypatch)
+
+    outcome, exhausted = run_required_step(prepared, budget)
+
+    assert exhausted is None
+    cases, _ = outcome  # type: ignore[misc]
+    assert len(cases) == 12
+    assert budget.endpoint_cases == generator_module._MAX_ENDPOINT_CASES
+    assert (calls["copy"], calls["case"]) == (12, 12)
+
+
+def test_suite_scope_pre_check_reports_the_suite_limit_without_building_cases(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prepared = prepare_required_step(required_body_result(FLAT_REQUIRED_SCHEMA))
+    budget = generator_module._GenerationBudget()
+    budget.suite_cases = generator_module._MAX_SUITE_CASES - 5
+    before = budget.case_counts()
+    calls = count_required_step_work(monkeypatch)
+
+    outcome, exhausted = run_required_step(prepared, budget)
+
+    assert outcome is None
+    assert (exhausted.scope, exhausted.limit) == ("suite", generator_module._MAX_SUITE_CASES)  # type: ignore[attr-defined]
+    assert calls == {"copy": 0, "body": 0, "case": 0, "deepcopy": 0}
+    assert budget.case_counts() == before
+
+
+def test_step_that_fits_charges_each_case_exactly_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prepared = prepare_required_step(required_body_result(FLAT_REQUIRED_SCHEMA))
+    budget = generator_module._GenerationBudget()
+    budget.endpoint_cases = 7
+    budget.suite_cases = 40
+    calls = count_required_step_work(monkeypatch)
+
+    outcome, exhausted = run_required_step(prepared, budget)
+
+    assert exhausted is None
+    cases, _ = outcome  # type: ignore[misc]
+    assert len(cases) == 12
+    assert budget.case_counts() == (7 + 12, 40 + 12)
+    assert (calls["copy"], calls["body"], calls["case"]) == (12, 12, 12)
