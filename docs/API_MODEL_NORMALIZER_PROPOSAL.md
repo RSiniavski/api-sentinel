@@ -349,7 +349,7 @@ The model should support these test categories without AI functionality:
 | Format/constraint tests | `format` and every preserved constraint, with a deterministic support registry in the Generator. |
 | Request/response contract tests | Media types, request schemas, status-code response keys, response headers, and response schemas. |
 
-The model should expose enough data to generate test definitions, but generation policy belongs to the Test Generator. For example, the model preserves a regex `pattern`; a separate deterministic generator decides whether it knows how to produce a matching and non-matching value.
+The model should expose enough data to generate test definitions, but generation policy belongs to the Test Generator. For example, the model preserves a regex `pattern`; a separate deterministic generator decides which existing candidate values it can validate against that pattern (it does not synthesize values from a pattern).
 
 ## 10. MVP scope and extensibility
 

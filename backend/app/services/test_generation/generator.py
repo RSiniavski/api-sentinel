@@ -108,9 +108,17 @@ _MAX_SUITE_CASES = 50_000
 _MAX_ENDPOINT_DIAGNOSTICS = 100
 _MAX_SUITE_DIAGNOSTICS = 5_000
 # Pattern evaluations are regular-expression searches of a distinct
-# (pattern, candidate) pair. Each one is charged once per generation run.
+# (pattern, candidate) pair. Each one is charged once per generation run, both
+# as one evaluation and as a weighted amount of work (see _pattern_work).
 _MAX_ENDPOINT_PATTERN_EVALUATIONS = 2_000
 _MAX_SUITE_PATTERN_EVALUATIONS = 20_000
+# Work units are deterministic accounting units of a nominal microsecond scale,
+# not a conversion to execution time. The calibration is empirical (CPython
+# 3.13, one machine, see _pattern_work); the limits are not a hard wall-clock
+# guarantee.
+_MAX_ENDPOINT_PATTERN_WORK = 500_000
+_MAX_SUITE_PATTERN_WORK = 4_000_000
+_PATTERN_WORK_UNIT = "pattern work units"
 _EXPANSION_BUDGET_CODE = "generation_expansion_budget_exceeded"
 _CASE_BUDGET_CODE = "generation_case_budget_exceeded"
 _DIAGNOSTIC_BUDGET_CODE = "generation_diagnostic_budget_exceeded"
@@ -126,6 +134,7 @@ class _GenerationBudget:
         self.suite_diagnostics = 0
         self.suite_suppressed = 0
         self.suite_pattern_evaluations = 0
+        self.suite_pattern_work = 0
         # Results of the (pattern, candidate) pairs already evaluated in this
         # run. It lives on the budget, never at module level, so charges cannot
         # depend on an earlier generation call.
@@ -138,6 +147,7 @@ class _GenerationBudget:
         self.endpoint_diagnostics = 0
         self.endpoint_suppressed = 0
         self.endpoint_pattern_evaluations = 0
+        self.endpoint_pattern_work = 0
 
     def charge_expansion(self, pointer: str, reference_uri: str) -> None:
         self.endpoint_expansions += 1
@@ -153,18 +163,30 @@ class _GenerationBudget:
                 pointer, reference_uri,
             )
 
-    def charge_pattern_evaluation(self, pointer: str | None) -> None:
+    def charge_pattern_evaluation(self, pointer: str | None, work: int) -> None:
         self.endpoint_pattern_evaluations += 1
         self.suite_pattern_evaluations += 1
+        self.endpoint_pattern_work += work
+        self.suite_pattern_work += work
         if self.endpoint_pattern_evaluations > _MAX_ENDPOINT_PATTERN_EVALUATIONS:
             raise _BudgetExhausted(
                 _PATTERN_BUDGET_CODE, "endpoint", _MAX_ENDPOINT_PATTERN_EVALUATIONS,
                 pointer, None,
             )
+        if self.endpoint_pattern_work > _MAX_ENDPOINT_PATTERN_WORK:
+            raise _BudgetExhausted(
+                _PATTERN_BUDGET_CODE, "endpoint", _MAX_ENDPOINT_PATTERN_WORK,
+                pointer, None, _PATTERN_WORK_UNIT,
+            )
         if self.suite_pattern_evaluations > _MAX_SUITE_PATTERN_EVALUATIONS:
             raise _BudgetExhausted(
                 _PATTERN_BUDGET_CODE, "suite", _MAX_SUITE_PATTERN_EVALUATIONS,
                 pointer, None,
+            )
+        if self.suite_pattern_work > _MAX_SUITE_PATTERN_WORK:
+            raise _BudgetExhausted(
+                _PATTERN_BUDGET_CODE, "suite", _MAX_SUITE_PATTERN_WORK,
+                pointer, None, _PATTERN_WORK_UNIT,
             )
 
     def charge_case(self) -> None:
@@ -211,6 +233,7 @@ class _BudgetExhausted(Exception):
         limit: int,
         pointer: str | None,
         reference_uri: str | None,
+        unit: str | None = None,
     ) -> None:
         super().__init__(code)
         self.code = code
@@ -218,6 +241,7 @@ class _BudgetExhausted(Exception):
         self.limit = limit
         self.pointer = pointer
         self.reference_uri = reference_uri
+        self.unit = unit
 
 
 # Budget of the generate_test_suite call in progress. None outside such a call,
@@ -441,7 +465,7 @@ def _unsupported_diagnostic(
 def _budget_diagnostic(
     exhausted: _BudgetExhausted, step: str, endpoint: Endpoint, remaining: int
 ) -> GenerationDiagnostic:
-    what = {
+    what = exhausted.unit or {
         _EXPANSION_BUDGET_CODE: "schema reference expansions",
         _PATTERN_BUDGET_CODE: "pattern evaluations",
     }.get(exhausted.code, "generated test cases")
@@ -3551,6 +3575,34 @@ def _check_pattern(value: Any, pointer: str) -> None:
         )
 
 
+def _pattern_work(pattern: str, value: str) -> int:
+    """Work estimate of one (pattern, candidate) evaluation.
+
+    Deterministic: it depends only on the two lengths, never on timing or the
+    environment. It is ``32 + ceil(m / 2)`` for compiling a pattern of ``m``
+    characters, plus ``ceil((n + 1)**2 * (m + 32) / 512)`` for searching a
+    candidate of ``n`` characters. The subset has no groups, alternation or
+    nested quantifiers, so the backtracking cost grows about quadratically with
+    ``n`` and linearly in the work done per attempt.
+
+    The calibration is empirical. On CPython 3.13 on one development machine,
+    the slowest patterns found took (a cold compile plus a failed search,
+    median and 95th percentile of repeated runs) about 0.1 to 0.4 of the
+    estimate, and no wider benchmark measurement was above about 0.65; the first
+    call in a fresh process costs relatively more for very small pairs. Work
+    units are deterministic accounting units of a nominal microsecond scale, not
+    a conversion to execution time. These ratios are measurements, not a proven
+    upper bound, and the work-unit budget is not a hard wall-clock guarantee:
+    other Python versions, CPUs or loads can differ.
+    Both lengths are already limited to 128 when this is called.
+    """
+    pattern_length = len(pattern)
+    candidate_length = len(value)
+    compile_work = 32 + (pattern_length + 1) // 2
+    search_work = ((candidate_length + 1) ** 2 * (pattern_length + 32) + 511) // 512
+    return compile_work + search_work
+
+
 def _pattern_accepts(pattern: Any, value: str, pointer: str | None) -> bool:
     """Whether a string candidate satisfies a pattern; unsupported means no."""
     source, _ = _pattern_source(pattern)
@@ -3563,7 +3615,7 @@ def _pattern_accepts(pattern: Any, value: str, pointer: str | None) -> bool:
     result = budget.pattern_memo.get(key)
     if result is None:
         # Charge before compiling, so a pair over the limit costs no compilation.
-        budget.charge_pattern_evaluation(pointer)
+        budget.charge_pattern_evaluation(pointer, _pattern_work(pattern, value))
         result = re.compile(source, re.ASCII).search(value) is not None
         budget.pattern_memo[key] = result
     return result

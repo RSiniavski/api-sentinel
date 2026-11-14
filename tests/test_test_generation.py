@@ -10259,9 +10259,9 @@ def count_pattern_evaluations(result: NormalizationResult) -> int:
     counter = {"count": 0}
     original = generator_module._GenerationBudget.charge_pattern_evaluation
 
-    def counting(self: object, pointer: object) -> None:
+    def counting(self: object, pointer: object, work: int) -> None:
         counter["count"] += 1
-        original(self, pointer)  # type: ignore[arg-type]
+        original(self, pointer, work)  # type: ignore[arg-type]
 
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(generator_module._GenerationBudget, "charge_pattern_evaluation", counting)
@@ -10545,3 +10545,364 @@ def test_unsupported_pattern_and_long_candidate_are_not_compiled(
         assert budget.suite_pattern_evaluations == 0
     finally:
         generator_module._BUDGET.reset(token)  # type: ignore[arg-type]
+
+
+# --- weighted pattern work budget -------------------------------------------
+
+# Long, quantified and never matching candidates that start with "-": the work
+# model charges by length only, so these inputs make the accounting deterministic.
+SLOW_PATTERN = (
+    r"^\wa\wa+a\w[ab]\waa\w{3}\w[ab]\wa\wa\w[ab]\waa\wa\wa\w[ab]\waa\wa\wa\w[ab]\waa"
+)
+
+
+def charged_pattern_work(result: NormalizationResult) -> list[int]:
+    charged: list[int] = []
+    original = generator_module._GenerationBudget.charge_pattern_evaluation
+
+    def recording(self: object, pointer: object, work: int) -> None:
+        charged.append(work)
+        original(self, pointer, work)  # type: ignore[arg-type]
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(generator_module._GenerationBudget, "charge_pattern_evaluation", recording)
+        generate_test_suite(result)
+    return charged
+
+
+def test_pattern_work_cost_function_values() -> None:
+    work = generator_module._pattern_work
+
+    assert work("", "") == 33
+    assert work("^a$", "a") == 35
+    assert work("a" * 128, "a" * 128) == 5_297
+    assert work("a" * 128, "") == 32 + 64 + (1 * 160 + 511) // 512
+    assert work("[0-9]{3}", "123") == 32 + 4 + (16 * 40 + 511) // 512
+
+
+def test_pattern_work_depends_only_on_the_two_lengths_and_grows_with_both() -> None:
+    work = generator_module._pattern_work
+
+    assert work("^[a-z]+$", "abcdef") == work("^[0-9]+$", "zzzzzz")
+    previous = 0
+    for length in range(0, 129):
+        current = work("a" * 16, "a" * length)
+        assert current >= previous
+        previous = current
+    previous = 0
+    for length in range(0, 129):
+        current = work("a" * length, "a" * 16)
+        assert current >= previous
+        previous = current
+    assert work("a" * 17, "a" * 16) > work("a" * 16, "a" * 16)
+    assert work("a" * 16, "a" * 17) > work("a" * 16, "a" * 16)
+
+
+def test_pattern_work_limits_are_ordered_and_admit_a_useful_number_of_worst_case_pairs() -> None:
+    worst = generator_module._pattern_work("a" * 128, "a" * 128)
+
+    assert generator_module._MAX_ENDPOINT_PATTERN_WORK == 500_000
+    assert generator_module._MAX_SUITE_PATTERN_WORK == 4_000_000
+    assert generator_module._PATTERN_WORK_UNIT == "pattern work units"
+    assert generator_module._MAX_ENDPOINT_PATTERN_WORK < generator_module._MAX_SUITE_PATTERN_WORK
+    assert generator_module._MAX_ENDPOINT_PATTERN_WORK // worst >= 90
+    assert generator_module._MAX_SUITE_PATTERN_WORK // worst >= 700
+
+
+def test_pattern_work_is_charged_once_per_distinct_pair_and_memo_hits_are_free() -> None:
+    token, budget = with_budget()
+    try:
+        accepts = generator_module._pattern_accepts
+        work = generator_module._pattern_work
+
+        assert accepts("^a$", "a", None) is True
+        assert budget.endpoint_pattern_work == budget.suite_pattern_work == work("^a$", "a")
+        for _ in range(3):
+            assert accepts("^a$", "a", None) is True
+        assert budget.suite_pattern_work == work("^a$", "a")
+        assert accepts("^a$", "bb", None) is False
+        assert budget.suite_pattern_work == work("^a$", "a") + work("^a$", "bb")
+        assert budget.suite_pattern_evaluations == 2
+        budget.begin_endpoint()
+        assert budget.endpoint_pattern_work == 0
+        assert accepts("^a$", "a", None) is True
+        assert budget.endpoint_pattern_work == 0
+        assert budget.suite_pattern_work == work("^a$", "a") + work("^a$", "bb")
+    finally:
+        generator_module._BUDGET.reset(token)  # type: ignore[arg-type]
+
+
+def test_pair_over_the_work_limit_is_charged_but_not_compiled_or_memoized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    work = generator_module._pattern_work
+    monkeypatch.setattr(
+        generator_module, "_MAX_ENDPOINT_PATTERN_WORK", work("^a$", "a") + work("^b$", "b") - 1
+    )
+    token, budget = with_budget()
+    try:
+        compiled = count_pattern_compilations(monkeypatch)
+        assert generator_module._pattern_accepts("^a$", "a", None) is True
+        assert len(compiled) == 1
+
+        with pytest.raises(generator_module._BudgetExhausted) as raised:
+            generator_module._pattern_accepts("^b$", "b", None)
+
+        assert len(compiled) == 1
+        assert ("^b$", "b") not in budget.pattern_memo
+        assert raised.value.code == "generation_pattern_budget_exceeded"
+        assert raised.value.scope == "endpoint"
+        assert raised.value.limit == generator_module._MAX_ENDPOINT_PATTERN_WORK
+        assert raised.value.unit == "pattern work units"
+        assert budget.suite_pattern_work == work("^a$", "a") + work("^b$", "b")
+    finally:
+        generator_module._BUDGET.reset(token)  # type: ignore[arg-type]
+
+
+def test_suite_work_limit_raises_with_suite_scope_after_the_endpoint_limits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    work = generator_module._pattern_work("^a$", "a")
+    monkeypatch.setattr(generator_module, "_MAX_SUITE_PATTERN_WORK", work)
+    token, budget = with_budget()
+    try:
+        assert generator_module._pattern_accepts("^a$", "a", None) is True
+        budget.begin_endpoint()
+        with pytest.raises(generator_module._BudgetExhausted) as raised:
+            generator_module._pattern_accepts("^b$", "b", None)
+        assert (raised.value.scope, raised.value.limit, raised.value.unit) == (
+            "suite", work, "pattern work units",
+        )
+    finally:
+        generator_module._BUDGET.reset(token)  # type: ignore[arg-type]
+
+
+def test_evaluation_count_limit_keeps_its_own_message_when_work_is_plentiful(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_PATTERN_EVALUATIONS", 2)
+    suite = generate_test_suite(pattern_result(["^ok$"], ["a1", "a2", "a3", "ok"]))
+
+    assert [item.code for item in suite.diagnostics] == ["generation_pattern_budget_exceeded"]
+    assert "per-endpoint limit of 2 pattern evaluations" in suite.diagnostics[0].message
+    assert "pattern work units" not in suite.diagnostics[0].message
+
+
+def test_endpoint_work_limit_stops_the_step_with_a_work_unit_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = pattern_result(["^ok$"], ["a1", "a2", "a3", "a4", "ok"])
+    used = charged_pattern_work(result)
+    assert len(used) >= 4
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_PATTERN_WORK", sum(used[:3]))
+
+    suite = generate_test_suite(result)
+
+    assert suite.cases == ()
+    assert [item.code for item in suite.diagnostics] == ["generation_pattern_budget_exceeded"]
+    message = suite.diagnostics[0].message
+    assert f"per-endpoint limit of {sum(used[:3])} pattern work units" in message
+    assert "'positive_baseline' step" in message
+    assert suite.diagnostics[0].source_pointer.endswith("/properties/a/pattern")  # type: ignore[union-attr]
+    assert generate_test_suite(result) == suite
+
+
+def test_suite_work_limit_stops_the_remaining_endpoints(monkeypatch: pytest.MonkeyPatch) -> None:
+    values = ["no", "ok1", "ok2", "ok3"]
+    patterns = ["^ok1$", "^ok2$", "^ok3$"]
+    one = sum(charged_pattern_work(pattern_result(patterns[:1], values)))
+    monkeypatch.setattr(generator_module, "_MAX_SUITE_PATTERN_WORK", one)
+
+    suite = generate_test_suite(pattern_result(patterns, values))
+
+    assert {case.path for case in suite.cases} == {"/items0"}
+    budget = [item for item in suite.diagnostics if item.code == "generation_pattern_budget_exceeded"]
+    assert len(budget) == 1 and budget[0].endpoint_path == "/items1"
+    assert f"per-suite limit of {one} pattern work units" in budget[0].message
+    assert "1 following endpoint(s)" in budget[0].message
+    assert generate_test_suite(pattern_result(patterns, values)) == suite
+
+
+def test_work_accounting_is_identical_across_runs_and_cache_states() -> None:
+    result = pattern_result(["^ok$", "^[a-z]+$", "ok"], ["no", "ok"])
+    clear_pattern_scan_cache()
+    first = charged_pattern_work(result)
+    second = charged_pattern_work(result)
+    clear_pattern_scan_cache()
+    third = charged_pattern_work(result)
+
+    assert first == second == third
+    assert first and all(isinstance(item, int) and item > 0 for item in first)
+
+
+def test_endpoint_pattern_counters_accumulate_across_steps_and_reset_only_between_endpoints(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    budget_class = generator_module._GenerationBudget
+    original_begin = budget_class.begin_endpoint
+    original_charge = budget_class.charge_pattern_evaluation
+    original_run_step = generator_module._run_step
+    state = {"begins": 0, "steps": 0}
+    rows: list[dict[str, int]] = []
+
+    def begin(self: object) -> None:
+        state["begins"] += 1
+        original_begin(self)  # type: ignore[arg-type]
+
+    def run_step(budget: object, step: object) -> object:
+        state["steps"] += 1
+        return original_run_step(budget, step)  # type: ignore[arg-type]
+
+    def charge(self: object, pointer: object, work: int) -> None:
+        original_charge(self, pointer, work)  # type: ignore[arg-type]
+        rows.append(
+            {
+                "begins": state["begins"],
+                "step": state["steps"],
+                "work": work,
+                "endpoint_evaluations": self.endpoint_pattern_evaluations,  # type: ignore[attr-defined]
+                "endpoint_work": self.endpoint_pattern_work,  # type: ignore[attr-defined]
+                "suite_evaluations": self.suite_pattern_evaluations,  # type: ignore[attr-defined]
+                "suite_work": self.suite_pattern_work,  # type: ignore[attr-defined]
+            }
+        )
+
+    monkeypatch.setattr(budget_class, "begin_endpoint", begin)
+    monkeypatch.setattr(budget_class, "charge_pattern_evaluation", charge)
+    monkeypatch.setattr(generator_module, "_run_step", run_step)
+
+    generate_test_suite(pattern_result(["^ok$", "^no$"], ["no", "ok", "oops"]))
+
+    # begin_endpoint runs once in the constructor and once per endpoint.
+    assert state["begins"] == 3
+    groups = [[row for row in rows if row["begins"] == number] for number in (2, 3)]
+    assert all(groups)
+    total_work = 0
+    total_evaluations = 0
+    for group in groups:
+        # The pairs are charged by more than one step of the same endpoint.
+        assert len({row["step"] for row in group}) >= 2
+        running_work = 0
+        for position, row in enumerate(group, start=1):
+            running_work += row["work"]
+            total_work += row["work"]
+            total_evaluations += 1
+            assert row["endpoint_evaluations"] == position
+            assert row["endpoint_work"] == running_work
+            assert row["suite_evaluations"] == total_evaluations
+            assert row["suite_work"] == total_work
+    assert groups[1][0]["endpoint_evaluations"] == 1
+    assert groups[1][0]["endpoint_work"] == groups[1][0]["work"]
+
+
+def adversarial_result(endpoints: int, per_endpoint: int) -> NormalizationResult:
+    assert generator_module._scan_pattern(SLOW_PATTERN)[0] is not None
+    return make_result(
+        *(
+            make_endpoint(
+                f"/items{index}",
+                "post",
+                request_body=RequestBody(
+                    required=True,
+                    content={
+                        "application/json": MediaType(
+                            schema=Schema(
+                                raw=pattern_object(
+                                    {
+                                        "type": "string",
+                                        "pattern": SLOW_PATTERN,
+                                        "enum": [
+                                            "-" + "a" * 121 + f"{index * per_endpoint + item:06d}"
+                                            for item in range(per_endpoint)
+                                        ],
+                                    }
+                                )
+                            )
+                        )
+                    },
+                ),
+                responses=BAD_REQUEST,
+            )
+            for index in range(endpoints)
+        )
+    )
+
+
+def test_large_adversarial_pattern_input_is_stopped_by_the_work_budget() -> None:
+    result = adversarial_result(13, 2_000)
+    worst = generator_module._pattern_work(SLOW_PATTERN, "-" + "a" * 127)
+
+    used = charged_pattern_work(result)
+    suite = generate_test_suite(result)
+
+    assert suite.cases == ()
+    assert sum(used) <= generator_module._MAX_SUITE_PATTERN_WORK + worst
+    assert len(used) <= generator_module._MAX_SUITE_PATTERN_WORK // worst + 2
+    assert len(used) < generator_module._MAX_SUITE_PATTERN_EVALUATIONS // 10
+    codes = {item.code for item in suite.diagnostics}
+    assert "generation_pattern_budget_exceeded" in codes
+    suite_messages = [
+        item.message for item in suite.diagnostics if "per-suite limit" in item.message
+    ]
+    assert suite_messages and "pattern work units" in suite_messages[0]
+    assert generate_test_suite(result) == suite
+    assert charged_pattern_work(result) == used
+
+
+def normal_pattern_properties(index: int) -> dict[str, dict[str, object]]:
+    """Five realistic string properties whose examples differ per endpoint."""
+    return {
+        "id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+            "example": f"123e4567-e89b-12d3-a456-{index:012d}",
+        },
+        "slug": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$", "example": f"item-{index}"},
+        "code": {"type": "string", "pattern": "^[A-Z]{2}[0-9]{3}$", "example": f"AB{index % 1000:03d}"},
+        "phone": {
+            "type": "string", "pattern": r"^\+?[0-9]{7,15}$", "example": f"+38044{index:07d}",
+        },
+        "name": {"type": "string", "pattern": "^[A-Za-z ]+$", "enum": ["Ann Lee", "Bob", "Cy"]},
+    }
+
+
+def normal_pattern_result(endpoints: int) -> NormalizationResult:
+    return make_result(
+        *(
+            make_endpoint(
+                f"/things{index}",
+                "post",
+                request_body=RequestBody(
+                    required=True,
+                    content={
+                        "application/json": MediaType(
+                            schema=Schema(
+                                raw={
+                                    "type": "object",
+                                    "required": sorted(normal_pattern_properties(index)),
+                                    "properties": normal_pattern_properties(index),
+                                }
+                            )
+                        )
+                    },
+                ),
+                responses=BAD_REQUEST,
+            )
+            for index in range(endpoints)
+        )
+    )
+
+
+def test_representative_normal_pattern_input_stays_far_below_the_work_budget() -> None:
+    result = normal_pattern_result(100)
+
+    used = charged_pattern_work(result)
+    suite = generate_test_suite(result)
+
+    assert "generation_pattern_budget_exceeded" not in {item.code for item in suite.diagnostics}
+    assert suite.diagnostics == ()
+    assert {case.path for case in suite.cases} == {f"/things{index}" for index in range(100)}
+    assert sum(used) < generator_module._MAX_SUITE_PATTERN_WORK // 4
+    assert len(used) < generator_module._MAX_SUITE_PATTERN_EVALUATIONS // 4
+    per_endpoint = sum(charged_pattern_work(normal_pattern_result(1)))
+    assert per_endpoint < generator_module._MAX_ENDPOINT_PATTERN_WORK // 10
