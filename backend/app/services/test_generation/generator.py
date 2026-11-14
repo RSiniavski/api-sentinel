@@ -3715,13 +3715,18 @@ def _fallback_values(schema: dict[str, Any], version: str, pointer: str, directi
             bound = schema.get(key)
             if isinstance(bound, (int, float)) and not isinstance(bound, bool):
                 candidates.extend((bound, bound - 1, bound + 1))
-                if kind == "integer":
+                if kind == "integer" and _is_finite_number(bound):
                     candidates.extend((math.floor(bound), math.ceil(bound)))
         multiple = schema.get("multipleOf")
         if isinstance(multiple, (int, float)) and not isinstance(multiple, bool) and multiple > 0:
             candidates.extend((multiple, -multiple, multiple * 2, -multiple * 2))
         if kind == "integer":
-            if isinstance(multiple, (int, float)) and not isinstance(multiple, bool) and multiple > 0:
+            if (
+                isinstance(multiple, (int, float))
+                and not isinstance(multiple, bool)
+                and multiple > 0
+                and _is_finite_number(multiple)
+            ):
                 # Integer multiples of a reduced decimal p/q lie on the p-step
                 # lattice. Include lattice points around each bound so the
                 # fallback can find a valid value even when p itself is far
@@ -3747,7 +3752,11 @@ def _fallback_values(schema: dict[str, Any], version: str, pointer: str, directi
                         }
                     ):
                         candidates.append(units * int(lattice_step))
-            candidates = [int(value) for value in candidates if float(value).is_integer()]
+            # An int is integral by definition. Converting it to float would
+            # overflow for values beyond the float range.
+            candidates = [
+                int(value) for value in candidates if isinstance(value, int) or value.is_integer()
+            ]
         return tuple(dict.fromkeys(candidates))
     if kind == "boolean":
         return (False, True)
@@ -3796,6 +3805,11 @@ def _fallback_values(schema: dict[str, Any], version: str, pointer: str, directi
     return (None, {}, [], False, 0, "")
 
 
+def _is_finite_number(value: int | float) -> bool:
+    # math.isfinite converts an int to float, which overflows for huge ints.
+    return isinstance(value, int) or math.isfinite(value)
+
+
 def _number_matches(schema: dict[str, Any], value: int | float, version: str) -> bool:
     if isinstance(value, bool):
         return False
@@ -3813,9 +3827,11 @@ def _number_matches(schema: dict[str, Any], value: int | float, version: str) ->
     multiple = schema.get("multipleOf")
     if multiple is not None:
         try:
-            if Decimal(str(value)) % Decimal(str(multiple)) != 0:
+            # Exact rational arithmetic: Decimal's remainder is limited by the
+            # context precision and fails for large quotients.
+            if not _decimal_is_multiple(Decimal(str(value)), Decimal(str(multiple))):
                 return False
-        except (InvalidOperation, ZeroDivisionError):
+        except (InvalidOperation, OverflowError, ValueError):
             return False
     return True
 

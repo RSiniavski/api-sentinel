@@ -10906,3 +10906,188 @@ def test_representative_normal_pattern_input_stays_far_below_the_work_budget() -
     assert len(used) < generator_module._MAX_SUITE_PATTERN_EVALUATIONS // 4
     per_endpoint = sum(charged_pattern_work(normal_pattern_result(1)))
     assert per_endpoint < generator_module._MAX_ENDPOINT_PATTERN_WORK // 10
+
+
+HUGE = 10**400
+
+
+def huge_number_suite(schema: dict[str, object], version: str = "3.1.1") -> GeneratedTestSuite:
+    body = pattern_object(schema)
+    broken = make_endpoint(
+        "/big",
+        "post",
+        request_body=RequestBody(
+            required=True, content={"application/json": MediaType(schema=Schema(raw=body))}
+        ),
+        responses=BAD_REQUEST,
+    )
+    healthy = make_endpoint("/healthy", "get", responses=BAD_REQUEST)
+    return generate_test_suite(make_result(broken, healthy, version=version))
+
+
+def positive_number(suite: GeneratedTestSuite) -> object:
+    case = next(case for case in suite.cases if case.path == "/big" and case.category == "positive")
+    assert case.request_body is not None
+    return case.request_body.value["a"]  # type: ignore[index]
+
+
+def satisfies_exactly(schema: dict[str, object], value: object) -> bool:
+    from fractions import Fraction
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    number = Fraction(value)
+    if schema["type"] == "integer" and number.denominator != 1:
+        return False
+    checks = {
+        "minimum": lambda bound: number >= bound,
+        "maximum": lambda bound: number <= bound,
+        "exclusiveMinimum": lambda bound: number > bound,
+        "exclusiveMaximum": lambda bound: number < bound,
+    }
+    for key, check in checks.items():
+        if key in schema and not check(Fraction(schema[key])):  # type: ignore[arg-type]
+            return False
+    if "multipleOf" in schema:
+        return (number / Fraction(schema["multipleOf"])).denominator == 1  # type: ignore[arg-type]
+    return True
+
+
+HUGE_BOUND_CASES = [
+    ("3.1.1", "minimum", HUGE),
+    ("3.1.1", "minimum", -HUGE),
+    ("3.1.1", "maximum", HUGE),
+    ("3.1.1", "maximum", -HUGE),
+    ("3.1.1", "exclusiveMinimum", HUGE),
+    ("3.1.1", "exclusiveMinimum", -HUGE),
+    ("3.1.1", "exclusiveMaximum", HUGE),
+    ("3.1.1", "exclusiveMaximum", -HUGE),
+    ("3.1.1", "multipleOf", HUGE),
+    ("3.0.3", "minimum", HUGE),
+    ("3.0.3", "minimum", -HUGE),
+    ("3.0.3", "maximum", HUGE),
+    ("3.0.3", "maximum", -HUGE),
+    ("3.0.3", "multipleOf", HUGE),
+]
+
+
+@pytest.mark.parametrize("kind", ["integer", "number"])
+@pytest.mark.parametrize(("version", "keyword", "bound"), HUGE_BOUND_CASES)
+def test_huge_integer_bounds_do_not_abort_the_suite(
+    kind: str, version: str, keyword: str, bound: int
+) -> None:
+    schema: dict[str, object] = {"type": kind, keyword: bound}
+    suite = huge_number_suite(schema, version)
+
+    assert any(case.path == "/healthy" for case in suite.cases)
+    assert satisfies_exactly(schema, positive_number(suite))
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [
+        {"type": "integer", "minimum": HUGE, "multipleOf": 3},
+        {"type": "integer", "maximum": -HUGE, "multipleOf": 7},
+        {"type": "integer", "minimum": HUGE, "maximum": HUGE + 5},
+        {"type": "integer", "minimum": HUGE, "multipleOf": HUGE},
+        {"type": "integer", "multipleOf": HUGE, "maximum": 10**500},
+        {"type": "integer", "exclusiveMinimum": HUGE, "multipleOf": 2.5},
+        {"type": "integer", "minimum": -HUGE, "maximum": HUGE, "multipleOf": 10**30},
+    ],
+)
+def test_huge_integer_bounds_with_multiple_of_generate_exactly_valid_values(
+    schema: dict[str, object],
+) -> None:
+    suite = huge_number_suite(schema)
+
+    assert any(case.path == "/healthy" for case in suite.cases)
+    value = positive_number(suite)
+    assert isinstance(value, int) and satisfies_exactly(schema, value)
+    assert not [d for d in suite.diagnostics if d.code == "no_positive_schema_value"]
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [
+        {"type": "integer", "minimum": float("inf")},
+        {"type": "integer", "maximum": float("-inf")},
+        {"type": "integer", "exclusiveMinimum": float("inf")},
+        {"type": "integer", "exclusiveMaximum": float("-inf")},
+        {"type": "integer", "multipleOf": float("inf")},
+        {"type": "integer", "minimum": float("nan")},
+        {"type": "integer", "multipleOf": float("nan")},
+    ],
+)
+def test_non_finite_integer_bounds_do_not_abort_the_suite(schema: dict[str, object]) -> None:
+    suite = huge_number_suite(schema)
+
+    assert any(case.path == "/healthy" for case in suite.cases)
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [
+        {"type": "integer", "minimum": float("inf")},
+        {"type": "integer", "maximum": float("-inf")},
+        {"type": "integer", "multipleOf": float("inf")},
+    ],
+)
+def test_unsatisfiable_non_finite_integer_bounds_give_an_explicit_diagnostic(
+    schema: dict[str, object],
+) -> None:
+    suite = huge_number_suite(schema)
+
+    assert not [case for case in suite.cases if case.path == "/big"]
+    codes = [d.code for d in suite.diagnostics if d.endpoint_path == "/big"]
+    assert codes == ["no_positive_schema_value"]
+
+
+def test_huge_integer_bound_generation_is_deterministic() -> None:
+    schema: dict[str, object] = {"type": "integer", "minimum": HUGE, "multipleOf": 3}
+
+    first = huge_number_suite(schema)
+    second = huge_number_suite(schema)
+
+    assert first == second
+    assert first.model_dump_json() == second.model_dump_json()
+
+
+def test_ordinary_integer_and_number_schemas_keep_their_values() -> None:
+    integer = {"type": "integer", "minimum": 5, "multipleOf": 3}
+    assert positive_number(huge_number_suite(integer)) == 6
+    assert positive_number(huge_number_suite({"type": "integer", "minimum": 1, "maximum": 5})) == 1
+    number = {"type": "number", "minimum": 1.5, "exclusiveMaximum": 4.5, "multipleOf": 0.5}
+    value = positive_number(huge_number_suite(number))
+    assert satisfies_exactly(number, value)
+    assert not [d for d in huge_number_suite(number).diagnostics if d.endpoint_path == "/big"]
+
+
+@pytest.mark.parametrize(
+    ("schema", "value", "expected"),
+    [
+        ({"multipleOf": 3}, 9, True),
+        ({"multipleOf": 3}, 7, False),
+        ({"multipleOf": 0.1}, 0.3, True),
+        ({"multipleOf": 0.5}, 1.25, False),
+        ({"multipleOf": 0}, 4, False),
+        ({"multipleOf": 3}, float("inf"), False),
+        ({"multipleOf": 3}, float("nan"), False),
+        ({"multipleOf": float("inf")}, 3, False),
+        ({"multipleOf": 1}, 10**30, True),
+        ({"multipleOf": 3}, 3 * 10**400, True),
+        ({"multipleOf": 3}, 3 * 10**400 + 1, False),
+        ({"multipleOf": HUGE}, 2 * HUGE, True),
+    ],
+)
+def test_number_multiple_of_uses_exact_arithmetic(
+    schema: dict[str, object], value: int | float, expected: bool
+) -> None:
+    assert generator_module._number_matches(schema, value, "3.1.1") is expected
+
+
+def test_is_finite_number_accepts_every_int_and_checks_floats() -> None:
+    assert generator_module._is_finite_number(HUGE)
+    assert generator_module._is_finite_number(-HUGE)
+    assert generator_module._is_finite_number(1.5)
+    assert not generator_module._is_finite_number(float("inf"))
+    assert not generator_module._is_finite_number(float("nan"))
