@@ -1352,8 +1352,12 @@ def _array_bound_negative_cases(
 
     Targets are a root array, array properties present in the positive request
     body, and optional (writable) array properties that are absent from it when
-    their parent object is present. Missing parents are not created, and array
-    elements are not traversed.
+    their parent object is present. Missing parents are not created. After
+    these, only element 0 of each present non-empty array is visited, through
+    its items schema: an element that is an object contributes the same
+    targets as any object, and an element that is an array is a target itself.
+    A case below an array or items schema with ``enum`` or ``const`` is not
+    generated, because the changed element would also violate that literal.
     """
     version = api.openapi_version
     resolved = _resolved_request_body(endpoint, api)
@@ -1369,6 +1373,10 @@ def _array_bound_negative_cases(
     root_pointer = _child(body_pointer, "content", "application/json", "schema")
     targets: list[tuple[tuple[str, ...], str, list[Any], str]] = []
     diagnostics: list[GenerationDiagnostic] = []
+    # Present non-empty arrays whose element 0 is visited after all other
+    # targets, and the keyword pointer of an enclosing enum/const, if any.
+    pending: list[tuple[dict[str, Any], list[Any], tuple[str, ...], str, str | None]] = []
+    blocker: list[str | None] = [None]
 
     def report(
         code: str, message: str, pointer: str, reference_uri: str | None = None
@@ -1490,6 +1498,16 @@ def _array_bound_negative_cases(
                     f"No deterministic array safely violates '{constraint}' while satisfying the other supported constraints.",
                     constraint_pointer,
                 )
+            elif blocker[0] is not None:
+                # Changing this element would also break an enclosing literal.
+                report(
+                    "array_bound_no_safe_candidate",
+                    (
+                        f"The '{constraint}' case for an array element would also "
+                        f"violate the enclosing literal at {blocker[0]}; no case was generated."
+                    ),
+                    constraint_pointer,
+                )
             else:
                 targets.append((path, constraint, candidate, pointer))
 
@@ -1541,8 +1559,11 @@ def _array_bound_negative_cases(
             return
         schema, pointer = followed
         if not path and isinstance(schema, dict):
-            # A root-level array body; nested arrays are not traversed.
+            # A root-level array body.
             target_array(schema, pointer, path)
+        if isinstance(schema, dict) and isinstance(value, list) and value:
+            # Elements are visited after every other target was collected.
+            pending.append((schema, value, path, pointer, blocker[0]))
         if not isinstance(schema, dict) or not isinstance(value, dict):
             return
         properties = schema.get("properties")
@@ -1579,7 +1600,39 @@ def _array_bound_negative_cases(
 
             visit(child_schema, value[name], child_path, child_pointer)
 
+    def visit_element(
+        schema: dict[str, Any],
+        value: list[Any],
+        path: tuple[str, ...],
+        pointer: str,
+        inherited: str | None,
+    ) -> None:
+        """Visit element 0 of one present array through its items schema."""
+        if "items" not in schema:
+            return
+        followed = _follow_property_schema(
+            schema["items"], _child(pointer, "items"), report_issue
+        )
+        if followed is None or not isinstance(followed[0], dict):
+            return
+        item_schema, item_pointer = followed
+        element_path = (*path, "0")
+        # A literal on this array or on its items schema fixes every element
+        # value, so a changed element would also violate it.
+        outer = inherited or _literal_pointer(schema, pointer)
+        element = value[0]
+        if isinstance(element, list):
+            blocker[0] = outer
+            target_array(item_schema, item_pointer, element_path)
+        blocker[0] = outer or _literal_pointer(item_schema, item_pointer)
+        if isinstance(element, (dict, list)):
+            visit(item_schema, element, element_path, item_pointer)
+
     visit(media.schema.raw, positive.request_body.value, (), root_pointer)
+    for entry in pending:  # grows while elements are visited
+        blocker[0] = entry[4]
+        visit_element(*entry)
+    blocker[0] = None
 
     cases: list[GeneratedTestCase] = []
     for path, constraint, candidate, schema_pointer in targets:
@@ -1587,8 +1640,9 @@ def _array_bound_negative_cases(
             generated_value = deepcopy(positive.request_body.value)
             parent = generated_value
             for name in path[:-1]:
-                parent = parent[name]
-            parent[path[-1]] = candidate
+                parent = parent[int(name)] if isinstance(parent, list) else parent[name]
+            last = int(path[-1]) if isinstance(parent, list) else path[-1]
+            parent[last] = candidate
         else:
             # A root-level array replaces the whole body.
             generated_value = candidate
@@ -1669,6 +1723,14 @@ def _array_candidate(
     if constraint == "uniqueItems" and not _has_duplicate_items(candidate):
         return None
     return candidate
+
+
+def _literal_pointer(schema: dict[str, Any], pointer: str) -> str | None:
+    """Pointer of a ``const`` or ``enum`` keyword in a schema, if it has one."""
+    for keyword in ("const", "enum"):
+        if keyword in schema:
+            return _child(pointer, keyword)
+    return None
 
 
 def _has_duplicate_items(items: list[Any]) -> bool:

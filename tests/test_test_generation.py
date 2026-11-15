@@ -5420,7 +5420,7 @@ def test_arrays_inside_nested_objects_are_covered() -> None:
     assert cases[0].request_body.value == {"outer": {"tags": ["x"]}}
 
 
-def test_out_of_scope_arrays_are_not_generated() -> None:
+def test_nested_array_is_covered_through_its_first_element() -> None:
     nested_array = generate_test_suite(
         make_result(
             post_endpoint(
@@ -5435,7 +5435,7 @@ def test_out_of_scope_arrays_are_not_generated() -> None:
         )
     )
 
-    assert array_summary(nested_array) == [("/tags", "minItems", 0)]
+    assert array_summary(nested_array) == [("/tags", "minItems", 0), ("/tags/0", "minItems", 1)]
 
 
 def test_a_malformed_property_does_not_stop_other_properties() -> None:
@@ -5955,7 +5955,7 @@ def test_unique_items_case_follows_the_existing_cases_of_its_property() -> None:
     assert kept == array_cases(without)
 
 
-def test_unique_items_out_of_scope_arrays_are_not_generated() -> None:
+def test_unique_items_on_a_nested_array_is_covered_through_its_first_element() -> None:
     nested_array = array_suite(
         {
             "type": "array",
@@ -5981,7 +5981,10 @@ def test_unique_items_out_of_scope_arrays_are_not_generated() -> None:
         )
     )
 
-    assert unique_cases(nested_array.cases) == [] and array_diagnostics(nested_array) == []
+    assert [(case.affected_property, body_value(case)) for case in unique_cases(nested_array.cases)] == [
+        ("/tags/0", {"tags": [["x", "x"]]})
+    ]
+    assert array_diagnostics(nested_array) == []
     assert [(case.affected_property, case.violated_constraint) for case in array_cases(nested_object)] == [
         ("/outer/tags", "uniqueItems")
     ]
@@ -8112,14 +8115,18 @@ def test_root_array_items_unsupported_still_allow_the_candidate_without_items() 
     ]
 
 
-def test_root_array_enum_literal_candidates_and_nested_arrays_are_not_expanded() -> None:
+def test_root_array_enum_literal_candidates_and_nested_arrays_use_the_first_element() -> None:
     literal = root_suite({"type": "array", "maxItems": 1, "enum": [[1], [1, 2]], "items": {"type": "integer"}})
     nested = root_suite(
         {"type": "array", "minItems": 1, "items": {"type": "array", "minItems": 2, "maxItems": 3, "items": {"type": "integer"}}}
     )
 
     assert body_value(root_array_cases(literal)["maxItems"]) == [1, 2]
-    assert [(case.violated_constraint, body_value(case)) for case in array_cases(nested)] == [("minItems", [])]
+    assert [(case.affected_property, case.violated_constraint, body_value(case)) for case in array_cases(nested)] == [
+        ("", "minItems", []),
+        ("/0", "minItems", [[0]]),
+        ("/0", "maxItems", [[0, 0, 0, 0]]),
+    ]
     assert [item.code for item in nested.diagnostics] == []
 
 
@@ -11632,3 +11639,428 @@ def test_mutating_the_positive_case_does_not_change_any_negative_case(
     after = [case.model_dump(mode="json") for case in suite.cases]
     assert after[0] != before[0]
     assert after[1:] == before[1:]
+
+
+# --- Step 8.28: array bounds inside the first element of present arrays ----------
+
+ELEMENT_TAGS: dict[str, object] = {"type": "array", "minItems": 2, "maxItems": 3, "items": ITEM_SCHEMA}
+ELEMENT_ITEM: dict[str, object] = {
+    "type": "object",
+    "required": ["tags"],
+    "properties": {"tags": ELEMENT_TAGS},
+}
+ELEMENT_ITEM_POINTER = f"{ARRAY_BODY_POINTER}/properties/rows/items"
+
+
+def rows_body(rows: object) -> dict[str, object]:
+    return {"type": "object", "required": ["rows"], "properties": {"rows": rows}}
+
+
+def element_rows(item: object, **options: object) -> dict[str, object]:
+    return rows_body({"type": "array", "minItems": 1, "items": item, **options})
+
+
+def element_suite(body: object, schemas: dict[str, object] | None = None) -> GeneratedTestSuite:
+    endpoint = post_endpoint(body)
+    if schemas:
+        return generate_test_suite(make_result_with_schemas(endpoint, schemas))
+    return generate_test_suite(make_result(endpoint))
+
+
+def element_values(suite: GeneratedTestSuite) -> list[tuple[str | None, str | None, object]]:
+    return array_values(suite)
+
+
+def test_present_inner_array_of_an_object_element_gets_bound_cases() -> None:
+    suite = element_suite(element_rows(ELEMENT_ITEM))
+
+    assert suite.cases[0].request_body.value == {"rows": [{"tags": ["x", "x"]}]}  # type: ignore[union-attr]
+    assert element_values(suite) == [
+        ("/rows", "minItems", {"rows": []}),
+        ("/rows/0/tags", "minItems", {"rows": [{"tags": ["x"]}]}),
+        ("/rows/0/tags", "maxItems", {"rows": [{"tags": ["x", "x", "x", "x"]}]}),
+    ]
+    case = array_cases(suite)[1]
+    assert f"{ELEMENT_ITEM_POINTER}/properties/tags" in case.provenance
+    assert case.provenance[-1] == "violated_constraint:minItems:/rows/0/tags"
+    assert array_diagnostics(suite) == []
+
+
+def test_absent_optional_inner_array_of_an_element_follows_the_present_parent_rule() -> None:
+    item = {"type": "object", "properties": {"tags": ELEMENT_TAGS, "ro": {**ELEMENT_TAGS, "readOnly": True}}}
+
+    suite = element_suite(element_rows(item))
+
+    assert suite.cases[0].request_body.value == {"rows": [{}]}  # type: ignore[union-attr]
+    assert element_values(suite)[1:] == [
+        ("/rows/0/tags", "minItems", {"rows": [{"tags": ["x"]}]}),
+        ("/rows/0/tags", "maxItems", {"rows": [{"tags": ["x", "x", "x", "x"]}]}),
+    ]
+    assert suite.cases[0].request_body.value == {"rows": [{}]}  # type: ignore[union-attr]
+
+
+@pytest.mark.parametrize(
+    ("levels", "path", "minimum", "maximum"),
+    [
+        (1, "/rows/0", [["x"]], [["x"] * 4]),
+        (2, "/rows/0/0", [[["x"]]], [[["x"] * 4]]),
+    ],
+)
+def test_nested_arrays_get_inner_bound_cases(
+    levels: int, path: str, minimum: object, maximum: object
+) -> None:
+    item: object = ELEMENT_TAGS
+    for _ in range(levels - 1):
+        item = {"type": "array", "minItems": 1, "items": item}
+
+    suite = element_suite(element_rows(item))
+
+    assert [value for value in element_values(suite) if value[0] == path] == [
+        (path, "minItems", {"rows": minimum}),
+        (path, "maxItems", {"rows": maximum}),
+    ]
+    assert array_diagnostics(suite) == []
+
+
+def test_items_reference_is_followed_and_charged_for_the_first_element() -> None:
+    def build() -> NormalizationResult:
+        return make_result_with_schemas(
+            post_endpoint(element_rows(schema_reference("Row"))), {"Row": ELEMENT_ITEM}
+        )
+
+    suite = generate_test_suite(build())
+
+    assert element_values(suite)[1:] == [
+        ("/rows/0/tags", "minItems", {"rows": [{"tags": ["x"]}]}),
+        ("/rows/0/tags", "maxItems", {"rows": [{"tags": ["x", "x", "x", "x"]}]}),
+    ]
+    assert any("Row" in pointer for pointer in array_cases(suite)[1].provenance)
+    assert array_diagnostics(suite) == []
+
+
+def test_unresolvable_items_reference_is_reported_once_and_keeps_other_cases() -> None:
+    body = rows_body(
+        {"type": "array", "minItems": 1, "items": schema_reference("Missing")}
+    )
+
+    cases, diagnostics = run_array_step(body, {"rows": [{"tags": ["x", "x"]}]})
+
+    assert [(case.affected_property, case.violated_constraint) for case in cases] == [
+        ("/rows", "minItems")
+    ]
+    assert [(item.code, item.reference_uri) for item in diagnostics] == [
+        ("array_bound_unsupported_schema", "#/components/schemas/Missing")
+    ]
+
+
+def test_items_reference_hop_is_charged_to_the_expansion_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def build() -> NormalizationResult:
+        return make_result_with_schemas(
+            post_endpoint(element_rows(schema_reference("Row"))), {"Row": ELEMENT_ITEM}
+        )
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(generator_module, "_array_bound_negative_cases", lambda *args: ((), ()))
+        hops_without_array_step = count_expansions(build())
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_EXPANSIONS", hops_without_array_step)
+
+    suite = generate_test_suite(build())
+
+    assert array_cases(suite) == []
+    assert [item.code for item in suite.diagnostics] == ["generation_expansion_budget_exceeded"]
+    assert "'array_bounds'" in suite.diagnostics[0].message
+
+
+def test_inner_array_case_keeps_an_outer_unique_items_array_valid() -> None:
+    item = {**ELEMENT_ITEM, "examples": [{"tags": ["a", "b"]}, {"tags": ["c", "d"]}]}
+
+    suite = element_suite(element_rows(item, minItems=2, uniqueItems=True))
+
+    assert suite.cases[0].request_body.value == {"rows": [{"tags": ["a", "b"]}, {"tags": ["c", "d"]}]}  # type: ignore[union-attr]
+    inner = [case for case in array_cases(suite) if case.affected_property == "/rows/0/tags"]
+    assert [(case.violated_constraint, body_value(case)) for case in inner] == [
+        ("minItems", {"rows": [{"tags": ["x"]}, {"tags": ["c", "d"]}]}),
+        ("maxItems", {"rows": [{"tags": ["x", "x", "x", "x"]}, {"tags": ["c", "d"]}]}),
+    ]
+    for case in inner:
+        assert not generator_module._has_duplicate_items(body_value(case)["rows"])  # type: ignore[index]
+    outer = [case for case in array_cases(suite) if case.affected_property == "/rows"]
+    assert [case.violated_constraint for case in outer] == ["minItems", "uniqueItems"]
+
+
+@pytest.mark.parametrize("keyword", ["const", "enum"])
+@pytest.mark.parametrize("where", ["array", "items", "outer-of-nested"])
+def test_enclosing_const_or_enum_blocks_element_cases_with_a_diagnostic(
+    keyword: str, where: str
+) -> None:
+    literal = [{"tags": ["x", "x"]}]
+    if where == "array":
+        rows = {"type": "array", "items": ELEMENT_ITEM}
+        value: object = literal if keyword == "const" else [literal]
+        rows[keyword] = value
+        pointer = f"{ARRAY_BODY_POINTER}/properties/rows/{keyword}"
+    elif where == "items":
+        item = dict(ELEMENT_ITEM)
+        item[keyword] = literal[0] if keyword == "const" else [literal[0]]
+        rows = {"type": "array", "minItems": 1, "items": item}
+        pointer = f"{ELEMENT_ITEM_POINTER}/{keyword}"
+    else:
+        inner = {"type": "array", "minItems": 1, "items": ELEMENT_ITEM}
+        rows = {"type": "array", "minItems": 1, "items": inner}
+        rows[keyword] = [[literal]] if keyword == "enum" else [literal]
+        pointer = f"{ARRAY_BODY_POINTER}/properties/rows/{keyword}"
+        literal = [literal]
+
+    suite = element_suite(rows_body(rows))
+
+    assert [prop for prop, _, _ in element_values(suite) if prop and "/0" in prop] == []
+    messages = [item for item in suite.diagnostics if "enclosing literal" in item.message]
+    expected = ["minItems", "maxItems"] if where != "outer-of-nested" else ["minItems", "minItems", "maxItems"]
+    assert [item.code for item in messages] == ["array_bound_no_safe_candidate"] * len(expected)
+    assert [item.source_pointer.rsplit("/", 1)[1] for item in messages] == expected  # type: ignore[union-attr]
+    assert all(item.message.endswith(f"{pointer}; no case was generated.") for item in messages)
+
+
+def test_empty_positive_array_has_no_element_case_and_no_fabricated_element() -> None:
+    suite = element_suite(element_rows(ELEMENT_ITEM, minItems=0))
+
+    assert suite.cases[0].request_body.value == {"rows": []}  # type: ignore[union-attr]
+    assert array_cases(suite) == []
+    # Only the existing "minItems is 0" explanation; nothing about elements.
+    assert array_diagnostics(suite) == [
+        ("array_bound_no_safe_candidate", f"{ARRAY_BODY_POINTER}/properties/rows/minItems")
+    ]
+
+
+def test_only_element_zero_is_visited_and_a_later_only_target_is_not_covered() -> None:
+    item = {"type": "object", "properties": {"p": {"type": "object", "properties": {"tags": ELEMENT_TAGS}}}}
+    body = rows_body({"type": "array", "items": item})
+
+    later_only = run_array_step(body, {"rows": [{}, {"p": {}}]})
+    first = run_array_step(body, {"rows": [{"p": {}}, {}]})
+
+    assert later_only == ((), ())
+    assert [(case.affected_property, case.violated_constraint) for case in first[0]] == [
+        ("/rows/0/p/tags", "minItems"),
+        ("/rows/0/p/tags", "maxItems"),
+    ]
+    assert first[0][0].request_body.value == {"rows": [{"p": {"tags": ["x"]}}, {}]}  # type: ignore[union-attr]
+
+
+def test_element_cases_are_appended_after_the_existing_array_cases() -> None:
+    body = {
+        "type": "object",
+        "required": ["a", "b"],
+        "properties": {
+            "a": {"type": "array", "minItems": 1, "items": ELEMENT_ITEM},
+            "b": {"type": "array", "minItems": 1, "maxItems": 2, "items": ITEM_SCHEMA},
+        },
+    }
+
+    suite = element_suite(body)
+
+    summary = [(prop, constraint) for prop, constraint, _ in element_values(suite)]
+    assert summary == [
+        ("/a", "minItems"),
+        ("/b", "minItems"),
+        ("/b", "maxItems"),
+        ("/a/0/tags", "minItems"),
+        ("/a/0/tags", "maxItems"),
+    ]
+    ids = [case.case_id for case in array_cases(suite)]
+    assert ids[:3] == [
+        build_case_id("negative", "/items", "post", "array-bound:/a:minItems:0"),
+        build_case_id("negative", "/items", "post", "array-bound:/b:minItems:0"),
+        build_case_id("negative", "/items", "post", "array-bound:/b:maxItems:3"),
+    ]
+    assert ids[3:] == [
+        build_case_id("negative", "/items", "post", "array-bound:/a/0/tags:minItems:1"),
+        build_case_id("negative", "/items", "post", "array-bound:/a/0/tags:maxItems:4"),
+    ]
+    assert len({case.case_id for case in suite.cases}) == len(suite.cases)
+
+
+def test_element_cases_are_isolated_from_the_positive_case_and_siblings() -> None:
+    result = make_result(post_endpoint(element_rows(ELEMENT_ITEM)))
+    before_input = result.model_dump_json()
+    suite = generate_test_suite(result)
+    source = next(case for case in suite.cases if case.affected_property == "/rows/0/tags")
+    before = [case.model_dump(mode="json") for case in suite.cases]
+
+    body_value(source)["rows"][0]["tags"].append("mutated")  # type: ignore[index]
+    body_value(source)["rows"].append("mutated")  # type: ignore[attr-defined,index]
+
+    after = [case.model_dump(mode="json") for case in suite.cases]
+    index = suite.cases.index(source)
+    assert after[index] != before[index]
+    assert [item for i, item in enumerate(after) if i != index] == [
+        item for i, item in enumerate(before) if i != index
+    ]
+    assert result.model_dump_json() == before_input
+
+
+def test_element_array_step_case_budget_keeps_the_whole_step_all_or_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reference = element_suite(element_rows(ELEMENT_ITEM))
+    before_array = len(reference.cases) - len(array_cases(reference))
+    assert len(array_cases(reference)) == 3
+
+    with monkeypatch.context() as patch:
+        patch.setattr(generator_module, "_MAX_ENDPOINT_CASES", before_array + 3)
+        assert element_suite(element_rows(ELEMENT_ITEM)).cases == reference.cases
+
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_CASES", before_array + 2)
+    suite = element_suite(element_rows(ELEMENT_ITEM))
+
+    assert array_cases(suite) == []
+    assert suite.cases == reference.cases[:before_array]
+    assert [item.code for item in suite.diagnostics] == ["generation_case_budget_exceeded"]
+    assert "'array_bounds'" in suite.diagnostics[0].message
+
+
+def test_element_cases_are_deterministic_with_stable_ids() -> None:
+    def build() -> GeneratedTestSuite:
+        return element_suite(element_rows({"type": "array", "minItems": 1, "items": ELEMENT_ITEM}))
+
+    first, second = build(), build()
+
+    assert first.model_dump_json() == second.model_dump_json()
+    assert [case.case_id for case in array_cases(first)] == [case.case_id for case in array_cases(second)]
+    assert len({case.case_id for case in first.cases}) == len(first.cases)
+
+
+@pytest.mark.parametrize("version", ["3.0.3", "3.1.1"])
+def test_normalized_documents_generate_element_array_cases(version: str) -> None:
+    from app.services.openapi import normalize_openapi_document
+
+    document = {
+        "openapi": version,
+        "info": {"title": "T", "version": "1"},
+        "paths": {
+            "/items": {
+                "post": {
+                    "requestBody": {
+                        "required": True,
+                        "content": {"application/json": {"schema": element_rows(ELEMENT_ITEM)}},
+                    },
+                    "responses": {"200": {"description": "OK"}, "400": {"description": "Bad"}},
+                }
+            }
+        },
+    }
+
+    suite = generate_test_suite(normalize_openapi_document(document))
+
+    assert [(prop, constraint) for prop, constraint, _ in element_values(suite)] == [
+        ("/rows", "minItems"),
+        ("/rows/0/tags", "minItems"),
+        ("/rows/0/tags", "maxItems"),
+    ]
+    assert array_diagnostics(suite) == []
+
+
+# --- Step 8.28 review: literals on a nested array and on its enclosing arrays ---
+
+LITERAL_ITEM: dict[str, object] = {"type": "string"}
+
+
+def nested_literal_rows(literal: dict[str, object]) -> dict[str, object]:
+    """A root array whose element is itself an array declaring the given literal."""
+    inner = {"type": "array", "minItems": 2, "maxItems": 3, "items": LITERAL_ITEM, **literal}
+    return {"type": "array", "minItems": 1, "items": inner}
+
+
+def test_nested_array_without_a_literal_keeps_its_normal_bound_cases() -> None:
+    suite = element_suite(nested_literal_rows({}))
+
+    assert suite.cases[0].request_body.value == [["sentinel", "sentinel"]]  # type: ignore[union-attr]
+    assert element_values(suite) == [
+        ("", "minItems", []),
+        ("/0", "minItems", [["sentinel"]]),
+        ("/0", "maxItems", [["sentinel"] * 4]),
+    ]
+    assert array_diagnostics(suite) == []
+
+
+def test_nested_array_const_gives_no_case_because_no_member_violates_a_bound() -> None:
+    suite = element_suite(nested_literal_rows({"const": ["x", "x"]}))
+
+    assert suite.cases[0].request_body.value == [["x", "x"]]  # type: ignore[union-attr]
+    # Only the outer array case remains; the element array is not changed.
+    assert [(prop, constraint) for prop, constraint, _ in element_values(suite)] == [("", "minItems")]
+    assert array_diagnostics(suite) == [
+        ("array_bound_no_safe_candidate", f"{ARRAY_BODY_POINTER}/items/minItems"),
+        ("array_bound_no_safe_candidate", f"{ARRAY_BODY_POINTER}/items/maxItems"),
+    ]
+    messages = [item.message for item in suite.diagnostics if item.code == "array_bound_no_safe_candidate"]
+    assert messages[0].startswith("No deterministic array safely violates 'minItems'")
+    assert messages[1].startswith("No deterministic array safely violates 'maxItems'")
+
+
+@pytest.mark.parametrize(
+    ("constraint", "other", "members", "expected"),
+    [
+        ("minItems", "maxItems", [["x", "x"], ["y"]], [["y"]]),
+        ("maxItems", "minItems", [["x", "x"], ["y", "y", "y", "y"]], [["y", "y", "y", "y"]]),
+    ],
+)
+def test_nested_array_enum_uses_a_member_that_violates_only_the_targeted_bound(
+    constraint: str, other: str, members: list[list[str]], expected: object
+) -> None:
+    suite = element_suite(nested_literal_rows({"enum": members}))
+
+    assert suite.cases[0].request_body.value == [["x", "x"]]  # type: ignore[union-attr]
+    assert [value for value in element_values(suite) if value[0] == "/0"] == [("/0", constraint, expected)]
+    case = next(case for case in array_cases(suite) if case.affected_property == "/0")
+    changed = body_value(case)[0]  # type: ignore[index]
+    # The changed element is a member of the enum, so the enum is not violated.
+    assert changed in members
+    assert body_value(case) == expected
+    assert (len(changed) < 2) if constraint == "minItems" else (len(changed) > 3)
+    # The other bound has no member that violates it, and is reported as before.
+    assert array_diagnostics(suite) == [
+        ("array_bound_no_safe_candidate", f"{ARRAY_BODY_POINTER}/items/{other}")
+    ]
+
+
+@pytest.mark.parametrize("keyword", ["const", "enum"])
+def test_targets_below_a_literal_constrained_nested_array_are_blocked(keyword: str) -> None:
+    literal = [{"tags": ["x", "x"]}]
+    inner = {"type": "array", "minItems": 1, "items": ELEMENT_ITEM}
+    inner[keyword] = literal if keyword == "const" else [literal]
+    suite = element_suite({"type": "array", "minItems": 1, "items": inner})
+
+    assert suite.cases[0].request_body.value == [[{"tags": ["x", "x"]}]]  # type: ignore[union-attr]
+    assert [(prop, constraint) for prop, constraint, _ in element_values(suite)] == [("", "minItems")]
+    inner_pointer = f"{ARRAY_BODY_POINTER}/items"
+    assert array_diagnostics(suite) == [
+        # The nested array itself: its own literal leaves no shorter array.
+        ("array_bound_no_safe_candidate", f"{inner_pointer}/minItems"),
+        # The arrays below it would also change the literal.
+        ("array_bound_no_safe_candidate", f"{inner_pointer}/items/properties/tags/minItems"),
+        ("array_bound_no_safe_candidate", f"{inner_pointer}/items/properties/tags/maxItems"),
+    ]
+    blocked = [item for item in suite.diagnostics if "enclosing literal" in item.message]
+    assert len(blocked) == 2
+    assert all(item.message.endswith(f"at {inner_pointer}/{keyword}; no case was generated.") for item in blocked)
+
+
+@pytest.mark.parametrize(
+    ("literal", "expected"),
+    [
+        ({"const": ["x", "x"]}, []),
+        ({"enum": [["x", "x"], ["y"]]}, [("/a", "minItems", {"a": ["y"]})]),
+    ],
+    ids=["const", "enum"],
+)
+def test_array_property_literal_follows_the_same_candidate_selection(
+    literal: dict[str, object], expected: list[tuple[str, str, object]]
+) -> None:
+    prop = {"type": "array", "minItems": 2, "items": LITERAL_ITEM, **literal}
+    suite = element_suite({"type": "object", "required": ["a"], "properties": {"a": prop}})
+
+    assert suite.cases[0].request_body.value == {"a": ["x", "x"]}  # type: ignore[union-attr]
+    assert element_values(suite) == expected
