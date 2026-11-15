@@ -11483,3 +11483,152 @@ def test_step_that_fits_charges_each_case_exactly_once(
     assert len(cases) == 12
     assert budget.case_counts() == (7 + 12, 40 + 12)
     assert (calls["copy"], calls["body"], calls["case"]) == (12, 12, 12)
+
+
+# Mutation isolation of response expectations and security between cases.
+#
+# Pydantic reuses an already-built model instance instead of copying it, so the
+# nested dictionaries inside ``ResponseExpectation`` and ``SecurityRequirement``
+# stay independent only because every case copies them explicitly. These tests
+# mutate those dictionaries in place and check that no other case changes.
+
+ISOLATION_RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {"error": {"type": "string"}, "detail": {"type": "object"}},
+}
+
+ISOLATION_STEPS = {
+    "required_parameter": 1,
+    "required_request_body": 1,
+    "required_property": 4,
+    "type": 4,
+    "minLength": 1,
+    "maxLength": 1,
+    "minimum": 1,
+    "maximum": 1,
+    "enum": 1,
+    "minItems": 1,
+    "maxItems": 1,
+}
+
+
+def isolation_suite() -> GeneratedTestSuite:
+    endpoint = Endpoint(
+        path="/isolation",
+        method="post",
+        parameters=(
+            Parameter(
+                name="trace",
+                location="query",
+                required=True,
+                schema=Schema(raw={"type": "string"}),
+                source_scope="operation",
+            ),
+        ),
+        security=(SecurityRequirement(schemes={"oauth": ("write",)}),),
+        responses={
+            "200": Response(
+                description="OK",
+                content={
+                    "application/json": MediaType(schema=Schema(raw=ISOLATION_RESPONSE_SCHEMA))
+                },
+            ),
+            "400": Response(
+                description="Invalid request",
+                content={
+                    "application/json": MediaType(schema=Schema(raw=ISOLATION_RESPONSE_SCHEMA))
+                },
+            ),
+        },
+        request_body=RequestBody(
+            required=True,
+            content={
+                "application/json": MediaType(
+                    schema=Schema(
+                        raw={
+                            "type": "object",
+                            "required": ["name", "count", "kind", "tags"],
+                            "properties": {
+                                "name": {"type": "string", "minLength": 2, "maxLength": 5},
+                                "count": {"type": "integer", "minimum": 1, "maximum": 9},
+                                "kind": {"type": "string", "enum": ["a", "b"]},
+                                "tags": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "minItems": 1,
+                                    "maxItems": 3,
+                                },
+                            },
+                        }
+                    )
+                )
+            },
+        ),
+    )
+    return generate_test_suite(
+        make_result(endpoint, components=declared_security_schemes("oauth"))
+    )
+
+
+def mutate_response_expectations(case: GeneratedTestCase) -> None:
+    for expectation in case.response_expectations:
+        schemas = expectation.schemas_by_media_type
+        schemas["application/json"].raw["properties"]["error"]["type"] = "MUTATED"
+        schemas["mutated/type"] = None
+
+
+def mutate_security(case: GeneratedTestCase) -> None:
+    for requirement_value in case.security or ():
+        requirement_value.schemes["oauth"] = ("MUTATED",)
+        requirement_value.schemes["mutated"] = ("MUTATED",)
+
+
+ISOLATION_MUTATIONS = {
+    "response_expectations": mutate_response_expectations,
+    "security": mutate_security,
+}
+
+
+def test_isolation_suite_covers_every_expected_negative_step() -> None:
+    suite = isolation_suite()
+    counts: dict[str, int] = {}
+    for case in suite.cases[1:]:
+        counts[case.violated_constraint] = counts.get(case.violated_constraint, 0) + 1
+
+    assert suite.cases[0].category == "positive"
+    assert counts == ISOLATION_STEPS
+    for case in suite.cases:
+        assert case.security is not None and len(case.response_expectations) == 2
+
+
+@pytest.mark.parametrize("structure", ISOLATION_MUTATIONS)
+@pytest.mark.parametrize("step", ISOLATION_STEPS)
+def test_mutating_a_negative_case_does_not_change_any_other_case(
+    step: str, structure: str
+) -> None:
+    suite = isolation_suite()
+    source = next(case for case in suite.cases if case.violated_constraint == step)
+    before = [case.model_dump(mode="json") for case in suite.cases]
+
+    ISOLATION_MUTATIONS[structure](source)
+
+    after = [case.model_dump(mode="json") for case in suite.cases]
+    assert after[suite.cases.index(source)] != before[suite.cases.index(source)]
+    for index, case in enumerate(suite.cases):
+        if case is not source:
+            assert after[index] == before[index], case.case_id
+
+
+@pytest.mark.parametrize("structure", ISOLATION_MUTATIONS)
+def test_mutating_the_positive_case_does_not_change_any_negative_case(
+    structure: str,
+) -> None:
+    suite = isolation_suite()
+    positive = suite.cases[0]
+    before = [case.model_dump(mode="json") for case in suite.cases]
+
+    ISOLATION_MUTATIONS[structure](positive)
+
+    after = [case.model_dump(mode="json") for case in suite.cases]
+    assert after[0] != before[0]
+    assert after[1:] == before[1:]
