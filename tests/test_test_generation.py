@@ -9168,7 +9168,7 @@ def test_optional_array_inside_a_present_nested_object_is_added_to_that_object()
     ]
 
 
-def test_optional_array_inside_an_absent_parent_is_not_materialized() -> None:
+def test_optional_array_inside_an_absent_parent_is_created_in_negative_cases_only() -> None:
     absent_parent = optional_body(
         {"a": ITEM_SCHEMA, "outer": optional_body({"tags": {"type": "array", "minItems": 1, "items": ITEM_SCHEMA}}, ("tags",))},
         ("a",),
@@ -9177,11 +9177,14 @@ def test_optional_array_inside_an_absent_parent_is_not_materialized() -> None:
         {"outer": optional_body({"tags": {"type": "array", "maxItems": 1, "items": ITEM_SCHEMA}})}
     )
 
-    for body in (absent_parent, absent_optional_in_absent):
-        suite = optional_array_suite(body)
-        assert array_cases(suite) == []
-        assert array_diagnostics(suite) == []
+    first = optional_array_suite(absent_parent)
+    second = optional_array_suite(absent_optional_in_absent)
+
+    assert array_values(first) == [("/outer/tags", "minItems", {"a": "x", "outer": {"tags": []}})]
+    assert array_values(second) == [("/outer/tags", "maxItems", {"outer": {"tags": ["x", "x"]}})]
+    for suite in (first, second):
         assert "outer" not in (suite.cases[0].request_body.value or {})  # type: ignore[union-attr]
+        assert array_diagnostics(suite) == []
 
 
 def test_optional_array_reached_through_a_property_reference() -> None:
@@ -11835,18 +11838,29 @@ def test_empty_positive_array_has_no_element_case_and_no_fabricated_element() ->
 
 
 def test_only_element_zero_is_visited_and_a_later_only_target_is_not_covered() -> None:
-    item = {"type": "object", "properties": {"p": {"type": "object", "properties": {"tags": ELEMENT_TAGS}}}}
-    body = rows_body({"type": "array", "items": item})
+    # Element 0 has an absent parent that cannot be created (unsupported required
+    # sibling); element 1 has the parent present, so only element 1 could be targeted.
+    parent = {
+        "type": "object",
+        "required": ["s"],
+        "properties": {"s": {"type": "string", "pattern": "(a|b)"}, "tags": ELEMENT_TAGS},
+    }
+    body = rows_body({"type": "array", "items": {"type": "object", "properties": {"p": parent}}})
 
-    later_only = run_array_step(body, {"rows": [{}, {"p": {}}]})
-    first = run_array_step(body, {"rows": [{"p": {}}, {}]})
+    later_only = run_array_step(body, {"rows": [{}, {"p": {"s": "a"}}]})
+    first = run_array_step(body, {"rows": [{"p": {"s": "a"}}, {}]})
 
-    assert later_only == ((), ())
+    assert later_only[0] == ()
+    assert [(item.code, item.source_pointer.rsplit("/", 1)[1]) for item in later_only[1]] == [  # type: ignore[union-attr]
+        ("array_bound_unsupported_schema", "pattern")
+    ]
     assert [(case.affected_property, case.violated_constraint) for case in first[0]] == [
         ("/rows/0/p/tags", "minItems"),
         ("/rows/0/p/tags", "maxItems"),
     ]
-    assert first[0][0].request_body.value == {"rows": [{"p": {"tags": ["x"]}}, {}]}  # type: ignore[union-attr]
+    assert first[0][0].request_body.value == {  # type: ignore[union-attr]
+        "rows": [{"p": {"s": "a", "tags": ["x"]}}, {}]
+    }
 
 
 def test_element_cases_are_appended_after_the_existing_array_cases() -> None:
@@ -12064,3 +12078,452 @@ def test_array_property_literal_follows_the_same_candidate_selection(
 
     assert suite.cases[0].request_body.value == {"a": ["x", "x"]}  # type: ignore[union-attr]
     assert element_values(suite) == expected
+
+
+# --- Step 8.30: array bounds below absent optional parent objects ---------------
+
+ABSENT_PROPERTIES = f"{ARRAY_BODY_POINTER}/properties"
+ABSENT_MINMAX = [("minItems", ["x"]), ("maxItems", ["x", "x", "x", "x"])]
+
+
+def absent_body(properties: dict[str, object], required: tuple[str, ...] = ()) -> dict[str, object]:
+    return {"type": "object", "required": list(required), "properties": properties}
+
+
+def tags_parent(**extra: object) -> dict[str, object]:
+    return {"type": "object", "properties": {"tags": ELEMENT_TAGS}, **extra}
+
+
+def absent_cases(suite: GeneratedTestSuite, prefix: str) -> list[tuple[str | None, str | None, object]]:
+    return [value for value in array_values(suite) if str(value[0]).startswith(prefix)]
+
+
+def test_required_array_inside_an_absent_optional_parent_gets_bound_cases() -> None:
+    parent = {"type": "object", "required": ["tags"], "properties": {"tags": ELEMENT_TAGS}}
+
+    suite = element_suite(absent_body({"p": parent}))
+
+    assert suite.cases[0].request_body.value == {}  # type: ignore[union-attr]
+    assert array_values(suite) == [
+        ("/p/tags", constraint, {"p": {"tags": value}}) for constraint, value in ABSENT_MINMAX
+    ]
+    case = array_cases(suite)[0]
+    assert case.provenance[-3:] == (
+        f"{ABSENT_PROPERTIES}/p/properties/tags",
+        f"{ABSENT_PROPERTIES}/p/properties/tags/minItems",
+        "violated_constraint:minItems:/p/tags",
+    )
+    assert array_diagnostics(suite) == []
+
+
+def test_optional_array_inside_an_absent_optional_parent_gets_bound_cases() -> None:
+    suite = element_suite(absent_body({"p": tags_parent()}))
+
+    assert suite.cases[0].request_body.value == {}  # type: ignore[union-attr]
+    assert array_values(suite) == [
+        ("/p/tags", constraint, {"p": {"tags": value}}) for constraint, value in ABSENT_MINMAX
+    ]
+    assert array_diagnostics(suite) == []
+
+
+@pytest.mark.parametrize("required_top", [(), ("p",)])
+def test_several_nested_absent_optional_parents_are_created_outermost_first(
+    required_top: tuple[str, ...]
+) -> None:
+    deepest = tags_parent()
+    nested = absent_body({"q": absent_body({"r": deepest})})
+
+    suite = element_suite(absent_body({"p": nested}, required_top))
+
+    assert [value[:2] for value in array_values(suite)] == [
+        ("/p/q/r/tags", "minItems"),
+        ("/p/q/r/tags", "maxItems"),
+    ]
+    assert array_values(suite)[0][2] == {"p": {"q": {"r": {"tags": ["x"]}}}}
+    assert suite.cases[0].request_body.value == ({"p": {}} if required_top else {})  # type: ignore[union-attr]
+    assert array_diagnostics(suite) == []
+
+
+def test_parent_value_keeps_its_required_sibling_properties() -> None:
+    parent = {
+        "type": "object",
+        "required": ["id"],
+        "properties": {"id": {"type": "integer"}, "tags": ELEMENT_TAGS},
+    }
+
+    suite = element_suite(absent_body({"p": parent}))
+
+    assert array_values(suite)[0] == ("/p/tags", "minItems", {"p": {"id": 0, "tags": ["x"]}})
+    assert array_values(suite)[1][2] == {"p": {"id": 0, "tags": ["x", "x", "x", "x"]}}
+
+
+def test_absent_parent_resolved_through_a_reference() -> None:
+    suite = element_suite(
+        absent_body({"p": schema_reference("Parent")}), {"Parent": tags_parent()}
+    )
+
+    assert array_values(suite) == [
+        ("/p/tags", constraint, {"p": {"tags": value}}) for constraint, value in ABSENT_MINMAX
+    ]
+    assert any("components/schemas/Parent" in pointer for pointer in array_cases(suite)[0].provenance)
+    assert array_diagnostics(suite) == []
+
+
+def absent_reference_result() -> NormalizationResult:
+    body = absent_body({"a": ELEMENT_TAGS, "p": schema_reference("Parent")}, ("a",))
+    return make_result_with_schemas(
+        post_endpoint(body),
+        {"Parent": absent_body({"tags": schema_reference("Tags")}), "Tags": ELEMENT_TAGS},
+    )
+
+
+def test_absent_parent_references_are_charged_and_an_expansion_limit_drops_only_the_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hops = count_expansions(absent_reference_result())
+    reference = generate_test_suite(absent_reference_result())
+    assert [value[0] for value in array_values(reference)] == ["/a", "/a", "/p/tags", "/p/tags"]
+
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_EXPANSIONS", hops)
+    assert generate_test_suite(absent_reference_result()).cases == reference.cases
+
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_EXPANSIONS", hops - 1)
+    suite = generate_test_suite(absent_reference_result())
+
+    assert [value[0] for value in array_values(suite)] == ["/a", "/a"]
+    assert suite.cases == reference.cases[:-2]
+    assert [item.code for item in suite.diagnostics] == ["generation_expansion_budget_exceeded"]
+    message = suite.diagnostics[0].message
+    assert "per-endpoint limit" in message and "absent optional parent objects" in message
+    assert generate_test_suite(absent_reference_result()) == suite
+
+
+def test_absent_parent_inside_element_zero_of_an_array() -> None:
+    item = absent_body({"p": tags_parent()})
+
+    suite = element_suite(element_rows(item))
+
+    assert array_values(suite) == [
+        ("/rows", "minItems", {"rows": []}),
+        ("/rows/0/p/tags", "minItems", {"rows": [{"p": {"tags": ["x"]}}]}),
+        ("/rows/0/p/tags", "maxItems", {"rows": [{"p": {"tags": ["x"] * 4}}]}),
+    ]
+    assert suite.cases[0].request_body.value == {"rows": [{}]}  # type: ignore[union-attr]
+    assert array_diagnostics(suite) == []
+
+
+def test_absent_parent_inside_a_nested_array() -> None:
+    item = absent_body({"p": tags_parent()})
+    inner = {"type": "array", "minItems": 1, "items": item}
+
+    suite = element_suite({"type": "array", "minItems": 1, "items": inner})
+
+    assert [value for value in array_values(suite) if value[0] == "/0/0/p/tags"] == [
+        ("/0/0/p/tags", "minItems", [[{"p": {"tags": ["x"]}}]]),
+        ("/0/0/p/tags", "maxItems", [[{"p": {"tags": ["x"] * 4}}]]),
+    ]
+
+
+def test_read_only_parent_is_not_created_and_an_ordinary_object_gets_no_diagnostic() -> None:
+    suite = element_suite(
+        absent_body(
+            {
+                "ro": tags_parent(readOnly=True),
+                "plain": absent_body({"name": {"type": "string"}, "list": {"type": "array", "items": ITEM_SCHEMA}}),
+                "broken": absent_body({"s": {"type": "string", "pattern": "(a|b)"}}, ("s",)),
+            }
+        )
+    )
+
+    assert array_values(suite) == []
+    assert array_diagnostics(suite) == []
+
+
+@pytest.mark.parametrize("keyword", ["const", "enum"])
+def test_parent_literal_blocks_creating_it_with_one_diagnostic(keyword: str) -> None:
+    literal = {"tags": ["x", "x"]}
+    parent = tags_parent(**{keyword: literal if keyword == "const" else [literal]})
+
+    suite = element_suite(absent_body({"p": parent}))
+
+    assert array_values(suite) == []
+    literal_pointer = f"{ABSENT_PROPERTIES}/p/{keyword}"
+    assert array_diagnostics(suite) == [("array_bound_no_safe_candidate", literal_pointer)]
+    message = suite.diagnostics[0].message
+    assert "'/p'" in message and literal_pointer in message and "violate the literal" in message
+
+
+def test_unsupported_required_sibling_prevents_creating_the_parent_and_is_reported_once() -> None:
+    parent = {
+        "type": "object",
+        "required": ["s"],
+        "properties": {"s": {"type": "string", "pattern": "(a|b)"}, "tags": ELEMENT_TAGS},
+    }
+
+    suite = element_suite(absent_body({"p": parent}))
+
+    assert array_values(suite) == []
+    assert array_diagnostics(suite) == [
+        ("array_bound_unsupported_schema", f"{ABSENT_PROPERTIES}/p/properties/s/pattern")
+    ]
+
+
+def test_recursive_optional_schemas_stop_at_the_first_repeated_schema() -> None:
+    node = absent_body({"tags": ELEMENT_TAGS, "child": schema_reference("Node")})
+
+    def build() -> GeneratedTestSuite:
+        return element_suite(absent_body({"node": schema_reference("Node")}), {"Node": node})
+
+    suite = build()
+
+    assert [value[:2] for value in array_values(suite)] == [
+        ("/node/tags", "minItems"),
+        ("/node/tags", "maxItems"),
+    ]
+    assert build() == suite
+
+
+def absent_with_existing_body() -> dict[str, object]:
+    return absent_body(
+        {
+            "a": ELEMENT_TAGS,
+            "rows": {"type": "array", "minItems": 1, "items": ELEMENT_ITEM},
+            "p": tags_parent(),
+        },
+        ("a", "rows"),
+    )
+
+
+def test_new_cases_are_appended_after_existing_and_element_cases() -> None:
+    suite = element_suite(absent_with_existing_body())
+
+    assert [value[:2] for value in array_values(suite)] == [
+        ("/a", "minItems"),
+        ("/a", "maxItems"),
+        ("/rows", "minItems"),
+        ("/rows/0/tags", "minItems"),
+        ("/rows/0/tags", "maxItems"),
+        ("/p/tags", "minItems"),
+        ("/p/tags", "maxItems"),
+    ]
+    assert array_cases(suite)[-1] is suite.cases[-1]
+
+
+def test_existing_case_ids_and_order_do_not_change_when_absent_parents_exist() -> None:
+    without = absent_with_existing_body()
+    del without["properties"]["p"]  # type: ignore[attr-defined]
+    old = element_suite(without)
+    new = element_suite(absent_with_existing_body())
+
+    assert [case.case_id for case in new.cases[: len(old.cases)]] == [case.case_id for case in old.cases]
+    assert new.cases[: len(old.cases)] == old.cases
+    assert [case.case_id for case in new.cases[len(old.cases) :]] == [
+        build_case_id("negative", "/items", "post", "array-bound:/p/tags:minItems:1"),
+        build_case_id("negative", "/items", "post", "array-bound:/p/tags:maxItems:4"),
+    ]
+    assert len({case.case_id for case in new.cases}) == len(new.cases)
+
+
+def test_created_parent_values_are_isolated_between_cases() -> None:
+    parent = {
+        "type": "object",
+        "required": ["id", "obj"],
+        "properties": {"id": {"type": "integer"}, "obj": {"type": "object"}, "tags": ELEMENT_TAGS},
+    }
+    result = make_result(post_endpoint(absent_body({"p": parent})))
+    before_input = result.model_dump_json()
+    suite = generate_test_suite(result)
+    source = next(case for case in suite.cases if case.violated_constraint == "minItems")
+    before = [case.model_dump(mode="json") for case in suite.cases]
+
+    created = body_value(source)["p"]  # type: ignore[index]
+    created["id"] = "mutated"
+    created["obj"]["added"] = True
+    created["tags"].append("mutated")
+
+    after = [case.model_dump(mode="json") for case in suite.cases]
+    index = suite.cases.index(source)
+    assert after[index] != before[index]
+    assert [item for i, item in enumerate(after) if i != index] == [
+        item for i, item in enumerate(before) if i != index
+    ]
+    assert result.model_dump_json() == before_input
+
+
+def budget_suite(endpoints: int = 1) -> GeneratedTestSuite:
+    result = make_result(
+        *(
+            post_endpoint(absent_with_existing_body(), path=f"/items{index}")
+            for index in range(endpoints)
+        )
+    )
+    return generate_test_suite(result)
+
+
+@pytest.mark.parametrize("scope", ["endpoint", "suite"])
+def test_case_limit_drops_only_the_new_group_and_keeps_existing_array_cases(
+    scope: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reference = budget_suite()
+    new_count = 2
+    existing = reference.cases[:-new_count]
+    name = "_MAX_ENDPOINT_CASES" if scope == "endpoint" else "_MAX_SUITE_CASES"
+    monkeypatch.setattr(generator_module, name, len(reference.cases) - 1)
+
+    suite = budget_suite()
+
+    assert suite.cases == existing
+    assert [value[0] for value in array_values(suite)] == ["/a", "/a", "/rows", "/rows/0/tags", "/rows/0/tags"]
+    assert [item.code for item in suite.diagnostics] == ["generation_case_budget_exceeded"]
+    message = suite.diagnostics[0].message
+    assert f"per-{scope} limit" in message and "absent optional parent objects" in message
+    assert "other array-bound cases" in message
+    assert budget_suite() == suite
+
+
+def test_later_endpoints_continue_after_an_endpoint_scope_drop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    single = budget_suite()
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_CASES", len(single.cases) - 1)
+
+    suite = budget_suite(endpoints=3)
+
+    assert len(suite.cases) == 3 * (len(single.cases) - 2)
+    assert [item.code for item in suite.diagnostics] == ["generation_case_budget_exceeded"] * 3
+    assert [item.endpoint_path for item in suite.diagnostics] == ["/items0", "/items1", "/items2"]
+    assert len({case.case_id for case in suite.cases}) == len(suite.cases)
+
+
+def test_suite_scope_expansion_limit_keeps_the_existing_cases_and_is_deterministic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hops = count_expansions(absent_reference_result())
+    monkeypatch.setattr(generator_module, "_MAX_SUITE_EXPANSIONS", hops - 1)
+
+    suite = generate_test_suite(absent_reference_result())
+
+    assert [value[0] for value in array_values(suite)] == ["/a", "/a"]
+    assert [item.code for item in suite.diagnostics] == ["generation_expansion_budget_exceeded"]
+    assert "per-suite limit" in suite.diagnostics[0].message
+    assert generate_test_suite(absent_reference_result()) == suite
+
+
+def test_absent_parent_generation_is_deterministic() -> None:
+    first = element_suite(absent_with_existing_body())
+    second = element_suite(absent_with_existing_body())
+
+    assert first.model_dump_json() == second.model_dump_json()
+    assert [case.case_id for case in first.cases] == [case.case_id for case in second.cases]
+
+
+@pytest.mark.parametrize("version", ["3.0.3", "3.1.1"])
+def test_normalized_documents_generate_absent_parent_cases(version: str) -> None:
+    from app.services.openapi import normalize_openapi_document
+
+    document = {
+        "openapi": version,
+        "info": {"title": "T", "version": "1"},
+        "paths": {
+            "/items": {
+                "post": {
+                    "requestBody": {
+                        "required": True,
+                        "content": {
+                            "application/json": {
+                                "schema": absent_body({"p": absent_body({"q": tags_parent()})})
+                            }
+                        },
+                    },
+                    "responses": {"200": {"description": "OK"}, "400": {"description": "Bad"}},
+                }
+            }
+        },
+    }
+
+    suite = generate_test_suite(normalize_openapi_document(document))
+
+    assert array_values(suite) == [
+        ("/p/q/tags", "minItems", {"p": {"q": {"tags": ["x"]}}}),
+        ("/p/q/tags", "maxItems", {"p": {"q": {"tags": ["x"] * 4}}}),
+    ]
+    assert suite.cases[0].request_body.value == {}  # type: ignore[union-attr]
+    assert array_diagnostics(suite) == []
+
+
+def test_parent_whose_only_array_is_below_a_read_only_object_is_not_created() -> None:
+    inner = absent_body({"tags": ELEMENT_TAGS})
+    inner["readOnly"] = True
+
+    broken = {"s": {"type": "string", "pattern": "(a|b)"}}
+    suite = element_suite(absent_body({"p": absent_body({"inner": inner, **broken}, ("s",))}))
+
+    assert array_values(suite) == []
+    assert array_diagnostics(suite) == []
+
+
+def test_case_counters_are_restored_after_the_new_group_is_dropped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reference = budget_suite()
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_CASES", len(reference.cases) - 1)
+    restored: list[tuple[tuple[int, int], tuple[int, int]]] = []
+    original = generator_module._GenerationBudget.restore_case_counts
+
+    def spy(self: object, counts: tuple[int, int]) -> None:
+        original(self, counts)  # type: ignore[arg-type]
+        restored.append((counts, self.case_counts()))  # type: ignore[attr-defined]
+
+    monkeypatch.setattr(generator_module._GenerationBudget, "restore_case_counts", spy)
+
+    suite = budget_suite()
+
+    assert restored[-1][0] == restored[-1][1]
+    assert restored[-1][0][0] == len(suite.cases)
+
+
+def test_suite_limit_hit_in_the_new_group_lets_a_later_endpoint_use_the_rest_of_the_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    per_endpoint = len(budget_suite().cases)
+    new_count = 2
+    # Endpoint 0 fits completely. Endpoint 1 reaches the limit inside the new group.
+    # After the group is rolled back, one case of budget is left for endpoint 2.
+    limit = 2 * per_endpoint - new_count + 1
+    monkeypatch.setattr(generator_module, "_MAX_SUITE_CASES", limit)
+
+    suite = budget_suite(endpoints=4)
+
+    def counts_by_path(value: GeneratedTestSuite) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for case in value.cases:
+            counts[case.path] = counts.get(case.path, 0) + 1
+        return counts
+
+    # Endpoint 1 keeps everything before the new group; endpoint 2 gets the last case;
+    # endpoint 3 is never generated. The limit is not exceeded.
+    assert counts_by_path(suite) == {
+        "/items0": per_endpoint,
+        "/items1": per_endpoint - new_count,
+        "/items2": 1,
+    }
+    assert len(suite.cases) == limit
+    assert [case.path for case in suite.cases] == sorted(
+        (case.path for case in suite.cases), key=lambda path: path
+    )
+    new_cases = [case for case in array_cases(suite) if case.affected_property == "/p/tags"]
+    assert [case.path for case in new_cases] == ["/items0", "/items0"]
+
+    assert [(item.code, item.endpoint_path) for item in suite.diagnostics] == [
+        ("generation_case_budget_exceeded", "/items1"),
+        ("generation_case_budget_exceeded", "/items2"),
+    ]
+    dropped, normal = (item.message for item in suite.diagnostics)
+    assert "absent optional parent objects" in dropped
+    assert "per-suite limit" in dropped
+    assert "absent optional parent objects" not in normal
+    assert f"per-suite limit of {limit} generated test cases" in normal
+    assert "1 following endpoint(s) were not generated" in normal
+
+    assert budget_suite(endpoints=4) == suite
+    assert budget_suite(endpoints=4).model_dump_json() == suite.model_dump_json()

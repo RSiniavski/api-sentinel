@@ -1352,12 +1352,20 @@ def _array_bound_negative_cases(
 
     Targets are a root array, array properties present in the positive request
     body, and optional (writable) array properties that are absent from it when
-    their parent object is present. Missing parents are not created. After
-    these, only element 0 of each present non-empty array is visited, through
+    their parent object is present. After these, only element 0 of each present non-empty array is visited, through
     its items schema: an element that is an object contributes the same
     targets as any object, and an element that is an array is a target itself.
     A case below an array or items schema with ``enum`` or ``const`` is not
     generated, because the changed element would also violate that literal.
+
+    A third phase handles absent optional (writable) object properties whose
+    subtree holds an array-bound target. Such a parent is created with
+    ``_select_value`` in the negative body only, never in the positive one, and
+    the normal traversal runs on it. A parent with ``const`` or ``enum`` is not
+    created (``array_bound_no_safe_candidate``), and one that cannot be built
+    gives ``array_bound_unsupported_schema``. The phase is isolated: if it
+    exhausts a budget, its cases and diagnostics are dropped, case counters are
+    restored, and one budget diagnostic is reported; earlier cases are kept.
     """
     version = api.openapi_version
     resolved = _resolved_request_body(endpoint, api)
@@ -1371,12 +1379,23 @@ def _array_bound_negative_cases(
         return (), ()
 
     root_pointer = _child(body_pointer, "content", "application/json", "schema")
-    targets: list[tuple[tuple[str, ...], str, list[Any], str]] = []
+    # (path, constraint, candidate, schema pointer, parents created for it)
+    targets: list[tuple[tuple[str, ...], str, list[Any], str, _Insertions]] = []
     diagnostics: list[GenerationDiagnostic] = []
     # Present non-empty arrays whose element 0 is visited after all other
     # targets, and the keyword pointer of an enclosing enum/const, if any.
-    pending: list[tuple[dict[str, Any], list[Any], tuple[str, ...], str, str | None]] = []
+    pending: list[
+        tuple[dict[str, Any], list[Any], tuple[str, ...], str, str | None, _Insertions, tuple[str, ...]]
+    ] = []
     blocker: list[str | None] = [None]
+    # Absent optional object properties, visited last (see the phase 3 below),
+    # with the parents already created above them and the schema pointers
+    # already entered, which ends recursive optional schemas.
+    absent_parents: list[
+        tuple[dict[str, Any], str, tuple[str, ...], str | None, _Insertions, tuple[str, ...]]
+    ] = []
+    insertions: list[_Insertions] = [()]
+    entered: list[tuple[str, ...]] = [()]
 
     def report(
         code: str, message: str, pointer: str, reference_uri: str | None = None
@@ -1509,7 +1528,7 @@ def _array_bound_negative_cases(
                     constraint_pointer,
                 )
             else:
-                targets.append((path, constraint, candidate, pointer))
+                targets.append((path, constraint, candidate, pointer, insertions[0]))
 
     def target_array(
         child_schema: dict[str, Any], child_pointer: str, child_path: tuple[str, ...]
@@ -1563,7 +1582,9 @@ def _array_bound_negative_cases(
             target_array(schema, pointer, path)
         if isinstance(schema, dict) and isinstance(value, list) and value:
             # Elements are visited after every other target was collected.
-            pending.append((schema, value, path, pointer, blocker[0]))
+            pending.append(
+                (schema, value, path, pointer, blocker[0], insertions[0], entered[0])
+            )
         if not isinstance(schema, dict) or not isinstance(value, dict):
             return
         properties = schema.get("properties")
@@ -1585,6 +1606,17 @@ def _array_bound_negative_cases(
                     and absent[0].get("readOnly") is not True
                 ):
                     target_array(absent[0], absent[1], (*path, name))
+                    if _is_object_with_properties(absent[0]):
+                        absent_parents.append(
+                            (
+                                absent[0],
+                                absent[1],
+                                (*path, name),
+                                blocker[0],
+                                insertions[0],
+                                entered[0],
+                            )
+                        )
                 continue
             followed_child = _follow_property_schema(
                 properties[name], child_pointer, report_issue
@@ -1628,21 +1660,28 @@ def _array_bound_negative_cases(
         if isinstance(element, (dict, list)):
             visit(item_schema, element, element_path, item_pointer)
 
-    visit(media.schema.raw, positive.request_body.value, (), root_pointer)
-    for entry in pending:  # grows while elements are visited
-        blocker[0] = entry[4]
-        visit_element(*entry)
-    blocker[0] = None
+    def drain_pending(start: int) -> None:
+        """Visit the elements queued from index start; the queue grows meanwhile."""
+        index = start
+        while index < len(pending):
+            schema, value, path, pointer, inherited, created, chain = pending[index]
+            blocker[0], insertions[0], entered[0] = inherited, created, chain
+            visit_element(schema, value, path, pointer, inherited)
+            index += 1
+        blocker[0], insertions[0], entered[0] = None, (), ()
 
-    cases: list[GeneratedTestCase] = []
-    for path, constraint, candidate, schema_pointer in targets:
+    visit(media.schema.raw, positive.request_body.value, (), root_pointer)
+    drain_pending(0)
+
+    def build_case(
+        target: tuple[tuple[str, ...], str, list[Any], str, _Insertions]
+    ) -> GeneratedTestCase:
+        path, constraint, candidate, schema_pointer, created = target
         if path:
             generated_value = deepcopy(positive.request_body.value)
-            parent = generated_value
-            for name in path[:-1]:
-                parent = parent[int(name)] if isinstance(parent, list) else parent[name]
-            last = int(path[-1]) if isinstance(parent, list) else path[-1]
-            parent[last] = candidate
+            for created_path, created_value in created:
+                _assign_at(generated_value, created_path, deepcopy(created_value))
+            _assign_at(generated_value, path, candidate)
         else:
             # A root-level array replaces the whole body.
             generated_value = candidate
@@ -1650,36 +1689,151 @@ def _array_bound_negative_cases(
         # The empty JSON Pointer addresses the body root itself.
         property_pointer = _json_pointer(path) if path else ""
         constraint_pointer = _child(schema_pointer, constraint)
-        cases.append(
-            _counted_case(
-                case_id=build_case_id(
-                    "negative",
-                    endpoint.path,
-                    endpoint.method,
-                    f"array-bound:{property_pointer}:{constraint}:{len(candidate)}",
-                ),
-                category="negative",
-                path=positive.path,
-                method=positive.method,
-                parameters=deepcopy(positive.parameters),
-                request_body=GeneratedBody(
-                    media_type="application/json", value=generated_value
-                ),
-                security=deepcopy(positive.security),
-                response_expectations=deepcopy(positive.response_expectations),
-                provenance=(
-                    *positive.provenance,
-                    schema_pointer,
-                    constraint_pointer,
-                    f"violated_constraint:{constraint}:{property_pointer}",
-                ),
-                expected_outcome="request_rejection_status_unspecified",
-                violated_constraint=constraint,
-                affected_property=property_pointer,
+        return _counted_case(
+            case_id=build_case_id(
+                "negative",
+                endpoint.path,
+                endpoint.method,
+                f"array-bound:{property_pointer}:{constraint}:{len(candidate)}",
+            ),
+            category="negative",
+            path=positive.path,
+            method=positive.method,
+            parameters=deepcopy(positive.parameters),
+            request_body=GeneratedBody(
+                media_type="application/json", value=generated_value
+            ),
+            security=deepcopy(positive.security),
+            response_expectations=deepcopy(positive.response_expectations),
+            provenance=(
+                *positive.provenance,
+                schema_pointer,
+                constraint_pointer,
+                f"violated_constraint:{constraint}:{property_pointer}",
+            ),
+            expected_outcome="request_rejection_status_unspecified",
+            violated_constraint=constraint,
+            affected_property=property_pointer,
+        )
+
+    cases = [build_case(target) for target in targets]
+
+    # Phase 3: array bounds below absent optional object properties. The parent
+    # is created in the negative body only; the positive body is not changed.
+    # The whole phase is isolated, so a limit reached here drops only its own
+    # cases and diagnostics and never the cases built above.
+    scan_results: dict[str, bool] = {}
+
+    def has_array_bounds(schema: dict[str, Any], pointer: str) -> bool:
+        """Whether a schema subtree declares array bounds, so a parent is worth creating."""
+        if pointer in scan_results:
+            return scan_results[pointer]
+        seen: set[str] = set()
+
+        def scan(node: Any, node_pointer: str, depth: int, top: bool) -> bool:
+            followed = _follow_property_schema(node, node_pointer, _skip_issue)
+            if followed is None or depth > _MAX_DEPTH:
+                return False
+            node, node_pointer = followed
+            if not isinstance(node, dict) or node_pointer in seen:
+                return False
+            seen.add(node_pointer)
+            if not top and node.get("readOnly") is True:
+                return False
+            if "minItems" in node or "maxItems" in node or node.get("uniqueItems") is True:
+                return True
+            properties = node.get("properties")
+            if isinstance(properties, dict):
+                for name in sorted(properties):
+                    if scan(properties[name], _child(node_pointer, "properties", name), depth + 1, False):
+                        return True
+            return "items" in node and scan(
+                node["items"], _child(node_pointer, "items"), depth + 1, False
             )
+
+        scan_results[pointer] = scan(schema, pointer, 0, True)
+        return scan_results[pointer]
+
+    def create_absent_parents() -> None:
+        index = 0
+        while index < len(absent_parents):  # grows while parents are created
+            schema, pointer, path, inherited, created, chain = absent_parents[index]
+            index += 1
+            if pointer in chain or not has_array_bounds(schema, pointer):
+                continue
+            literal = inherited or _literal_pointer(schema, pointer)
+            if literal is not None:
+                report(
+                    "array_bound_no_safe_candidate",
+                    (
+                        f"Array-bound cases below the absent optional property "
+                        f"'{_json_pointer(path)}' were not generated: creating it would "
+                        f"also violate the literal at {literal}."
+                    ),
+                    literal,
+                )
+                continue
+            try:
+                value, _ = _select_value(schema, version, [], pointer, direction="request")
+            except _UnsupportedOperation as issue:
+                report_issue(issue)
+                continue
+            if not isinstance(value, dict):
+                continue
+            insertions[0] = (*created, (path, value))
+            entered[0] = (*chain, pointer)
+            mark = len(pending)
+            visit(schema, value, path, pointer)
+            drain_pending(mark)
+
+    budget = _BUDGET.get()
+    counts = budget.case_counts() if budget is not None else None
+    target_mark, diagnostic_mark = len(targets), len(diagnostics)
+    try:
+        create_absent_parents()
+        cases.extend([build_case(target) for target in targets[target_mark:]])
+    except _BudgetExhausted as exhausted:
+        if budget is not None and counts is not None:
+            budget.restore_case_counts(counts)
+        del targets[target_mark:]
+        del diagnostics[diagnostic_mark:]
+        blocker[0], insertions[0], entered[0] = None, (), ()
+        what = exhausted.unit or {
+            _EXPANSION_BUDGET_CODE: "schema reference expansions",
+            _PATTERN_BUDGET_CODE: "pattern evaluations",
+        }.get(exhausted.code, "generated test cases")
+        report(
+            exhausted.code,
+            (
+                f"The per-{exhausted.scope} limit of {exhausted.limit} {what} was reached "
+                "while generating array-bound cases for absent optional parent objects. "
+                "Those cases were skipped; the other array-bound cases of this endpoint "
+                "were kept."
+            ),
+            exhausted.pointer or _endpoint_pointer(endpoint),
+            exhausted.reference_uri,
         )
 
     return tuple(cases), tuple(diagnostics)
+
+
+_Insertions = tuple[tuple[tuple[str, ...], Any], ...]
+
+
+def _assign_at(root: Any, path: tuple[str, ...], value: Any) -> None:
+    """Set the value at a body path whose steps are keys or list indexes."""
+    parent = root
+    for name in path[:-1]:
+        parent = parent[int(name)] if isinstance(parent, list) else parent[name]
+    parent[int(path[-1]) if isinstance(parent, list) else path[-1]] = value
+
+
+def _is_object_with_properties(schema: dict[str, Any]) -> bool:
+    declared = schema.get("type")
+    object_type = declared is None or declared == "object" or (
+        isinstance(declared, list) and "object" in declared
+    )
+    return object_type and isinstance(schema.get("properties"), dict)
 
 
 def _array_candidate(
