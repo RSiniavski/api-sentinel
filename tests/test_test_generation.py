@@ -11826,12 +11826,16 @@ def test_enclosing_const_or_enum_blocks_element_cases_with_a_diagnostic(
     assert all(item.message.endswith(f"{pointer}; no case was generated.") for item in messages)
 
 
-def test_empty_positive_array_has_no_element_case_and_no_fabricated_element() -> None:
+def test_empty_positive_array_gets_one_created_element_in_negative_cases_only() -> None:
     suite = element_suite(element_rows(ELEMENT_ITEM, minItems=0))
 
+    # The positive body keeps the empty array; one element exists only in the cases.
     assert suite.cases[0].request_body.value == {"rows": []}  # type: ignore[union-attr]
-    assert array_cases(suite) == []
-    # Only the existing "minItems is 0" explanation; nothing about elements.
+    assert array_values(suite) == [
+        ("/rows/0/tags", "minItems", {"rows": [{"tags": ["x"]}]}),
+        ("/rows/0/tags", "maxItems", {"rows": [{"tags": ["x"] * 4}]}),
+    ]
+    # The existing "minItems is 0" explanation is unchanged.
     assert array_diagnostics(suite) == [
         ("array_bound_no_safe_candidate", f"{ARRAY_BODY_POINTER}/properties/rows/minItems")
     ]
@@ -12527,3 +12531,794 @@ def test_suite_limit_hit_in_the_new_group_lets_a_later_endpoint_use_the_rest_of_
 
     assert budget_suite(endpoints=4) == suite
     assert budget_suite(endpoints=4).model_dump_json() == suite.model_dump_json()
+
+
+# --- Step 8.31: array bounds below the items of present empty arrays -------------
+
+def empty_obj(properties: dict[str, object], required: tuple[str, ...] = ()) -> dict[str, object]:
+    return {"type": "object", "required": list(required), "properties": properties}
+
+
+def empty_arr(items: object, **options: object) -> dict[str, object]:
+    return {"type": "array", "items": items, **options}
+
+
+TAGS_ITEM = empty_obj({"tags": ELEMENT_TAGS})
+
+
+def test_empty_root_array_gets_nested_bound_cases_in_the_negative_body_only() -> None:
+    suite = element_suite(empty_arr(TAGS_ITEM))
+
+    assert suite.cases[0].request_body.value == []  # type: ignore[union-attr]
+    assert array_values(suite) == [
+        ("/0/tags", "minItems", [{"tags": ["x"]}]),
+        ("/0/tags", "maxItems", [{"tags": ["x"] * 4}]),
+    ]
+    assert [case.case_id for case in array_cases(suite)] == [
+        build_case_id("negative", "/items", "post", "array-bound:/0/tags:minItems:1"),
+        build_case_id("negative", "/items", "post", "array-bound:/0/tags:maxItems:4"),
+    ]
+    assert array_diagnostics(suite) == []
+
+
+@pytest.mark.parametrize("keyword", ["enum", "const"])
+def test_root_literal_that_rejects_the_final_body_blocks_each_case(keyword: str) -> None:
+    schema = empty_arr(TAGS_ITEM, **{keyword: [[]] if keyword == "enum" else []})
+
+    suite = element_suite(schema)
+
+    assert array_values(suite) == []
+    pointer = f"{ARRAY_BODY_POINTER}/{keyword}"
+    assert array_diagnostics(suite) == [("array_bound_no_safe_candidate", pointer)] * 2
+    assert [item.message.split(" case ")[0] for item in suite.diagnostics] == [
+        "The minItems",
+        "The maxItems",
+    ]
+
+
+def test_root_literal_that_accepts_the_final_body_keeps_only_that_case() -> None:
+    # The positive body [] is the first member. The second member is the exact body
+    # of the minItems case, although it violates the items' own minItems.
+    schema = empty_arr(TAGS_ITEM, enum=[[], [{"tags": ["x"]}]])
+
+    suite = element_suite(schema)
+
+    assert suite.cases[0].request_body.value == []  # type: ignore[union-attr]
+    assert array_values(suite) == [("/0/tags", "minItems", [{"tags": ["x"]}])]
+    assert array_diagnostics(suite) == [
+        ("array_bound_no_safe_candidate", f"{ARRAY_BODY_POINTER}/enum")
+    ]
+    assert "maxItems" in suite.diagnostics[0].message
+
+
+def test_literal_accepting_the_final_body_while_the_positive_body_is_valid() -> None:
+    members = [{"rows": []}, {"rows": [{"tags": ["x"]}]}]
+    schema = {**empty_obj({"rows": empty_arr(TAGS_ITEM)}, ("rows",)), "enum": members}
+
+    suite = element_suite(schema)
+
+    positive = suite.cases[0].request_body.value  # type: ignore[union-attr]
+    assert positive == members[0]
+    # The positive body satisfies the whole schema; the second member does not.
+    assert generator_module._matches(schema, positive, "3.1.1", "request", 0, "/")
+    assert not generator_module._matches(schema, members[1], "3.1.1", "request", 0, "/")
+    assert array_values(suite) == [("/rows/0/tags", "minItems", members[1])]
+    assert len(members[1]["rows"][0]["tags"]) < ELEMENT_TAGS["minItems"]  # type: ignore[index, operator]
+    assert array_diagnostics(suite) == [
+        ("array_bound_no_safe_candidate", f"{ARRAY_BODY_POINTER}/enum")
+    ]
+
+
+def test_empty_array_then_absent_parent_then_empty_array_scenario_n() -> None:
+    parent = empty_obj({"list": empty_arr(TAGS_ITEM)}, ("list",))
+    body = empty_obj({"rows": empty_arr(empty_obj({"p": parent}))}, ("rows",))
+
+    suite = element_suite(body)
+
+    assert suite.cases[0].request_body.value == {"rows": []}  # type: ignore[union-attr]
+    assert array_values(suite) == [
+        ("/rows/0/p/list/0/tags", "minItems", {"rows": [{"p": {"list": [{"tags": ["x"]}]}}]}),
+        ("/rows/0/p/list/0/tags", "maxItems", {"rows": [{"p": {"list": [{"tags": ["x"] * 4}]}}]}),
+    ]
+    assert array_diagnostics(suite) == []
+
+
+def test_empty_array_then_empty_array_then_absent_parent_scenario_m() -> None:
+    inner = empty_arr(empty_obj({"q": empty_obj({"tags": ELEMENT_TAGS})}))
+    body = empty_obj({"rows": empty_arr(empty_obj({"inner": inner}, ("inner",)))}, ("rows",))
+
+    suite = element_suite(body)
+
+    assert array_values(suite) == [
+        ("/rows/0/inner/0/q/tags", "minItems", {"rows": [{"inner": [{"q": {"tags": ["x"]}}]}]}),
+        ("/rows/0/inner/0/q/tags", "maxItems", {"rows": [{"inner": [{"q": {"tags": ["x"] * 4}}]}]}),
+    ]
+
+
+def test_two_alternating_levels_of_empty_arrays_and_absent_parents_scenario_n2() -> None:
+    level_two = empty_obj({"list2": empty_arr(TAGS_ITEM)}, ("list2",))
+    level_one = empty_obj({"list": empty_arr(empty_obj({"q": level_two}))}, ("list",))
+    body = empty_obj({"rows": empty_arr(empty_obj({"p": level_one}))}, ("rows",))
+
+    suite = element_suite(body)
+
+    assert array_values(suite)[0] == (
+        "/rows/0/p/list/0/q/list2/0/tags",
+        "minItems",
+        {"rows": [{"p": {"list": [{"q": {"list2": [{"tags": ["x"]}]}}]}}]},
+    )
+    assert [value[:2] for value in array_values(suite)] == [
+        ("/rows/0/p/list/0/q/list2/0/tags", "minItems"),
+        ("/rows/0/p/list/0/q/list2/0/tags", "maxItems"),
+    ]
+    assert array_diagnostics(suite) == []
+
+
+def test_recursive_reference_schema_terminates_with_unique_deterministic_cases() -> None:
+    node = empty_obj(
+        {
+            "tags": ELEMENT_TAGS,
+            "kids": empty_arr(schema_reference("Node")),
+            "child": schema_reference("Node"),
+        },
+        ("kids",),
+    )
+    body = empty_obj({"root": schema_reference("Node")}, ("root",))
+
+    first = element_suite(body, {"Node": node})
+    second = element_suite(body, {"Node": node})
+
+    # The first four cases are the existing phases; the creation of the elements
+    # stops at the repeated "kids" schema, so the inner "kids" stay empty.
+    deep = [", ".join(map(str, value[:2])) for value in array_values(first)]
+    assert deep[-6:] == [
+        "/root/kids/0/tags, minItems",
+        "/root/kids/0/tags, maxItems",
+        "/root/child/kids/0/tags, minItems",
+        "/root/child/kids/0/tags, maxItems",
+        "/root/kids/0/child/tags, minItems",
+        "/root/kids/0/child/tags, maxItems",
+    ]
+    assert array_values(first)[-6][2] == {"root": {"kids": [{"kids": [], "tags": ["x"]}]}}
+    assert array_values(first)[-2][2] == {
+        "root": {"kids": [{"kids": [], "child": {"kids": [], "tags": ["x"]}}]}
+    }
+    ids = [case.case_id for case in first.cases]
+    assert len(ids) == len(set(ids))
+    assert first == second
+
+
+def test_empty_array_inside_a_phase_3_created_parent_gets_its_own_insertions() -> None:
+    body = empty_obj({"p": empty_obj({"tags": ELEMENT_TAGS, "rows": empty_arr(TAGS_ITEM)}, ("rows",))})
+
+    suite = element_suite(body)
+
+    assert suite.cases[0].request_body.value == {}  # type: ignore[union-attr]
+    assert array_values(suite) == [
+        ("/p/tags", "minItems", {"p": {"rows": [], "tags": ["x"]}}),
+        ("/p/tags", "maxItems", {"p": {"rows": [], "tags": ["x"] * 4}}),
+        ("/p/rows/0/tags", "minItems", {"p": {"rows": [{"tags": ["x"]}]}}),
+        ("/p/rows/0/tags", "maxItems", {"p": {"rows": [{"tags": ["x"] * 4}]}}),
+    ]
+    assert array_diagnostics(suite) == []
+
+
+def test_absent_parent_inside_an_inserted_element_is_created() -> None:
+    item = empty_obj({"q": empty_obj({"tags": ELEMENT_TAGS})})
+
+    suite = element_suite(empty_obj({"rows": empty_arr(item)}, ("rows",)))
+
+    assert array_values(suite) == [
+        ("/rows/0/q/tags", "minItems", {"rows": [{"q": {"tags": ["x"]}}]}),
+        ("/rows/0/q/tags", "maxItems", {"rows": [{"q": {"tags": ["x"] * 4}}]}),
+    ]
+
+
+def test_independent_empty_arrays_produce_separate_cases_with_only_their_own_element() -> None:
+    suite = element_suite(empty_obj({"a": empty_arr(TAGS_ITEM), "b": empty_arr(TAGS_ITEM)}, ("a", "b")))
+
+    assert array_values(suite) == [
+        ("/a/0/tags", "minItems", {"a": [{"tags": ["x"]}], "b": []}),
+        ("/a/0/tags", "maxItems", {"a": [{"tags": ["x"] * 4}], "b": []}),
+        ("/b/0/tags", "minItems", {"a": [], "b": [{"tags": ["x"]}]}),
+        ("/b/0/tags", "maxItems", {"a": [], "b": [{"tags": ["x"] * 4}]}),
+    ]
+
+
+def test_required_siblings_of_the_element_and_nested_arrays() -> None:
+    sibling_item = empty_obj({"id": {"type": "integer"}, "tags": ELEMENT_TAGS}, ("id",))
+    siblings = element_suite(empty_obj({"rows": empty_arr(sibling_item)}, ("rows",)))
+    nested = element_suite(empty_obj({"rows": empty_arr(empty_arr(TAGS_ITEM))}, ("rows",)))
+
+    assert array_values(siblings)[0] == ("/rows/0/tags", "minItems", {"rows": [{"id": 0, "tags": ["x"]}]})
+    assert array_values(siblings)[1][2] == {"rows": [{"id": 0, "tags": ["x"] * 4}]}
+    assert array_values(nested) == [
+        ("/rows/0/0/tags", "minItems", {"rows": [[{"tags": ["x"]}]]}),
+        ("/rows/0/0/tags", "maxItems", {"rows": [[{"tags": ["x"] * 4}]]}),
+    ]
+
+
+def test_items_resolved_through_a_reference() -> None:
+    suite = element_suite(
+        empty_obj({"rows": empty_arr(schema_reference("Item"))}, ("rows",)), {"Item": TAGS_ITEM}
+    )
+
+    assert array_values(suite) == [
+        ("/rows/0/tags", "minItems", {"rows": [{"tags": ["x"]}]}),
+        ("/rows/0/tags", "maxItems", {"rows": [{"tags": ["x"] * 4}]}),
+    ]
+    assert any("components/schemas/Item" in pointer for pointer in array_cases(suite)[0].provenance)
+
+
+def literal_case(body: object, schemas: dict[str, object] | None = None) -> tuple[list[object], list[tuple[str, str]]]:
+    suite = element_suite(body, schemas)
+    return array_values(suite), [(item.code, item.source_pointer) for item in suite.diagnostics if item.code.startswith("array_")]
+
+
+# "outer" is an array whose only literal member holds the empty array "rows".
+ENCLOSING_ARRAY_BODY = empty_obj(
+    {
+        "outer": empty_arr(
+            empty_obj({"rows": empty_arr(TAGS_ITEM)}, ("rows",)), enum=[[{"rows": []}]]
+        )
+    },
+    ("outer",),
+)
+
+
+@pytest.mark.parametrize(
+    ("name", "body", "schemas", "literal_pointer"),
+    [
+        (
+            "parent object",
+            empty_obj(
+                {"o": {**empty_obj({"rows": empty_arr(TAGS_ITEM)}, ("rows",)), "enum": [{"rows": []}]}},
+                ("o",),
+            ),
+            None,
+            f"{ARRAY_BODY_POINTER}/properties/o/enum",
+        ),
+        (
+            "enclosing array",
+            ENCLOSING_ARRAY_BODY,
+            None,
+            f"{ARRAY_BODY_POINTER}/properties/outer/enum",
+        ),
+        (
+            "items schema",
+            empty_obj(
+                {"rows": empty_arr({**TAGS_ITEM, "enum": [{"tags": ["a", "b"]}]})}, ("rows",)
+            ),
+            None,
+            f"{ARRAY_BODY_POINTER}/properties/rows/items/enum",
+        ),
+        (
+            "reference-resolved ancestor",
+            empty_obj({"w": schema_reference("W")}, ("w",)),
+            {"W": {**empty_obj({"rows": empty_arr(TAGS_ITEM)}, ("rows",)), "enum": [{"rows": []}]}},
+            "/components/schemas/W/enum",
+        ),
+    ],
+)
+def test_ancestor_literals_that_reject_the_final_body_block_both_cases(
+    name: str, body: object, schemas: dict[str, object] | None, literal_pointer: str
+) -> None:
+    values, diagnostics = literal_case(body, schemas)
+
+    assert values == [], name
+    assert diagnostics == [("array_bound_no_safe_candidate", literal_pointer)] * 2
+
+
+def test_enclosing_array_literal_scenario_has_a_valid_positive_body_and_blocks_the_created_element() -> None:
+    suite = element_suite(ENCLOSING_ARRAY_BODY)
+
+    positive = suite.cases[0].request_body.value  # type: ignore[union-attr]
+    assert positive == {"outer": [{"rows": []}]}
+    assert positive["outer"] in ENCLOSING_ARRAY_BODY["properties"]["outer"]["enum"]  # type: ignore[index]
+    assert generator_module._matches(ENCLOSING_ARRAY_BODY, positive, "3.1.1", "request", 0, "/")
+    # The element is created below "outer/0/rows", so the body would leave the literal.
+    assert array_values(suite) == []
+    assert [(item.code, item.source_pointer) for item in suite.diagnostics if item.code.startswith("array_")] == [
+        ("array_bound_no_safe_candidate", f"{ARRAY_BODY_POINTER}/properties/outer/enum")
+    ] * 2
+    assert all("'/outer/0/rows/0/tags'" in item.message for item in suite.diagnostics if item.code.startswith("array_"))
+
+
+def test_literal_on_the_target_array_that_accepts_its_member_keeps_the_case() -> None:
+    tags = {**ELEMENT_TAGS, "enum": [["a", "b"], ["a"]]}
+    item = empty_obj({"tags": tags}, ("tags",))
+
+    suite = element_suite(empty_obj({"rows": empty_arr(item)}, ("rows",)))
+
+    # The enum member ["a"] violates only minItems, so the target's literal accepts it.
+    assert array_values(suite) == [("/rows/0/tags", "minItems", {"rows": [{"tags": ["a"]}]})]
+    assert array_diagnostics(suite) == [
+        ("array_bound_no_safe_candidate", f"{ARRAY_BODY_POINTER}/properties/rows/items/properties/tags/maxItems")
+    ]
+
+
+def test_max_items_zero_gets_one_diagnostic_when_the_items_have_array_bounds() -> None:
+    suite = element_suite(empty_obj({"rows": empty_arr(TAGS_ITEM, maxItems=0)}, ("rows",)))
+
+    assert [value[0] for value in array_values(suite)] == ["/rows"]  # the existing maxItems case
+    assert array_diagnostics(suite) == [
+        ("array_bound_no_safe_candidate", f"{ARRAY_BODY_POINTER}/properties/rows/maxItems")
+    ]
+    assert "maxItems is 0" in suite.diagnostics[0].message
+
+
+def test_max_items_zero_without_nested_array_bounds_gives_no_diagnostic() -> None:
+    plain = empty_arr(empty_obj({"name": {"type": "string"}, "list": empty_arr({"type": "string"})}), maxItems=0)
+
+    suite = element_suite(empty_obj({"rows": plain}, ("rows",)))
+
+    assert [value[0] for value in array_values(suite)] == ["/rows"]
+    assert array_diagnostics(suite) == []
+
+
+def test_empty_array_without_nested_array_bounds_creates_nothing_and_reports_nothing() -> None:
+    item = empty_obj({"n": {"type": "string"}, "l": empty_arr({"type": "string"})})
+
+    suite = element_suite(empty_obj({"rows": empty_arr(item)}, ("rows",)))
+
+    assert array_values(suite) == []
+    assert array_diagnostics(suite) == []
+
+
+def test_unsupported_required_sibling_of_the_element_is_reported_once() -> None:
+    item = empty_obj({"s": {"type": "string", "pattern": "(a|b)"}, "tags": ELEMENT_TAGS}, ("s",))
+
+    suite = element_suite(empty_obj({"rows": empty_arr(item)}, ("rows",)))
+
+    assert array_values(suite) == []
+    assert array_diagnostics(suite) == [
+        ("array_bound_unsupported_schema", f"{ARRAY_BODY_POINTER}/properties/rows/items/properties/s/pattern")
+    ]
+
+
+def phase4_body() -> dict[str, object]:
+    # Phase 3 creates "p" for its tags; "p.rows" is then empty, which is phase 4.
+    return empty_obj(
+        {"p": empty_obj({"tags": ELEMENT_TAGS, "rows": empty_arr(TAGS_ITEM)}, ("rows",))}
+    )
+
+
+def phase4_suite(endpoints: int = 1) -> GeneratedTestSuite:
+    return generate_test_suite(
+        make_result(*(post_endpoint(phase4_body(), path=f"/items{index}") for index in range(endpoints)))
+    )
+
+
+def test_phase_3_rollback_drops_the_empty_arrays_it_registered(monkeypatch: pytest.MonkeyPatch) -> None:
+    reference = phase4_suite()
+    total = len(reference.cases)
+    assert [value[0] for value in array_values(reference)] == ["/p/tags"] * 2 + ["/p/rows/0/tags"] * 2
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_CASES", total - 3)
+
+    suite = phase4_suite()
+
+    # Phase 3 needs two cases but only one fits: its group is dropped. The empty
+    # array it created must not be processed by phase 4 afterwards.
+    assert array_values(suite) == []
+    assert [item.code for item in suite.diagnostics] == ["generation_case_budget_exceeded"]
+    assert "absent optional parent objects" in suite.diagnostics[0].message
+    assert suite.cases == reference.cases[: total - 4]
+
+
+@pytest.mark.parametrize("scope", ["endpoint", "suite"])
+def test_phase_4_case_limit_drops_only_its_group_and_keeps_phase_3(
+    scope: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reference = phase4_suite()
+    total = len(reference.cases)
+    name = "_MAX_ENDPOINT_CASES" if scope == "endpoint" else "_MAX_SUITE_CASES"
+    monkeypatch.setattr(generator_module, name, total - 1)
+
+    suite = phase4_suite()
+
+    assert suite.cases == reference.cases[: total - 2]
+    assert [value[0] for value in array_values(suite)] == ["/p/tags", "/p/tags"]
+    assert [item.code for item in suite.diagnostics] == ["generation_case_budget_exceeded"]
+    message = suite.diagnostics[0].message
+    assert f"per-{scope} limit of {total - 1}" in message
+    assert "elements of present empty arrays" in message and "other array-bound cases" in message
+    assert phase4_suite() == suite
+
+
+def test_phase_4_rollback_restores_the_case_counters(monkeypatch: pytest.MonkeyPatch) -> None:
+    total = len(phase4_suite().cases)
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_CASES", total - 1)
+    restored: list[tuple[object, object]] = []
+    original = generator_module._GenerationBudget.restore_case_counts
+
+    def spy(self: object, counts: tuple[int, int]) -> None:
+        original(self, counts)  # type: ignore[arg-type]
+        restored.append((counts, self.case_counts()))  # type: ignore[attr-defined]
+
+    monkeypatch.setattr(generator_module._GenerationBudget, "restore_case_counts", spy)
+
+    suite = phase4_suite()
+
+    assert restored[-1][0] == restored[-1][1]
+    assert restored[-1][0][0] == len(suite.cases)  # type: ignore[index]
+
+
+def test_suite_limit_hit_in_phase_4_lets_later_endpoints_use_the_rest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    per_endpoint = len(phase4_suite().cases)
+    limit = 2 * per_endpoint - 2 + 1
+    monkeypatch.setattr(generator_module, "_MAX_SUITE_CASES", limit)
+
+    suite = phase4_suite(endpoints=4)
+
+    counts: dict[str, int] = {}
+    for case in suite.cases:
+        counts[case.path] = counts.get(case.path, 0) + 1
+    assert counts == {"/items0": per_endpoint, "/items1": per_endpoint - 2, "/items2": 1}
+    assert len(suite.cases) == limit
+    assert [(item.code, item.endpoint_path) for item in suite.diagnostics] == [
+        ("generation_case_budget_exceeded", "/items1"),
+        ("generation_case_budget_exceeded", "/items2"),
+    ]
+    dropped, normal = (item.message for item in suite.diagnostics)
+    assert "elements of present empty arrays" in dropped
+    assert "elements of present empty arrays" not in normal
+    assert "1 following endpoint(s) were not generated" in normal
+    assert phase4_suite(endpoints=4) == suite
+
+
+def test_endpoint_limit_drop_in_phase_4_lets_later_endpoints_continue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    per_endpoint = len(phase4_suite().cases)
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_CASES", per_endpoint - 1)
+
+    suite = phase4_suite(endpoints=3)
+
+    assert len(suite.cases) == 3 * (per_endpoint - 2)
+    assert [item.endpoint_path for item in suite.diagnostics] == ["/items0", "/items1", "/items2"]
+    assert len({case.case_id for case in suite.cases}) == len(suite.cases)
+
+
+def expansion_result() -> NormalizationResult:
+    body = empty_obj({"rows": empty_arr(schema_reference("I"))}, ("rows",))
+    return make_result_with_schemas(
+        post_endpoint(body),
+        {
+            "I": empty_obj({"p": schema_reference("P")}),
+            "P": empty_obj({"list": empty_arr(schema_reference("J"))}, ("list",)),
+            "J": empty_obj({"tags": schema_reference("Tags")}),
+            "Tags": ELEMENT_TAGS,
+        },
+    )
+
+
+def test_expansion_limit_in_a_later_worklist_round_drops_the_group_deterministically(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hops = count_expansions(expansion_result())
+    reference = generate_test_suite(expansion_result())
+    assert [value[0] for value in array_values(reference)] == ["/rows/0/p/list/0/tags"] * 2
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_EXPANSIONS", hops)
+    assert generate_test_suite(expansion_result()).cases == reference.cases
+
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_EXPANSIONS", hops - 1)
+    suite = generate_test_suite(expansion_result())
+
+    assert suite.cases == reference.cases[:-2]
+    assert [item.code for item in suite.diagnostics] == ["generation_expansion_budget_exceeded"]
+    # "J" is only reached after the second round created "p" and processed "list".
+    assert suite.diagnostics[0].source_pointer == "/components/schemas/J/properties/tags"
+    assert "elements of present empty arrays" in suite.diagnostics[0].message
+    assert generate_test_suite(expansion_result()) == suite
+
+
+def test_created_elements_and_positive_bodies_are_isolated_between_cases() -> None:
+    example = {"meta": {"k": 1}, "tags": ["a", "b"]}
+    item = {
+        **empty_obj({"meta": {"type": "object"}, "tags": ELEMENT_TAGS}, ("meta", "tags")),
+        "example": example,
+    }
+    result = make_result(post_endpoint(empty_obj({"rows": empty_arr(item)}, ("rows",))))
+    before_input = result.model_dump_json()
+    suite = generate_test_suite(result)
+    cases = [case for case in array_cases(suite) if case.affected_property == "/rows/0/tags"]
+    assert [case.violated_constraint for case in cases] == ["minItems", "maxItems"]
+    before = [case.model_dump(mode="json") for case in suite.cases]
+
+    created = body_value(cases[0])["rows"][0]  # type: ignore[index]
+    created["meta"]["k"] = "mutated"
+    created["tags"].append("mutated")
+
+    after = [case.model_dump(mode="json") for case in suite.cases]
+    index = suite.cases.index(cases[0])
+    assert after[index] != before[index]
+    assert [x for i, x in enumerate(after) if i != index] == [x for i, x in enumerate(before) if i != index]
+    assert example == {"meta": {"k": 1}, "tags": ["a", "b"]}
+    assert result.model_dump_json() == before_input
+    assert suite.cases[0].request_body.value == {"rows": []}  # type: ignore[union-attr]
+
+
+def test_existing_case_ids_and_order_do_not_change_and_phase_4_cases_come_last() -> None:
+    plain_item = empty_obj({"name": {"type": "string"}})
+
+    def build(item: object) -> GeneratedTestSuite:
+        return element_suite(
+            empty_obj({"a": ELEMENT_TAGS, "rows": empty_arr(item)}, ("a", "rows"))
+        )
+
+    old = build(plain_item)
+    new = build(TAGS_ITEM)
+
+    assert [case.case_id for case in new.cases[:-2]] == [case.case_id for case in old.cases]
+    assert [case.case_id for case in new.cases[-2:]] == [
+        build_case_id("negative", "/items", "post", "array-bound:/rows/0/tags:minItems:1"),
+        build_case_id("negative", "/items", "post", "array-bound:/rows/0/tags:maxItems:4"),
+    ]
+    assert [case.violated_constraint for case in new.cases[-2:]] == ["minItems", "maxItems"]
+    assert len({case.case_id for case in new.cases}) == len(new.cases)
+
+
+def test_phase_4_generation_is_deterministic() -> None:
+    level_two = empty_obj({"list2": empty_arr(TAGS_ITEM)}, ("list2",))
+    level_one = empty_obj({"list": empty_arr(empty_obj({"q": level_two}))}, ("list",))
+    body = empty_obj(
+        {"rows": empty_arr(empty_obj({"p": level_one})), "other": empty_arr(TAGS_ITEM)},
+        ("rows", "other"),
+    )
+
+    first, second = element_suite(body), element_suite(body)
+
+    assert first.model_dump_json() == second.model_dump_json()
+    assert [case.case_id for case in first.cases] == [case.case_id for case in second.cases]
+
+
+@pytest.mark.parametrize("version", ["3.0.3", "3.1.1"])
+def test_normalized_documents_generate_cases_below_empty_arrays(version: str) -> None:
+    from app.services.openapi import normalize_openapi_document
+
+    document = {
+        "openapi": version,
+        "info": {"title": "T", "version": "1"},
+        "paths": {
+            "/items": {
+                "post": {
+                    "requestBody": {
+                        "required": True,
+                        "content": {
+                            "application/json": {
+                                "schema": empty_obj({"rows": empty_arr(TAGS_ITEM)}, ("rows",))
+                            }
+                        },
+                    },
+                    "responses": {"200": {"description": "OK"}, "400": {"description": "Bad"}},
+                }
+            }
+        },
+    }
+
+    suite = generate_test_suite(normalize_openapi_document(document))
+
+    assert suite.cases[0].request_body.value == {"rows": []}  # type: ignore[union-attr]
+    assert array_values(suite) == [
+        ("/rows/0/tags", "minItems", {"rows": [{"tags": ["x"]}]}),
+        ("/rows/0/tags", "maxItems", {"rows": [{"tags": ["x"] * 4}]}),
+    ]
+    assert array_diagnostics(suite) == []
+
+
+def test_non_empty_array_inside_an_inserted_element_is_visited_too() -> None:
+    item = empty_obj({"list": empty_arr(TAGS_ITEM, minItems=1)}, ("list",))
+
+    suite = element_suite(empty_obj({"rows": empty_arr(item)}, ("rows",)))
+
+    # The element's own array bound and, through its element 0, the nested target.
+    assert array_values(suite) == [
+        ("/rows/0/list", "minItems", {"rows": [{"list": []}]}),
+        ("/rows/0/list/0/tags", "minItems", {"rows": [{"list": [{"tags": ["x"]}]}]}),
+        ("/rows/0/list/0/tags", "maxItems", {"rows": [{"list": [{"tags": ["x"] * 4}]}]}),
+    ]
+    assert array_diagnostics(suite) == []
+
+
+def pattern_phase4_body() -> dict[str, object]:
+    code = {"type": "string", "pattern": "^[a-z]+$"}
+    # A different pattern, so that the memo of the "code" evaluations cannot answer it.
+    element = empty_obj({"s": {"type": "string", "pattern": "^[a-z]{1,8}$"}, "tags": ELEMENT_TAGS}, ("s",))
+    return empty_obj(
+        {
+            "a": ELEMENT_TAGS,  # phase 1 cases
+            "code": code,  # pattern charges before phase 4
+            "empty_zero": empty_arr(TAGS_ITEM, maxItems=0),  # a phase 4 diagnostic, first
+            "p": empty_obj({"tags": ELEMENT_TAGS}),  # phase 3 cases
+            "rows": empty_arr(element),  # the pattern is evaluated only here, in phase 4
+        },
+        ("a", "code", "empty_zero", "rows"),
+    )
+
+
+def pattern_phase4_suite() -> GeneratedTestSuite:
+    return generate_test_suite(make_result(post_endpoint(pattern_phase4_body())))
+
+
+def test_pattern_limit_reached_while_selecting_a_phase_4_element_drops_the_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sys
+
+    from_phase4: list[bool] = []
+    original_charge = generator_module._GenerationBudget.charge_pattern_evaluation
+
+    def record(self: object, pointer: str | None, work: int) -> None:
+        frame, names = sys._getframe(1), set()
+        while frame is not None:
+            names.add(frame.f_code.co_name)
+            frame = frame.f_back  # type: ignore[assignment]
+        from_phase4.append("process_empty" in names)
+        original_charge(self, pointer, work)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(generator_module._GenerationBudget, "charge_pattern_evaluation", record)
+    reference = pattern_phase4_suite()
+    monkeypatch.undo()
+
+    phase4 = [("/rows/0/tags", "minItems"), ("/rows/0/tags", "maxItems")]
+    assert [value[:2] for value in array_values(reference)][-2:] == phase4
+    assert [item.code for item in reference.diagnostics] == ["array_bound_no_safe_candidate"]
+    # The first pattern evaluation of phase 4 comes after earlier ones ("code").
+    before_phase4 = from_phase4.index(True)
+    assert before_phase4 > 0 and not any(from_phase4[:before_phase4])
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_PATTERN_EVALUATIONS", before_phase4)
+
+    charges: list[bool] = []
+    restored: list[tuple[tuple[int, int], tuple[int, int], int, int]] = []
+    original_charge = generator_module._GenerationBudget.charge_pattern_evaluation
+    original_restore = generator_module._GenerationBudget.restore_case_counts
+
+    def count_charge(self: object, pointer: str | None, work: int) -> None:
+        charges.append(True)
+        original_charge(self, pointer, work)  # type: ignore[arg-type]
+
+    def spy_restore(self: object, counts: tuple[int, int]) -> None:
+        original_restore(self, counts)  # type: ignore[arg-type]
+        restored.append(
+            (
+                counts,
+                self.case_counts(),  # type: ignore[attr-defined]
+                self.endpoint_pattern_evaluations,  # type: ignore[attr-defined]
+                self.suite_pattern_evaluations,  # type: ignore[attr-defined]
+            )
+        )
+
+    monkeypatch.setattr(generator_module._GenerationBudget, "charge_pattern_evaluation", count_charge)
+    monkeypatch.setattr(generator_module._GenerationBudget, "restore_case_counts", spy_restore)
+
+    suite = pattern_phase4_suite()
+
+    # All phase 4 cases and its own diagnostic are gone; the earlier cases are unchanged.
+    assert suite.cases == reference.cases[:-2]
+    assert [value[0] for value in array_values(suite)] == ["/a", "/a", "/empty_zero", "/p/tags", "/p/tags"]
+    assert [item.code for item in suite.diagnostics] == ["generation_pattern_budget_exceeded"]
+    message = suite.diagnostics[0].message
+    assert "per-endpoint limit" in message and "pattern evaluations" in message
+    assert "elements of present empty arrays" in message
+    # The case counters are restored; the pattern charges, including the failed one, stay.
+    counts, after, endpoint_patterns, suite_patterns = restored[-1]
+    assert counts == after and counts[0] == len(suite.cases)
+    assert endpoint_patterns == suite_patterns == before_phase4 + 1
+    assert len(charges) == before_phase4 + 1
+
+    monkeypatch.undo()
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_PATTERN_EVALUATIONS", before_phase4)
+    assert pattern_phase4_suite() == suite
+    assert pattern_phase4_suite().model_dump_json() == suite.model_dump_json()
+
+
+CONST_ENUM_ROWS = empty_obj({"rows": empty_arr(TAGS_ITEM)}, ("rows",))
+CONST_ENUM_FINAL = {"rows": [{"tags": ["x"]}]}  # the body of the minItems case
+
+
+def test_const_and_enum_on_one_node_report_the_rejecting_const_when_enum_accepts() -> None:
+    # The enum lists the exact final body of the minItems case, but the const (the
+    # positive body) rejects it, so the const is the violated keyword.
+    schema = {**CONST_ENUM_ROWS, "const": {"rows": []}, "enum": [{"rows": []}, CONST_ENUM_FINAL]}
+
+    suite = element_suite(schema)
+
+    assert suite.cases[0].request_body.value == {"rows": []}  # type: ignore[union-attr]
+    assert array_values(suite) == []
+    assert array_diagnostics(suite) == [
+        ("array_bound_no_safe_candidate", f"{ARRAY_BODY_POINTER}/const")
+    ] * 2
+
+
+def test_const_and_enum_on_one_node_that_both_reject_report_the_const_once_per_case() -> None:
+    schema = {**CONST_ENUM_ROWS, "const": {"rows": []}, "enum": [{"rows": []}]}
+
+    suite = element_suite(schema)
+
+    assert array_values(suite) == []
+    assert array_diagnostics(suite) == [
+        ("array_bound_no_safe_candidate", f"{ARRAY_BODY_POINTER}/const")
+    ] * 2
+
+
+@pytest.mark.parametrize(
+    ("const", "members"),
+    [
+        (CONST_ENUM_FINAL, [CONST_ENUM_FINAL]),  # const == final body, enum agrees
+        (CONST_ENUM_FINAL, [{"rows": []}]),  # const == final body, enum rejects it
+        ({"rows": []}, [CONST_ENUM_FINAL]),  # const == positive body, enum rejects it
+    ],
+)
+def test_const_and_enum_that_accept_the_final_body_cannot_come_with_a_positive_body(
+    const: object, members: list[object]
+) -> None:
+    # A node whose const accepts the final body, but whose enum rejects it, would need
+    # a positive body that satisfies both keywords and differs from the final body.
+    # No such body exists, so the endpoint has no positive baseline and Phase 4 never
+    # compares the node's keywords.
+    suite = element_suite({**CONST_ENUM_ROWS, "const": const, "enum": members})
+
+    assert suite.cases == ()
+    assert [item.code for item in suite.diagnostics if item.code.startswith("array_")] == []
+    assert [item.code for item in suite.diagnostics][:1] == ["no_positive_schema_value"]
+    assert array_values(suite) == []
+
+
+def test_literal_helpers_combine_const_and_enum() -> None:
+    accepts, pointer = generator_module._literal_accepts, generator_module._literal_pointer
+    both = {"const": 1, "enum": [1, 2]}
+
+    assert accepts(both, 1) is True  # both accept
+    assert accepts(both, 2) is False  # const rejects, enum accepts
+    assert accepts({"const": 1, "enum": [2]}, 1) is False  # const accepts, enum rejects
+    assert accepts(both, 3) is False  # both reject
+    assert accepts({"const": 1.0}, 1) is True and accepts({"enum": [True]}, 1) is False
+    assert pointer(both, "/s") == "/s/const"  # the const is named first
+    assert pointer({"enum": [1]}, "/s") == "/s/enum"
+    assert pointer({}, "/s") is None
+
+
+def test_phase_4_targets_with_aliases_nesting_and_recursion_never_share_a_case_key() -> None:
+    # Phase 4 drops a target whose (path, constraint, candidate length) was already
+    # accepted. Each array node is visited once, so that guard never fires: every
+    # (path, constraint) pair is unique, even when the same $ref alias, a recursive
+    # schema and the repeated worklist reach the same schema through different paths.
+    level_two = empty_obj({"list2": empty_arr(schema_reference("Item"))}, ("list2",))
+    level_one = empty_obj({"list": empty_arr(empty_obj({"q": level_two}))}, ("list",))
+    body = empty_obj(
+        {
+            "a": empty_arr(schema_reference("Item")),
+            "b": empty_arr(schema_reference("Item")),  # same alias, another path
+            "c": empty_arr(empty_arr(schema_reference("Item"))),
+            "deep": empty_arr(empty_obj({"p": level_one})),
+            "root": schema_reference("Node"),
+            "0": empty_arr(schema_reference("Item")),  # property named like an index
+        },
+        ("a", "b", "c", "deep", "root", "0"),
+    )
+    node = empty_obj(
+        {
+            "tags": ELEMENT_TAGS,
+            "kids": empty_arr(schema_reference("Node")),  # recursive through an array
+            "child": schema_reference("Node"),  # recursive through an object
+        },
+        ("kids",),
+    )
+
+    suite = element_suite(body, {"Item": TAGS_ITEM, "Node": node})
+    keys = [(path, constraint) for path, constraint, _ in array_values(suite)]
+
+    assert len(keys) == 20
+    assert len(set(keys)) == len(keys)  # no (path, constraint) repeats
+    assert len({case.case_id for case in suite.cases}) == len(suite.cases)
+    assert {path for path, _ in keys} >= {
+        "/a/0/tags",
+        "/b/0/tags",  # the alias reached twice gives two cases
+        "/c/0/0/tags",
+        "/0/0/tags",
+        "/root/kids/0/child/tags",
+        "/deep/0/p/list/0/q/list2/0/tags",
+    }
+    assert [item.code for item in suite.diagnostics if item.code.startswith("array_")] == []

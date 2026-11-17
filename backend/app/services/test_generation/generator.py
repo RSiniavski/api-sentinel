@@ -1366,6 +1366,13 @@ def _array_bound_negative_cases(
     gives ``array_bound_unsupported_schema``. The phase is isolated: if it
     exhausts a budget, its cases and diagnostics are dropped, case counters are
     restored, and one budget diagnostic is reported; earlier cases are kept.
+
+    A fourth phase handles present empty arrays whose ``items`` subtree holds an
+    array-bound target: one element is created with ``_select_value`` in the
+    negative body only (also at the root), discovery alternates between empty
+    arrays and absent parents until nothing new is left, and ``const``/``enum``
+    along the visited schemas are checked on the final body. It is isolated in
+    the same way as phase 3.
     """
     version = api.openapi_version
     resolved = _resolved_request_body(endpoint, api)
@@ -1396,6 +1403,16 @@ def _array_bound_negative_cases(
     ] = []
     insertions: list[_Insertions] = [()]
     entered: list[tuple[str, ...]] = [()]
+    # Present empty arrays, visited by phase 4 (see below), with the parents and
+    # elements already created above them and the schema pointers already entered.
+    empty_arrays: list[
+        tuple[dict[str, Any], str, tuple[str, ...], _Insertions, tuple[str, ...]]
+    ] = []
+    # The followed schema and its resolved pointer of every visited value path.
+    visited: dict[tuple[str, ...], tuple[dict[str, Any], str]] = {}
+    # Phase 4 decides literals on the final body, so the earlier per-target
+    # enum/const blocker is switched off while it runs.
+    final_body_mode: list[bool] = [False]
 
     def report(
         code: str, message: str, pointer: str, reference_uri: str | None = None
@@ -1577,6 +1594,8 @@ def _array_bound_negative_cases(
         if followed is None:
             return
         schema, pointer = followed
+        if isinstance(schema, dict):
+            visited[path] = (schema, pointer)
         if not path and isinstance(schema, dict):
             # A root-level array body.
             target_array(schema, pointer, path)
@@ -1585,6 +1604,12 @@ def _array_bound_negative_cases(
             pending.append(
                 (schema, value, path, pointer, blocker[0], insertions[0], entered[0])
             )
+        elif (
+            isinstance(schema, dict)
+            and isinstance(value, list)
+            and schema.get("readOnly") is not True
+        ):
+            empty_arrays.append((schema, pointer, path, insertions[0], entered[0]))
         if not isinstance(schema, dict) or not isinstance(value, dict):
             return
         properties = schema.get("properties")
@@ -1654,9 +1679,13 @@ def _array_bound_negative_cases(
         outer = inherited or _literal_pointer(schema, pointer)
         element = value[0]
         if isinstance(element, list):
-            blocker[0] = outer
+            blocker[0] = None if final_body_mode[0] else outer
             target_array(item_schema, item_pointer, element_path)
-        blocker[0] = outer or _literal_pointer(item_schema, item_pointer)
+        blocker[0] = (
+            None
+            if final_body_mode[0]
+            else outer or _literal_pointer(item_schema, item_pointer)
+        )
         if isinstance(element, (dict, list)):
             visit(item_schema, element, element_path, item_pointer)
 
@@ -1673,18 +1702,30 @@ def _array_bound_negative_cases(
     visit(media.schema.raw, positive.request_body.value, (), root_pointer)
     drain_pending(0)
 
-    def build_case(
+    def assemble(
         target: tuple[tuple[str, ...], str, list[Any], str, _Insertions]
-    ) -> GeneratedTestCase:
-        path, constraint, candidate, schema_pointer, created = target
+    ) -> Any:
+        """The negative body of one target: its created values, then its candidate."""
+        path, _, candidate, _, created = target
         if path:
             generated_value = deepcopy(positive.request_body.value)
             for created_path, created_value in created:
-                _assign_at(generated_value, created_path, deepcopy(created_value))
+                if created_path:
+                    _assign_at(generated_value, created_path, deepcopy(created_value))
+                else:
+                    # A created element of an empty root array replaces the body.
+                    generated_value = deepcopy(created_value)
             _assign_at(generated_value, path, candidate)
         else:
             # A root-level array replaces the whole body.
             generated_value = candidate
+        return generated_value
+
+    def build_case(
+        target: tuple[tuple[str, ...], str, list[Any], str, _Insertions]
+    ) -> GeneratedTestCase:
+        path, constraint, candidate, schema_pointer, _ = target
+        generated_value = assemble(target)
 
         # The empty JSON Pointer addresses the body root itself.
         property_pointer = _json_pointer(path) if path else ""
@@ -1754,8 +1795,9 @@ def _array_bound_negative_cases(
         scan_results[pointer] = scan(schema, pointer, 0, True)
         return scan_results[pointer]
 
-    def create_absent_parents() -> None:
-        index = 0
+    def create_absent_parents(start: int = 0) -> int:
+        """Create the parents queued from index start; returns the next unprocessed index."""
+        index = start
         while index < len(absent_parents):  # grows while parents are created
             schema, pointer, path, inherited, created, chain = absent_parents[index]
             index += 1
@@ -1785,10 +1827,12 @@ def _array_bound_negative_cases(
             mark = len(pending)
             visit(schema, value, path, pointer)
             drain_pending(mark)
+        return index
 
     budget = _BUDGET.get()
     counts = budget.case_counts() if budget is not None else None
     target_mark, diagnostic_mark = len(targets), len(diagnostics)
+    empty_mark = len(empty_arrays)
     try:
         create_absent_parents()
         cases.extend([build_case(target) for target in targets[target_mark:]])
@@ -1797,6 +1841,8 @@ def _array_bound_negative_cases(
             budget.restore_case_counts(counts)
         del targets[target_mark:]
         del diagnostics[diagnostic_mark:]
+        # Empty arrays registered inside the dropped parents must not reach phase 4.
+        del empty_arrays[empty_mark:]
         blocker[0], insertions[0], entered[0] = None, (), ()
         what = exhausted.unit or {
             _EXPANSION_BUDGET_CODE: "schema reference expansions",
@@ -1814,6 +1860,129 @@ def _array_bound_negative_cases(
             exhausted.reference_uri,
         )
 
+    # Phase 4: array bounds below the items of present empty arrays. One element is
+    # created in the negative body only, and discovery alternates between empty
+    # arrays and absent parents until no unprocessed entry is left. Entries stay in
+    # their lists and each is processed once through a growing index, so the loop
+    # ends: a value only gets deeper by creating a parent or element, and an entry
+    # whose schema pointer was already entered on its path is skipped. Like phase 3,
+    # the phase is isolated. Entries still queued from a rolled-back phase 3 are
+    # left behind by taking the start indexes here.
+    def process_empty(
+        entry: tuple[dict[str, Any], str, tuple[str, ...], _Insertions, tuple[str, ...]]
+    ) -> None:
+        schema, pointer, path, created, chain = entry
+        if pointer in chain or "items" not in schema:
+            return
+        items_pointer = _child(pointer, "items")
+        followed = _follow_property_schema(schema["items"], items_pointer, _skip_issue)
+        if (
+            followed is None
+            or not isinstance(followed[0], dict)
+            or not has_array_bounds(followed[0], followed[1])
+        ):
+            return
+        maximum = schema.get("maxItems")
+        if _bounded_int(maximum) and maximum < 1:
+            report(
+                "array_bound_no_safe_candidate",
+                (
+                    f"Array-bound cases below the items of the empty array "
+                    f"'{_json_pointer(path) if path else '/'}' were not generated: "
+                    "maxItems is 0, so an element cannot be added."
+                ),
+                _child(pointer, "maxItems"),
+            )
+            return
+        try:
+            element, _ = _select_value(
+                schema["items"], version, [], items_pointer, direction="request"
+            )
+        except _UnsupportedOperation as issue:
+            report_issue(issue)
+            return
+        if not isinstance(element, (dict, list)):
+            return
+        insertions[0] = (*created, (path, [element]))
+        entered[0] = (*chain, pointer)
+        mark = len(pending)
+        visit_element(schema, [element], path, pointer, None)
+        drain_pending(mark)
+
+    def run_worklist(absent_start: int) -> None:
+        empties_done, absents_done = 0, absent_start
+        while empties_done < len(empty_arrays) or absents_done < len(absent_parents):
+            while empties_done < len(empty_arrays):
+                process_empty(empty_arrays[empties_done])
+                empties_done += 1
+            absents_done = create_absent_parents(absents_done)
+
+    def literal_block(
+        target: tuple[tuple[str, ...], str, list[Any], str, _Insertions]
+    ) -> str | None:
+        """Keyword pointer of the first visited literal that rejects the final body."""
+        path = target[0]
+        final = assemble(target)
+        for length in range(len(path) + 1):
+            node = visited.get(path[:length])
+            if node is None:
+                continue
+            keyword = _literal_pointer(*node)
+            if keyword is not None and not _literal_accepts(
+                node[0], _value_at(final, path[:length])
+            ):
+                return keyword
+        return None
+
+    counts4 = budget.case_counts() if budget is not None else None
+    target_mark4, diagnostic_mark4 = len(targets), len(diagnostics)
+    final_body_mode[0] = True
+    try:
+        run_worklist(len(absent_parents))
+        accepted = []
+        seen_cases: set[tuple[tuple[str, ...], str, int]] = set()
+        for target in targets[target_mark4:]:
+            keyword = literal_block(target)
+            if keyword is not None:
+                report(
+                    "array_bound_no_safe_candidate",
+                    (
+                        f"The {target[1]} case for '{_json_pointer(target[0])}' was not "
+                        f"generated: the changed body would also violate the literal at "
+                        f"{keyword}."
+                    ),
+                    keyword,
+                )
+                continue
+            case_key = (target[0], target[1], len(target[2]))
+            if case_key not in seen_cases:
+                seen_cases.add(case_key)
+                accepted.append(target)
+        cases.extend([build_case(target) for target in accepted])
+    except _BudgetExhausted as exhausted:
+        if budget is not None and counts4 is not None:
+            budget.restore_case_counts(counts4)
+        del targets[target_mark4:]
+        del diagnostics[diagnostic_mark4:]
+        blocker[0], insertions[0], entered[0] = None, (), ()
+        what = exhausted.unit or {
+            _EXPANSION_BUDGET_CODE: "schema reference expansions",
+            _PATTERN_BUDGET_CODE: "pattern evaluations",
+        }.get(exhausted.code, "generated test cases")
+        report(
+            exhausted.code,
+            (
+                f"The per-{exhausted.scope} limit of {exhausted.limit} {what} was reached "
+                "while generating array-bound cases for elements of present empty arrays. "
+                "Those cases were skipped; the other array-bound cases of this endpoint "
+                "were kept."
+            ),
+            exhausted.pointer or _endpoint_pointer(endpoint),
+            exhausted.reference_uri,
+        )
+    finally:
+        final_body_mode[0] = False
+
     return tuple(cases), tuple(diagnostics)
 
 
@@ -1826,6 +1995,22 @@ def _assign_at(root: Any, path: tuple[str, ...], value: Any) -> None:
     for name in path[:-1]:
         parent = parent[int(name)] if isinstance(parent, list) else parent[name]
     parent[int(path[-1]) if isinstance(parent, list) else path[-1]] = value
+
+
+def _value_at(root: Any, path: tuple[str, ...]) -> Any:
+    """The value at a body path whose steps are keys or list indexes."""
+    value = root
+    for name in path:
+        value = value[int(name)] if isinstance(value, list) else value[name]
+    return value
+
+
+def _literal_accepts(schema: dict[str, Any], value: Any) -> bool:
+    """Whether the const and enum of a schema accept a value (JSON Schema equality)."""
+    if "const" in schema and not _equal(value, schema["const"]):
+        return False
+    members = schema.get("enum")
+    return not isinstance(members, list) or any(_equal(value, member) for member in members)
 
 
 def _is_object_with_properties(schema: dict[str, Any]) -> bool:

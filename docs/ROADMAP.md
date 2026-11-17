@@ -116,7 +116,7 @@ Implemented so far:
 
 Still planned:
 
-- Array bound cases for array elements other than index 0, and for absent optional parents constrained by `enum` (parent `const`/`enum` currently gives `array_bound_no_safe_candidate`).
+- Array bound cases for array elements other than index 0, for absent optional arrays below an inserted element, for more than one inserted element, and for absent optional parents constrained by `enum` (parent `const`/`enum` currently gives `array_bound_no_safe_candidate`).
 - Support for further schema keywords (formats beyond the closed set, patterns beyond the bounded subset) and compositions.
 - Request media types other than `application/json`.
 - OAuth2 scope validation against declared flows and resolved scheme metadata in generated cases.
