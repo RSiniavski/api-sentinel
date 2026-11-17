@@ -103,7 +103,7 @@ Implemented so far:
 - Internal test representation: strict, frozen output models (`GeneratedTestSuite`, `GeneratedTestCase`, `GenerationDiagnostic`).
 - Positive test generation: one baseline case per operation for the supported schema subset.
 - Negative test generation: required parameter, request body and property omission; wrong JSON type; enum/const violation.
-- Boundary test generation: string length bounds, numeric bounds (including properties reached through nested local `$ref`), array size bounds (`minItems`, `maxItems`) and `uniqueItems` duplicate cases for arrays present in the positive request body, including arrays inside element 0 of a present array (objects and nested arrays).
+- Boundary test generation: string length bounds, numeric bounds (including properties reached through nested local `$ref`), array size bounds (`minItems`, `maxItems`) and `uniqueItems` duplicate cases for request body arrays (Array Bounds Generation, implemented): arrays present in the positive body, optional arrays absent from it, arrays below absent optional parent objects (created in the negative body only), arrays inside element 0 of a present array (objects and nested arrays), and arrays below the one element created in a present empty array (array-bound phase 4).
 - Local reference resolution for parameters, request bodies and schemas, with diagnostics for unsupported, missing, invalid and cyclic references and the `$ref` sibling policy (annotations only).
 - Deterministic resource budgets for reference expansions, generated cases and diagnostics, with stable budget diagnostics.
 - Referenced responses: local `#/components/responses/` references, including alias chains, resolved into `ResponseExpectation`.
@@ -114,9 +114,19 @@ Implemented so far:
 - Request schema `additionalProperties` (boolean or schema object): enforced when validating example, default, enum and const candidates, which may keep undeclared properties that satisfy it; synthesized values contain declared properties only (no invented map keys). An unsupported or unresolvable `additionalProperties` schema rejects only the candidate being validated. No negative cases target additional properties, and `patternProperties`, `minProperties` and `maxProperties` remain unsupported.
 - String `pattern` (bounded subset): validates existing example, default, enum, const, fallback, boundary and array item candidates only (no synthesis, no pattern-violation cases); limits of 128 characters, 128 quantifier bounds, 128-code-point candidates, 2,000 / 20,000 evaluations and 500,000 / 4,000,000 weighted work units per endpoint / suite, with `generation_pattern_budget_exceeded`. Parser acceptance does not guarantee Generator support.
 
+Known limitations of Array Bounds Generation (the feature is implemented; these are documented limits, not missing core functionality):
+
+- Only element index 0 of an array is traversed for array-bound generation, so a target that exists only in a later element is not covered.
+- When an initially empty array is given elements for negative cases, exactly one element is inserted.
+- An absent optional parent object with `const` or `enum` is not created: no suitable enum member is selected, and `array_bound_no_safe_candidate` is reported at the literal keyword.
+- For an array with `uniqueItems: true`, `minItems`/`maxItems` violations that need more than one item are not generated (`array_bound_no_safe_candidate`), because the generator does not synthesize distinct valid item values.
+
+Known general limitation (not specific to Array Bounds):
+
+- Negative-case generators do not consistently validate the final generated body against `const`/`enum` on present object ancestors (and the root). The array-bound phases 1-3 and the other negative steps (required property, wrong type, string and numeric bounds, enum/const) can produce a case that violates both the target constraint and such an ancestor literal. Array-bound phase 3 checks only the literal of the parent it creates, and enclosing array or `items` literals. Array-bound phase 4 checks `const`/`enum` along the whole path against the final body, but this is not implemented across all negative-generation steps.
+
 Still planned:
 
-- Array bound cases for array elements other than index 0, for more than one inserted element, and for absent optional parents constrained by `enum` (parent `const`/`enum` currently gives `array_bound_no_safe_candidate`).
 - Support for further schema keywords (formats beyond the closed set, patterns beyond the bounded subset) and compositions.
 - Request media types other than `application/json`.
 - OAuth2 scope validation against declared flows and resolved scheme metadata in generated cases.
