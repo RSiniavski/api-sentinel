@@ -13322,3 +13322,169 @@ def test_phase_4_targets_with_aliases_nesting_and_recursion_never_share_a_case_k
         "/deep/0/p/list/0/q/list2/0/tags",
     }
     assert [item.code for item in suite.diagnostics if item.code.startswith("array_")] == []
+
+
+# --- Step 8.32: absent optional arrays below an element inserted by phase 4 --------
+# The behavior needs no extra traversal: the inserted element is visited like any
+# present object, so its absent optional arrays and object parents are targeted by the
+# same path as in phases 1-3. These tests pin it with exact bodies and case IDs.
+
+def inserted_rows(item: object, schemas: dict[str, object] | None = None) -> GeneratedTestSuite:
+    # "rows" is an empty positive array, so the element exists only in the cases.
+    suite = element_suite(empty_obj({"rows": empty_arr(item)}, ("rows",)), schemas)
+    assert suite.cases[0].request_body.value == {"rows": []}  # type: ignore[union-attr]
+    return suite
+
+
+def inserted_ids(*parts: str) -> list[str]:
+    return [build_case_id("negative", "/items", "post", f"array-bound:{part}") for part in parts]
+
+
+UNIQUE_TAGS: dict[str, object] = {"type": "array", "uniqueItems": True, "items": ITEM_SCHEMA}
+
+
+def test_absent_array_below_an_inserted_element_gets_min_max_and_unique_cases_with_stable_ids() -> None:
+    bounds = inserted_rows(empty_obj({"tags": ELEMENT_TAGS}))
+    unique = inserted_rows(empty_obj({"tags": UNIQUE_TAGS}))
+
+    assert [case.case_id for case in array_cases(bounds)] == inserted_ids(
+        "/rows/0/tags:minItems:1", "/rows/0/tags:maxItems:4"
+    )
+    assert array_values(unique) == [("/rows/0/tags", "uniqueItems", {"rows": [{"tags": ["x", "x"]}]})]
+    assert [case.case_id for case in array_cases(unique)] == inserted_ids("/rows/0/tags:uniqueItems:2")
+    assert array_diagnostics(bounds) == [] and array_diagnostics(unique) == []
+
+
+def test_two_levels_of_absent_object_parents_below_an_inserted_element() -> None:
+    inner = empty_obj({"tags": ELEMENT_TAGS})
+    suite = inserted_rows(empty_obj({"m1": empty_obj({"m2": inner})}))
+
+    assert array_values(suite) == [
+        ("/rows/0/m1/m2/tags", "minItems", {"rows": [{"m1": {"m2": {"tags": ["x"]}}}]}),
+        ("/rows/0/m1/m2/tags", "maxItems", {"rows": [{"m1": {"m2": {"tags": ["x"] * 4}}}]}),
+    ]
+    assert [case.case_id for case in array_cases(suite)] == inserted_ids(
+        "/rows/0/m1/m2/tags:minItems:1", "/rows/0/m1/m2/tags:maxItems:4"
+    )
+    assert array_diagnostics(suite) == []
+
+
+def test_references_on_the_item_parent_and_array_are_followed_below_an_inserted_element() -> None:
+    schemas: dict[str, object] = {
+        "Item": empty_obj({"meta": schema_reference("Meta"), "direct": schema_reference("Tags")}),
+        "Meta": empty_obj({"tags": schema_reference("Tags")}),
+        "Tags": ELEMENT_TAGS,
+    }
+    suite = inserted_rows(schema_reference("Item"), schemas)
+
+    # Properties are visited in sorted order: "direct" before "meta".
+    assert [value[:2] for value in array_values(suite)] == [
+        ("/rows/0/direct", "minItems"),
+        ("/rows/0/direct", "maxItems"),
+        ("/rows/0/meta/tags", "minItems"),
+        ("/rows/0/meta/tags", "maxItems"),
+    ]
+    assert array_values(suite)[0][2] == {"rows": [{"direct": ["x"]}]}
+    assert array_values(suite)[3][2] == {"rows": [{"meta": {"tags": ["x"] * 4}}]}
+    # The provenance names the array's own schema, reached through two references.
+    assert "/components/schemas/Tags/minItems" in array_cases(suite)[2].provenance
+    assert array_diagnostics(suite) == []
+
+
+def test_read_only_arrays_and_parents_are_skipped_and_write_only_arrays_are_kept_below_an_inserted_element() -> None:
+    item = empty_obj(
+        {
+            "ro": {**ELEMENT_TAGS, "readOnly": True},
+            "ro_parent": {**empty_obj({"tags": ELEMENT_TAGS}), "readOnly": True},
+            "wo": {**ELEMENT_TAGS, "writeOnly": True},
+        }
+    )
+
+    suite = inserted_rows(item)
+
+    assert array_values(suite) == [
+        ("/rows/0/wo", "minItems", {"rows": [{"wo": ["x"]}]}),
+        ("/rows/0/wo", "maxItems", {"rows": [{"wo": ["x"] * 4}]}),
+    ]
+    assert array_diagnostics(suite) == []
+
+
+@pytest.mark.parametrize("keyword", ["const", "enum"])
+def test_literal_on_an_absent_parent_below_an_inserted_element_blocks_only_that_parent(keyword: str) -> None:
+    literal = {"const": {}} if keyword == "const" else {"enum": [{}]}
+    item = empty_obj({"meta": {**empty_obj({"tags": ELEMENT_TAGS}), **literal}, "tags": ELEMENT_TAGS})
+
+    suite = inserted_rows(item)
+
+    # Creating "meta" would leave its literal; the sibling array is unaffected.
+    assert [value[:2] for value in array_values(suite)] == [("/rows/0/tags", "minItems"), ("/rows/0/tags", "maxItems")]
+    assert array_diagnostics(suite) == [
+        ("array_bound_no_safe_candidate", f"{ELEMENT_ITEM_POINTER}/properties/meta/{keyword}")
+    ]
+    assert "'/rows/0/meta'" in next(item.message for item in suite.diagnostics if item.code.startswith("array_"))
+
+
+@pytest.mark.parametrize(
+    ("sibling", "keyword"),
+    [(False, "must"), ({"allOf": [{"type": "string"}]}, "must/allOf")],
+)
+def test_unsupported_required_sibling_below_an_inserted_element_is_reported_once_per_group(
+    sibling: object, keyword: str
+) -> None:
+    element = inserted_rows(empty_obj({"must": sibling, "tags": ELEMENT_TAGS}, ("must",)))
+    parent = inserted_rows(
+        empty_obj({"meta": empty_obj({"must": sibling, "tags": ELEMENT_TAGS}, ("must",))})
+    )
+
+    assert array_values(element) == [] and array_values(parent) == []
+    assert array_diagnostics(element) == [
+        ("array_bound_unsupported_schema", f"{ELEMENT_ITEM_POINTER}/properties/{keyword}")
+    ]
+    assert array_diagnostics(parent) == [
+        ("array_bound_unsupported_schema", f"{ELEMENT_ITEM_POINTER}/properties/meta/properties/{keyword}")
+    ]
+
+
+def test_recursion_through_an_optional_parent_below_an_inserted_element_stops_at_the_repeat() -> None:
+    node = empty_obj({"tags": ELEMENT_TAGS, "child": schema_reference("Node")})
+
+    suite = inserted_rows(schema_reference("Node"), {"Node": node})
+
+    assert [value[:2] for value in array_values(suite)] == [
+        ("/rows/0/tags", "minItems"),
+        ("/rows/0/tags", "maxItems"),
+        ("/rows/0/child/tags", "minItems"),
+        ("/rows/0/child/tags", "maxItems"),
+    ]
+    assert array_values(suite)[3][2] == {"rows": [{"child": {"tags": ["x"] * 4}}]}  # no "child/child"
+    assert array_diagnostics(suite) == []
+
+
+def test_absent_arrays_below_an_inserted_element_are_deterministic_and_leave_the_input_untouched() -> None:
+    item = empty_obj(
+        {
+            "meta": empty_obj({"tags": ELEMENT_TAGS}),
+            "unique": UNIQUE_TAGS,
+            "wo": {**ELEMENT_TAGS, "writeOnly": True},
+        }
+    )
+    body = empty_obj({"rows": empty_arr(item)}, ("rows",))
+    before = deepcopy(body)
+
+    first = element_suite(body)
+    second = element_suite(body)
+
+    assert body == before  # the inserted element is built on copies
+    assert first == second and first.model_dump_json() == second.model_dump_json()
+    # Direct absent arrays come first, in sorted order; the absent parent's arrays follow.
+    ids = [case.case_id for case in array_cases(first)]
+    assert ids == inserted_ids(
+        "/rows/0/unique:uniqueItems:2",
+        "/rows/0/wo:minItems:1",
+        "/rows/0/wo:maxItems:4",
+        "/rows/0/meta/tags:minItems:1",
+        "/rows/0/meta/tags:maxItems:4",
+    )
+    assert array_values(first)[0][2] == {"rows": [{"unique": ["x", "x"]}]}  # no other property leaks in
+    assert array_values(first)[3][2] == {"rows": [{"meta": {"tags": ["x"]}}]}
+    assert first.cases[0].request_body.value == {"rows": []}  # type: ignore[union-attr]
