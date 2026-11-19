@@ -344,7 +344,13 @@ def _negative_steps(
         case = _required_request_body_negative_case(endpoint, positive, api)
         return ((case,) if case is not None else ()), ()
 
+    def optional_request_body_omitted() -> tuple[tuple[GeneratedTestCase, ...], tuple[()]]:
+        case = _optional_request_body_omitted_case(endpoint, positive, api)
+        return ((case,) if case is not None else ()), ()
+
     return (
+        # A positive case: it directly follows the baseline, before every negative case.
+        ("optional_request_body_omitted", optional_request_body_omitted),
         ("required_property", lambda: _required_property_negative_cases(endpoint, positive, api)),
         ("numeric_boundary", lambda: _numeric_boundary_negative_cases(endpoint, positive, api)),
         ("wrong_type", lambda: _wrong_type_negative_cases(endpoint, positive, api)),
@@ -563,6 +569,43 @@ def _required_parameter_negative_cases(
             )
         )
     return tuple(cases)
+
+
+def _request_body_is_required(endpoint: Endpoint, api: ApiModel) -> bool:
+    """Whether the endpoint's request body resolves to a body with `required: true`.
+
+    A body that cannot be resolved is not known to be required.
+    """
+    resolved = _resolved_request_body(endpoint, api)
+    return resolved is not None and resolved[0].required
+
+
+def _optional_request_body_omitted_case(
+    endpoint: Endpoint, positive: GeneratedTestCase, api: ApiModel
+) -> GeneratedTestCase | None:
+    """The positive case without the body, when the baseline carries an optional body."""
+    if positive.request_body is None or endpoint.request_body is None:
+        return None
+    if _request_body_is_required(endpoint, api):
+        return None
+
+    body_pointer = _child(_endpoint_pointer(endpoint), "requestBody")
+    # The baseline already resolved the body successfully.
+    _, declaration, followed = _resolve_request_body(endpoint.request_body, api, body_pointer)
+    return _counted_case(
+        case_id=build_case_id("positive", endpoint.path, endpoint.method, "request-body-omitted"),
+        category="positive",
+        path=positive.path,
+        method=positive.method,
+        parameters=tuple(deepcopy(value) for value in positive.parameters),
+        request_body=None,
+        security=deepcopy(positive.security),
+        response_expectations=deepcopy(positive.response_expectations),
+        provenance=(
+            positive.provenance[0],
+            *dict.fromkeys((body_pointer, *followed, declaration)),
+        ),
+    )
 
 
 def _required_request_body_negative_case(
@@ -3161,7 +3204,18 @@ def _generate_endpoint(
             path_names.add(entry.name)
 
     _check_path_placeholders(endpoint.path, path_names, _child(root, "parameters"))
-    body, body_provenance = _generate_body(endpoint, api, root)
+    body: GeneratedBody | None = None
+    body_provenance: tuple[str, ...] = ()
+    try:
+        body, body_provenance = _generate_body(endpoint, api, root)
+    except _UnsupportedOperation as issue:
+        # An optional (or not known to be required) body that this stage cannot
+        # generate is reported, and the baseline simply has no body. Only this
+        # exception is caught: an exhausted budget still propagates, and charges
+        # already made are not refunded.
+        if _request_body_is_required(endpoint, api):
+            raise
+        parameter_diagnostics.append(_unsupported_diagnostic(issue, endpoint))
     expectations = _response_expectations(endpoint, root, api)
     security = endpoint.security if endpoint.security is not None else api.security
     _check_security_schemes(endpoint, api, root)

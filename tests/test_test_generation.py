@@ -752,22 +752,28 @@ def test_required_request_body_generates_one_deterministic_omission_case() -> No
     assert result.model_dump_json() == original
 
 
-@pytest.mark.parametrize("request_body", [
-    None,
-    RequestBody(
-        required=False,
-        content={"application/json": MediaType(schema=Schema(raw={"type": "string"}))},
-    ),
-])
+@pytest.mark.parametrize(
+    ("request_body", "expected_categories"),
+    [
+        (None, ["positive"]),
+        (
+            RequestBody(
+                required=False,
+                content={"application/json": MediaType(schema=Schema(raw={"type": "string"}))},
+            ),
+            ["positive", "positive"],
+        ),
+    ],
+)
 def test_optional_or_absent_request_body_has_no_omission_case(
-    request_body: RequestBody | None,
+    request_body: RequestBody | None, expected_categories: list[str]
 ) -> None:
     endpoint = make_endpoint("/optional-body", "post", request_body=request_body)
 
     suite = generate_test_suite(make_result(endpoint))
 
-    assert len(suite.cases) == 1
-    assert suite.cases[0].category == "positive"
+    # An optional body only adds a positive case without the body, never a negative one.
+    assert [case.category for case in suite.cases] == expected_categories
     assert all(case.violated_constraint != "required_request_body" for case in suite.cases)
 
 
@@ -1657,15 +1663,6 @@ def test_example_selection_obeys_schema_constraints_and_context_precedence() -> 
             ),
             "unsupported_parameter_reference",
             "#/components/parameters/Id",
-        ),
-        (
-            make_endpoint(
-                "/ref-body",
-                "post",
-                request_body=LocalReference(uri="#/components/requestBodies/Input"),
-            ),
-            "unsupported_request_body_reference",
-            "#/components/requestBodies/Input",
         ),
         (
             make_endpoint(
@@ -3408,7 +3405,8 @@ def test_request_body_reference_cycle_emits_diagnostic_without_case() -> None:
 
     suite = generate_test_suite(result)
 
-    assert suite.cases == ()
+    # A body that is not known to be required does not skip the endpoint (Step 8.39.1).
+    assert [(case.category, case.request_body) for case in suite.cases] == [("positive", None)]
     assert len(suite.diagnostics) == 1
     assert suite.diagnostics[0].code == "unsupported_request_body_reference"
     assert suite.diagnostics[0].reference_uri == "#/components/requestBodies/A"
@@ -3429,7 +3427,7 @@ def test_unsupported_request_body_reference_forms_emit_diagnostic(uri: str) -> N
 
     suite = generate_test_suite(make_result(endpoint))
 
-    assert suite.cases == ()
+    assert [(case.category, case.request_body) for case in suite.cases] == [("positive", None)]
     assert len(suite.diagnostics) == 1
     assert suite.diagnostics[0].code == "unsupported_request_body_reference"
     assert suite.diagnostics[0].reference_uri == uri
@@ -14327,3 +14325,346 @@ def test_ancestor_literal_validation_leaves_the_expansion_budget_unchanged(
 
     assert budget_codes(15) == set()
     assert budget_codes(14) == {"generation_expansion_budget_exceeded"}
+
+
+# --- Optional request bodies (positive case without the body) ----------------------------
+
+OPTIONAL_BODY_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "required": ["a"],
+    "properties": {"a": {"type": "string", "example": "x"}},
+}
+UNSUPPORTED_BODY_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "required": ["a"],
+    "properties": {"a": {"type": "string", "format": "hostname"}},
+}
+OMITTED_VARIANT = "request-body-omitted"
+
+
+def body_of(schema: object, *, required: bool, media_type: str = "application/json") -> RequestBody:
+    return RequestBody(
+        required=required, content={media_type: MediaType(schema=Schema(raw=schema))}  # type: ignore[arg-type]
+    )
+
+
+def body_endpoint(request_body: RequestBody | LocalReference | None, path: str = "/x") -> Endpoint:
+    return Endpoint(
+        path=path,
+        method="post",
+        parameters=(
+            Parameter(
+                name="trace",
+                location="query",
+                required=True,
+                schema=Schema(raw={"type": "string", "example": "t-1"}),
+                source_scope="operation",
+            ),
+        ),
+        request_body=request_body,
+        security=(SecurityRequirement(schemes={"apiKey": ()}),),
+        responses={"400": Response(description="Invalid request")},
+    )
+
+
+def body_suite(
+    request_body: RequestBody | LocalReference | None,
+    request_bodies: dict[str, RequestBody | LocalReference] | None = None,
+) -> GeneratedTestSuite:
+    endpoint = body_endpoint(request_body)
+    return generate_test_suite(
+        make_result(
+            endpoint,
+            components=Components(
+                request_bodies=request_bodies or {},
+                security_schemes=declared_security_schemes("apiKey").security_schemes,
+            ),
+        )
+    )
+
+
+def test_supported_optional_body_adds_a_positive_case_without_the_body_after_the_baseline() -> None:
+    suite = body_suite(body_of(OPTIONAL_BODY_SCHEMA, required=False))
+
+    baseline, omitted, *negatives = suite.cases
+    assert [case.category for case in (baseline, omitted)] == ["positive", "positive"]
+    assert baseline.case_id == build_case_id("positive", "/x", "post", "baseline")
+    assert baseline.request_body == GeneratedBody(media_type="application/json", value={"a": "x"})
+    assert omitted.case_id == build_case_id("positive", "/x", "post", OMITTED_VARIANT)
+    assert omitted.case_id != baseline.case_id
+    assert omitted.request_body is None
+    for field in ("path", "method", "parameters", "security", "response_expectations"):
+        assert getattr(omitted, field) == getattr(baseline, field), field
+    assert [item.name for item in omitted.parameters] == ["trace"]
+    assert omitted.provenance == ("/paths/~1x/post", "/paths/~1x/post/requestBody")
+    assert omitted.provenance[0] == baseline.provenance[0]
+    assert omitted.expected_outcome == baseline.expected_outcome
+    assert omitted.violated_constraint is None and omitted.affected_property is None
+    # Negative cases follow the two positive cases, and none of them is a body omission.
+    assert negatives and all(case.category == "negative" for case in negatives)
+    assert "required_request_body" not in {case.violated_constraint for case in negatives}
+    assert {"required_parameter", "required_property"} <= {
+        case.violated_constraint for case in negatives
+    }
+    assert len({case.case_id for case in suite.cases}) == len(suite.cases)
+
+
+def test_optional_body_omitted_case_does_not_change_the_other_cases() -> None:
+    optional = body_suite(body_of(OPTIONAL_BODY_SCHEMA, required=False))
+    required = body_suite(body_of(OPTIONAL_BODY_SCHEMA, required=True))
+
+    without_variant = [case for case in optional.cases if case.case_id != build_case_id(
+        "positive", "/x", "post", OMITTED_VARIANT
+    )]
+    required_negatives = [
+        case for case in required.cases if case.violated_constraint != "required_request_body"
+    ]
+    assert [case.case_id for case in without_variant] == [case.case_id for case in required_negatives]
+
+
+def test_required_body_keeps_its_baseline_and_negative_omission_without_a_positive_variant() -> None:
+    suite = body_suite(body_of(OPTIONAL_BODY_SCHEMA, required=True))
+
+    positives = [case for case in suite.cases if case.category == "positive"]
+    omissions = [case for case in suite.cases if case.violated_constraint == "required_request_body"]
+    assert [case.case_id for case in positives] == [
+        build_case_id("positive", "/x", "post", "baseline")
+    ]
+    assert [case.case_id for case in omissions] == [
+        build_case_id("negative", "/x", "post", "required-request-body")
+    ]
+    assert omissions[0].request_body is None
+    assert build_case_id("positive", "/x", "post", OMITTED_VARIANT) not in {
+        case.case_id for case in suite.cases
+    }
+
+
+@pytest.mark.parametrize("required", [False, True])
+def test_unsupported_body_outcome_depends_on_whether_the_body_is_required(required: bool) -> None:
+    suite = body_suite(body_of(UNSUPPORTED_BODY_SCHEMA, required=required))
+
+    expected = (
+        "/paths/~1x/post/requestBody/content/application~1json/schema/properties/a/format"
+    )
+    assert [(d.code, d.source_pointer, d.reference_uri) for d in suite.diagnostics] == [
+        ("unsupported_schema_keyword", expected, None)
+    ]
+    assert suite.diagnostics[0].message == "Schema keyword 'format' is outside the supported subset."
+    if required:
+        assert suite.cases == ()
+        return
+    # Optional: the endpoint stays, with the baseline without a body and other negatives.
+    assert [case.case_id for case in suite.cases[:1]] == [
+        build_case_id("positive", "/x", "post", "baseline")
+    ]
+    assert suite.cases[0].request_body is None
+    assert [case.violated_constraint for case in suite.cases[1:]] == ["required_parameter"]
+    assert build_case_id("positive", "/x", "post", OMITTED_VARIANT) not in {
+        case.case_id for case in suite.cases
+    }
+
+
+@pytest.mark.parametrize(
+    ("request_body", "code", "pointer", "reference_uri"),
+    [
+        (
+            RequestBody(
+                required=False,
+                content={
+                    "application/json": MediaType(
+                        schema=Schema(raw=OPTIONAL_BODY_SCHEMA), encoding={"a": {}}
+                    )
+                },
+            ),
+            "unsupported_request_encoding",
+            "/paths/~1x/post/requestBody/content/application~1json/encoding",
+            None,
+        ),
+        (
+            body_of(OPTIONAL_BODY_SCHEMA, required=False, media_type="multipart/form-data"),
+            "unsupported_request_media_type",
+            "/paths/~1x/post/requestBody/content",
+            None,
+        ),
+        (
+            request_body_reference("Missing"),
+            "unsupported_request_body_reference",
+            "/paths/~1x/post/requestBody",
+            "#/components/requestBodies/Missing",
+        ),
+        (
+            request_body_reference("Loop"),
+            "unsupported_request_body_reference",
+            "/paths/~1x/post/requestBody",
+            "#/components/requestBodies/Loop",
+        ),
+    ],
+    ids=["encoding", "media-type", "unresolved-reference", "cyclic-reference"],
+)
+def test_unsupported_optional_bodies_keep_the_endpoint_and_the_original_diagnostic(
+    request_body: RequestBody | LocalReference,
+    code: str,
+    pointer: str,
+    reference_uri: str | None,
+) -> None:
+    suite = body_suite(request_body, {"Loop": request_body_reference("Loop")})
+
+    assert [(d.code, d.source_pointer, d.reference_uri) for d in suite.diagnostics] == [
+        (code, pointer, reference_uri)
+    ]
+    assert [(case.category, case.request_body) for case in suite.cases[:1]] == [("positive", None)]
+    assert suite.cases[0].case_id == build_case_id("positive", "/x", "post", "baseline")
+    assert [case.violated_constraint for case in suite.cases[1:]] == ["required_parameter"]
+
+
+def test_a_required_body_that_cannot_be_generated_still_skips_the_endpoint() -> None:
+    for request_body in (
+        body_of(OPTIONAL_BODY_SCHEMA, required=True, media_type="multipart/form-data"),
+        request_body_reference("Required"),
+    ):
+        suite = body_suite(
+            request_body,
+            {"Required": body_of(UNSUPPORTED_BODY_SCHEMA, required=True)},
+        )
+        assert suite.cases == ()
+        assert len(suite.diagnostics) == 1
+
+
+def test_no_body_declaration_generates_exactly_one_positive_baseline() -> None:
+    suite = body_suite(None)
+
+    assert [case.case_id for case in suite.cases[:1]] == [
+        build_case_id("positive", "/x", "post", "baseline")
+    ]
+    assert [case.category for case in suite.cases] == ["positive", "negative"]
+    assert suite.cases[0].request_body is None
+    assert suite.diagnostics == ()
+    assert build_case_id("positive", "/x", "post", OMITTED_VARIANT) not in {
+        case.case_id for case in suite.cases
+    }
+
+
+def test_requiredness_comes_from_the_resolved_target_of_an_alias_chain() -> None:
+    components = {
+        "Alias": request_body_reference("Mid"),
+        "Mid": request_body_reference("Optional"),
+        "Optional": body_of(OPTIONAL_BODY_SCHEMA, required=False),
+        "Needed": body_of(OPTIONAL_BODY_SCHEMA, required=True),
+        "NeededAlias": request_body_reference("Needed"),
+    }
+
+    optional = body_suite(request_body_reference("Alias"), components)
+    required = body_suite(request_body_reference("NeededAlias"), components)
+
+    omitted = optional.cases[1]
+    assert omitted.case_id == build_case_id("positive", "/x", "post", OMITTED_VARIANT)
+    assert omitted.request_body is None
+    assert omitted.provenance == (
+        "/paths/~1x/post",
+        "/paths/~1x/post/requestBody",
+        "#/components/requestBodies/Alias",
+        "#/components/requestBodies/Mid",
+        "#/components/requestBodies/Optional",
+        "/components/requestBodies/Optional",
+    )
+    assert "required_request_body" not in {case.violated_constraint for case in optional.cases}
+    assert [case.category for case in required.cases if case.category == "positive"] == ["positive"]
+    assert "required_request_body" in {case.violated_constraint for case in required.cases}
+
+
+def test_optional_body_generation_is_deterministic_and_does_not_mutate_the_input() -> None:
+    endpoint = body_endpoint(body_of(OPTIONAL_BODY_SCHEMA, required=False))
+    result = make_result(endpoint, components=declared_security_schemes("apiKey"))
+    before = result.model_dump_json()
+
+    first = generate_test_suite(result)
+    second = generate_test_suite(result)
+
+    assert result.model_dump_json() == before
+    assert first.model_dump_json() == second.model_dump_json()
+    assert [case.case_id for case in first.cases] == [case.case_id for case in second.cases]
+
+
+def test_the_omitted_case_respects_the_endpoint_case_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = body_of(OPTIONAL_BODY_SCHEMA, required=False)
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_CASES", 1)
+
+    only_baseline = body_suite(body)
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_CASES", 2)
+    with_variant = body_suite(body)
+
+    assert [case.case_id for case in only_baseline.cases] == [
+        build_case_id("positive", "/x", "post", "baseline")
+    ]
+    assert [item.code for item in only_baseline.diagnostics] == ["generation_case_budget_exceeded"]
+    assert "'optional_request_body_omitted' step" in only_baseline.diagnostics[0].message
+    assert [case.request_body is None for case in with_variant.cases] == [False, True]
+    assert [item.code for item in with_variant.diagnostics] == ["generation_case_budget_exceeded"]
+    assert "'required_property' step" in with_variant.diagnostics[0].message
+
+
+def test_the_omitted_case_respects_the_suite_case_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(generator_module, "_MAX_SUITE_CASES", 2)
+    body = body_of(OPTIONAL_BODY_SCHEMA, required=False)
+
+    suite = generate_test_suite(
+        make_result(
+            body_endpoint(body, "/one"),
+            body_endpoint(body, "/two"),
+            components=declared_security_schemes("apiKey"),
+        )
+    )
+
+    assert [case.path for case in suite.cases] == ["/one", "/one"]
+    assert [item.code for item in suite.diagnostics] == ["generation_case_budget_exceeded"]
+    assert "per-suite limit of 2" in suite.diagnostics[0].message
+
+
+def test_an_exhausted_expansion_budget_is_not_turned_into_an_optional_body_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_EXPANSIONS", 0)
+    body = body_of({"$ref": "#/components/schemas/Body"}, required=False)
+    result = make_result(
+        body_endpoint(body),
+        components=Components(
+            schemas={"Body": Schema(raw=OPTIONAL_BODY_SCHEMA)},
+            security_schemes=declared_security_schemes("apiKey").security_schemes,
+        ),
+    )
+
+    suite = generate_test_suite(result)
+
+    assert suite.cases == ()
+    assert [item.code for item in suite.diagnostics] == ["generation_expansion_budget_exceeded"]
+
+
+def test_an_exhausted_pattern_budget_is_not_turned_into_an_optional_body_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_PATTERN_EVALUATIONS", 0)
+    schema = {
+        "type": "object",
+        "required": ["a"],
+        "properties": {"a": {"type": "string", "pattern": "^ok$", "example": "ok"}},
+    }
+
+    suite = body_suite(body_of(schema, required=False))
+
+    assert suite.cases == ()
+    assert [item.code for item in suite.diagnostics] == ["generation_pattern_budget_exceeded"]
+
+
+def test_optional_body_diagnostics_use_the_existing_diagnostic_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_DIAGNOSTICS", 0)
+
+    suite = body_suite(body_of(UNSUPPORTED_BODY_SCHEMA, required=False))
+
+    assert [item.code for item in suite.diagnostics] == ["generation_diagnostic_budget_exceeded"]
+    assert suite.cases and suite.cases[0].request_body is None

@@ -127,6 +127,10 @@ Ancestor literal validation (Step 8.37):
 - Array Bounds phases 1-4 check the same lineage, and (as phase 4 always did) also include the target array's own node. A literal on an array schema (also a root array) or on an `items` schema keeps `array_bound_no_safe_candidate`; object roots and object ancestors use `negative_case_ancestor_literal_conflict`. For phases 1-3 the target array's own literal is already honored when the candidate is chosen, so such a literal yields `array_bound_no_safe_candidate` at the bound keyword and the lineage check on the target node is a consistency guard.
 - Only literals on the schemas visited by the existing traversal are checked.
 
+Optional request bodies (Step 8.39.1):
+
+- An optional request body gets an additional positive case without the body (variant `request-body-omitted`) directly after the baseline; the baseline ID and payload are unchanged. An unsupported optional body no longer skips the endpoint: the baseline has no body and keeps the original diagnostic. Required bodies and endpoints without a body are unchanged, and budget exhaustion is never swallowed.
+
 Still planned:
 
 - Support for further schema keywords (formats beyond the closed set, patterns beyond the bounded subset) and compositions.
