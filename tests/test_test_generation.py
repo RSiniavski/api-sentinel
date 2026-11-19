@@ -6698,6 +6698,313 @@ def test_security_scheme_data_is_not_copied_into_cases_or_diagnostics() -> None:
     assert "security_schemes" not in GeneratedTestCase.model_fields
 
 
+# --- OAuth2 scope validation ----------------------------------------------------------
+
+OAUTH_FLOWS = {
+    "implicit": {"authorizationUrl": "https://auth.example.test/a", "scopes": {"imp": "i", "both": "b"}},
+    "authorizationCode": {
+        "authorizationUrl": "https://auth.example.test/a",
+        "tokenUrl": "https://auth.example.test/t",
+        "scopes": {"read": "r", "both": "b"},
+    },
+}
+OAUTH2 = SecurityScheme(type="oauth2", flows=OAUTH_FLOWS)
+
+
+def scoped(**schemes: tuple[str, ...]) -> SecurityRequirement:
+    return SecurityRequirement(schemes=schemes)
+
+
+def scope_result(
+    scheme: SecurityScheme | LocalReference = OAUTH2,
+    *,
+    api: tuple[SecurityRequirement, ...] | None = None,
+    operation: tuple[SecurityRequirement, ...] | None = None,
+    extra: dict[str, SecurityScheme | LocalReference] | None = None,
+) -> NormalizationResult:
+    return security_result(
+        {"oauth": scheme, **(extra or {})}, security_endpoint(security=operation), api_security=api
+    )
+
+
+def test_declared_oauth2_scopes_are_accepted_from_any_flow_and_empty_lists_too() -> None:
+    for scopes in ((), ("read",), ("imp",), ("read", "imp", "both")):
+        suite = generate_test_suite(scope_result(api=(scoped(oauth=scopes),)))
+        assert [case.security for case in suite.cases] == [(scoped(oauth=scopes),)], scopes
+        assert suite.diagnostics == ()
+
+
+def test_undeclared_oauth2_scope_skips_the_endpoint_with_an_exact_diagnostic() -> None:
+    suite = generate_test_suite(scope_result(api=(scoped(oauth=("read", "write")),)))
+
+    assert suite.cases == ()
+    assert suite.diagnostics == (
+        GenerationDiagnostic(
+            code="unsupported_security_scope",
+            message="Scope 'write' is not declared by any flow of OAuth2 security scheme 'oauth'.",
+            endpoint_path="/items",
+            endpoint_method="get",
+            source_pointer="/security/0/oauth/1",
+            reference_uri=None,
+        ),
+    )
+
+
+def test_scope_matching_is_exact_and_case_sensitive() -> None:
+    suite = generate_test_suite(scope_result(api=(scoped(oauth=("READ", "read ", "")),)))
+
+    assert security_diagnostics(suite) == [
+        ("unsupported_security_scope", "/items", f"/security/0/oauth/{index}", None)
+        for index in range(3)
+    ]
+
+
+def test_every_invalid_scope_is_reported_in_requirement_scheme_and_scope_order() -> None:
+    suite = generate_test_suite(
+        scope_result(
+            api=(scoped(oauth=("x", "read", "y")), scoped(other=("z",), oauth=("w",))),
+            extra={"other": OAUTH2},
+        )
+    )
+
+    assert suite.cases == ()
+    assert [item[2] for item in security_diagnostics(suite)] == [
+        "/security/0/oauth/0",
+        "/security/0/oauth/2",
+        "/security/1/oauth/0",
+        "/security/1/other/0",
+    ]
+
+
+def test_duplicate_invalid_scope_items_are_reported_once_per_location() -> None:
+    suite = generate_test_suite(scope_result(api=(scoped(oauth=("bad", "bad")),)))
+
+    assert [item[2] for item in security_diagnostics(suite)] == [
+        "/security/0/oauth/0",
+        "/security/0/oauth/1",
+    ]
+
+
+def test_oauth2_scopes_are_validated_through_a_local_alias_chain() -> None:
+    result = security_result(
+        {"oauth": security_ref("mid"), "mid": security_ref("real"), "real": OAUTH2},
+        api_security=(scoped(oauth=("read",)),),
+    )
+    broken = security_result(
+        {"oauth": security_ref("mid"), "mid": security_ref("real"), "real": OAUTH2},
+        api_security=(scoped(oauth=("nope",)),),
+    )
+
+    assert len(generate_test_suite(result).cases) == 1
+    assert count_expansions(result) == 2
+    suite = generate_test_suite(broken)
+    assert suite.cases == ()
+    assert security_diagnostics(suite) == [
+        ("unsupported_security_scope", "/items", "/security/0/oauth/0", None)
+    ]
+    assert count_expansions(broken) == 2
+
+
+def test_root_and_operation_requirements_use_the_same_validation_and_pointers() -> None:
+    root = generate_test_suite(scope_result(api=(scoped(oauth=("bad",)),)))
+    operation = generate_test_suite(scope_result(operation=(scoped(oauth=("bad",)),)))
+
+    assert security_diagnostics(root) == [
+        ("unsupported_security_scope", "/items", "/security/0/oauth/0", None)
+    ]
+    assert security_diagnostics(operation) == [
+        ("unsupported_security_scope", "/items", "/paths/~1items/get/security/0/oauth/0", None)
+    ]
+    assert root.diagnostics[0].message == operation.diagnostics[0].message
+
+
+def test_operation_security_overrides_and_root_security_is_inherited_for_scopes() -> None:
+    overridden = generate_test_suite(
+        scope_result(api=(scoped(oauth=("bad",)),), operation=(scoped(oauth=("read",)),))
+    )
+    broken_override = generate_test_suite(
+        scope_result(api=(scoped(oauth=("read",)),), operation=(scoped(oauth=("bad",)),))
+    )
+    inherited = generate_test_suite(scope_result(api=(scoped(oauth=("read",)),)))
+
+    assert len(overridden.cases) == 1 and overridden.diagnostics == ()
+    assert broken_override.cases == ()
+    assert [item[2] for item in security_diagnostics(broken_override)] == [
+        "/paths/~1items/get/security/0/oauth/0"
+    ]
+    assert len(inherited.cases) == 1
+
+
+@pytest.mark.parametrize(
+    "case", ["empty-operation", "omitted", "anonymous-root", "anonymous-operation"]
+)
+def test_security_without_requirements_is_unchanged_for_oauth2_schemes(case: str) -> None:
+    broken = SecurityScheme(type="oauth2", flows=None)
+    arguments = {
+        "empty-operation": {"api": (scoped(oauth=("bad",)),), "operation": ()},
+        "omitted": {},
+        "anonymous-root": {"api": (SecurityRequirement(schemes={}),)},
+        "anonymous-operation": {"operation": (SecurityRequirement(schemes={}),)},
+    }[case]
+
+    suite = generate_test_suite(scope_result(broken, **arguments))  # type: ignore[arg-type]
+
+    assert len(suite.cases) == 1 and suite.diagnostics == ()
+
+
+def test_an_invalid_scope_in_one_alternative_fails_the_whole_endpoint_only() -> None:
+    result = security_result(
+        {"oauth": OAUTH2, "key": SECURITY_API_KEY},
+        security_endpoint("/items", (requirement("key"), scoped(oauth=("bad",)))),
+        security_endpoint("/other", (scoped(oauth=("read",)),)),
+    )
+
+    suite = generate_test_suite(result)
+
+    assert [case.path for case in suite.cases] == ["/other"]
+    assert security_diagnostics(suite) == [
+        ("unsupported_security_scope", "/items", "/paths/~1items/get/security/1/oauth/0", None)
+    ]
+
+
+def test_scopes_of_other_scheme_types_are_not_validated() -> None:
+    schemes: dict[str, SecurityScheme | LocalReference] = {
+        "key": SECURITY_API_KEY,
+        "http": SecurityScheme(type="http", scheme="bearer"),
+        "oidc": SecurityScheme(type="openIdConnect", openid_connect_url="https://a.example/o"),
+        "mtls": SecurityScheme(type="mutualTLS"),
+    }
+    requirement_ = SecurityRequirement(schemes={name: ("anything",) for name in schemes})
+
+    suite = generate_test_suite(security_result(schemes, api_security=(requirement_,), version="3.1.1"))
+
+    assert [case.security for case in suite.cases] == [(requirement_,)]
+    assert suite.diagnostics == ()
+
+
+@pytest.mark.parametrize(
+    "flows",
+    [
+        None,
+        {},
+        [],
+        "implicit",
+        {"x-extension": {"scopes": {"read": "r"}}},
+        {"implicit": None},
+        {"implicit": {"authorizationUrl": "https://a.example/a"}},
+        {"implicit": {"scopes": ["read"]}},
+        {"implicit": {"scopes": {"read": "r"}}, "password": {"scopes": None}},
+    ],
+    ids=["none", "empty", "list", "string", "no-known-flow", "flow-none", "no-scopes", "scopes-list", "one-bad-flow"],
+)
+def test_malformed_oauth2_flow_metadata_fails_closed_with_the_scheme_diagnostic(
+    flows: object,
+) -> None:
+    broken = SecurityScheme.model_construct(type="oauth2", flows=flows)
+    for scopes in ((), ("read",)):
+        suite = generate_test_suite(
+            security_result({"oauth": broken}, api_security=(scoped(oauth=scopes),))
+        )
+
+        assert suite.cases == ()
+        assert security_diagnostics(suite) == [
+            ("unsupported_security_scheme", "/items", "/components/securitySchemes/oauth", None)
+        ]
+        assert "missing or malformed flows" in suite.diagnostics[0].message
+
+
+def test_malformed_oauth2_metadata_reports_the_alias_target_and_last_reference() -> None:
+    broken = SecurityScheme(type="oauth2", flows=None)
+    suite = generate_test_suite(
+        security_result(
+            {"oauth": security_ref("real"), "real": broken},
+            api_security=(scoped(oauth=("read",)),),
+        )
+    )
+
+    assert security_diagnostics(suite) == [
+        (
+            "unsupported_security_scheme",
+            "/items",
+            "/components/securitySchemes/real",
+            f"{SECURITY_BASE}real",
+        )
+    ]
+
+
+def test_unknown_flow_keys_are_ignored_and_valid_flows_still_validate() -> None:
+    scheme = SecurityScheme(
+        type="oauth2",
+        flows={**OAUTH_FLOWS, "x-vendor": {"scopes": {"vendor": "v"}}, "other": 1},
+    )
+    ok = generate_test_suite(scope_result(scheme, api=(scoped(oauth=("read",)),)))
+    bad = generate_test_suite(scope_result(scheme, api=(scoped(oauth=("vendor",)),)))
+
+    assert len(ok.cases) == 1
+    assert security_diagnostics(bad) == [
+        ("unsupported_security_scope", "/items", "/security/0/oauth/0", None)
+    ]
+
+
+def test_scope_validation_does_not_copy_scheme_metadata_into_cases() -> None:
+    suite = generate_test_suite(
+        scope_result(
+            SecurityScheme(
+                type="oauth2",
+                description="SECRET-VALUE-123",
+                flows={"implicit": {"authorizationUrl": "https://s.example/a", "scopes": {"read": "SECRET-VALUE-123"}}},
+                extensions={"x-token": "SECRET-VALUE-123"},
+            ),
+            api=(scoped(oauth=("read",)),),
+        )
+    )
+
+    assert [case.security for case in suite.cases] == [(scoped(oauth=("read",)),)]
+    assert "SECRET-VALUE-123" not in suite.model_dump_json()
+    assert "security_schemes" not in GeneratedTestCase.model_fields
+
+
+def test_scope_validation_is_deterministic_and_does_not_mutate_inputs() -> None:
+    result = scope_result(api=(scoped(oauth=("bad", "read", "worse")),))
+    before = result.model_dump_json()
+
+    first = generate_test_suite(result)
+    second = generate_test_suite(result)
+
+    assert result.model_dump_json() == before
+    assert first.model_dump_json() == second.model_dump_json()
+
+
+def test_scope_diagnostics_use_the_existing_diagnostic_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_DIAGNOSTICS", 2)
+
+    suite = generate_test_suite(scope_result(api=(scoped(oauth=("a", "b", "c", "d")),)))
+
+    codes = [item.code for item in suite.diagnostics]
+    assert codes == ["unsupported_security_scope"] * 2 + ["generation_diagnostic_budget_exceeded"]
+    assert [item.source_pointer for item in suite.diagnostics[:2]] == [
+        "/security/0/oauth/0",
+        "/security/0/oauth/1",
+    ]
+    assert "per-endpoint limit of 2" in suite.diagnostics[-1].message
+
+
+def test_scope_failures_do_not_hide_an_exhausted_expansion_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_EXPANSIONS", 1)
+    result = security_result(
+        {"oauth": security_ref("mid"), "mid": security_ref("real"), "real": OAUTH2},
+        api_security=(scoped(oauth=("bad",)),),
+    )
+
+    suite = generate_test_suite(result)
+
+    assert [item.code for item in suite.diagnostics] == ["generation_expansion_budget_exceeded"]
+
+
 @pytest.mark.parametrize("version", ["3.0.3", "3.1.1"])
 def test_normalized_documents_resolve_security_scheme_aliases(version: str) -> None:
     from app.services.openapi import normalize_openapi_document

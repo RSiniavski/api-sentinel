@@ -3376,6 +3376,7 @@ def _response_expectations(
 
 _SECURITY_SCHEME_REFERENCE_PREFIX = "#/components/securitySchemes/"
 _SECURITY_SCHEME_TYPES = frozenset({"apiKey", "http", "oauth2", "openIdConnect"})
+_OAUTH_FLOW_NAMES = ("implicit", "password", "clientCredentials", "authorizationCode")
 
 
 def _check_security_schemes(endpoint: Endpoint, api: ApiModel, endpoint_pointer: str) -> None:
@@ -3384,9 +3385,10 @@ def _check_security_schemes(endpoint: Endpoint, api: ApiModel, endpoint_pointer:
     The effective requirements are the operation's own `security` if it is not
     None, otherwise the API-level `security`. Anonymous requirements and an
     explicitly empty list name no scheme, so nothing is looked up. Every
-    ordinary failure, in requirement order and then sorted name order, is
-    collected (identical pointer and reference URI once) and fails the whole
-    endpoint together; no alternative or scheme is dropped. An exhausted
+    ordinary failure, in requirement order and then sorted name order (a
+    scheme's undeclared OAuth2 scopes in scope order), is collected (identical
+    pointer and reference URI once) and fails the whole endpoint together; no
+    alternative or scheme is dropped. An exhausted
     expansion budget is not an ordinary failure: it propagates and stops the
     check.
     """
@@ -3403,21 +3405,28 @@ def _check_security_schemes(endpoint: Endpoint, api: ApiModel, endpoint_pointer:
     for index, requirement in enumerate(requirements):
         for name in sorted(requirement.schemes):
             try:
-                _resolve_security_scheme(name, api, _child(base, str(index), name))
-            except _UnsupportedOperation as issue:
-                key = (issue.pointer, issue.reference_uri)
-                if key not in seen:
-                    seen.add(key)
-                    issues.append(issue)
+                _resolve_security_scheme(
+                    name, api, _child(base, str(index), name), requirement.schemes[name]
+                )
+            except _UnsupportedOperation as raised:
+                for issue in raised.issues if isinstance(raised, _SecurityIssues) else (raised,):
+                    key = (issue.pointer, issue.reference_uri)
+                    if key not in seen:
+                        seen.add(key)
+                        issues.append(issue)
     if issues:
         raise _SecurityIssues(issues)
 
 
-def _resolve_security_scheme(name: str, api: ApiModel, pointer: str) -> SecurityScheme:
+def _resolve_security_scheme(
+    name: str, api: ApiModel, pointer: str, scopes: tuple[str, ...] = ()
+) -> SecurityScheme:
     """Look up a security scheme by name and follow local references to it.
 
-    Only the scheme's type is validated. Every successfully followed reference
-    hop is charged to the expansion budget.
+    The scheme's type is validated and, for `oauth2`, the requested scopes
+    (see _check_oauth2_scopes). The resolved scheme is used for validation
+    only. Every successfully followed reference hop is charged to the
+    expansion budget.
     """
     entry = api.components.security_schemes.get(name)
     if entry is None:
@@ -3476,6 +3485,10 @@ def _resolve_security_scheme(name: str, api: ApiModel, pointer: str) -> Security
     if current.type in _SECURITY_SCHEME_TYPES or (
         mutual_tls and api.openapi_version.startswith("3.1.")
     ):
+        if current.type == "oauth2":
+            _check_oauth2_scopes(
+                current, name, scopes, pointer, declaration, followed[-1] if followed else None
+            )
         return current
     raise _UnsupportedOperation(
         "unsupported_security_scheme",
@@ -3487,6 +3500,57 @@ def _resolve_security_scheme(name: str, api: ApiModel, pointer: str) -> Security
         declaration,
         followed[-1] if followed else None,
     )
+
+
+def _check_oauth2_scopes(
+    scheme: SecurityScheme,
+    name: str,
+    scopes: tuple[str, ...],
+    pointer: str,
+    declaration: str,
+    reference_uri: str | None,
+) -> None:
+    """Check requested scopes against the union of the scopes of all declared flows.
+
+    A requirement names no flow, so a scope is valid when at least one flow
+    declares it (exact, case-sensitive match). The Parser validates the
+    OpenAPI structure; this only fails closed, with the existing
+    `unsupported_security_scheme` code at the scheme declaration, when a
+    directly constructed or otherwise invalid model has no usable flow
+    metadata: `flows` that is not an object, no known flow, or a known flow
+    that is not an object with an object `scopes`. Unknown flow keys, such as
+    extensions, are ignored.
+    """
+    flows = scheme.flows
+    declared: set[str] = set()
+    usable = isinstance(flows, dict)
+    if usable:
+        present = [flow for flow in _OAUTH_FLOW_NAMES if flow in flows]
+        usable = bool(present)
+        for flow in present:
+            flow_scopes = flows[flow].get("scopes") if isinstance(flows[flow], dict) else None
+            if not isinstance(flow_scopes, dict):
+                usable = False
+                break
+            declared.update(flow_scopes)
+    if not usable:
+        raise _UnsupportedOperation(
+            "unsupported_security_scheme",
+            f"OAuth2 security scheme '{name}' has missing or malformed flows metadata.",
+            declaration,
+            reference_uri,
+        )
+    undeclared = [
+        _UnsupportedOperation(
+            "unsupported_security_scope",
+            f"Scope '{scope}' is not declared by any flow of OAuth2 security scheme '{name}'.",
+            _child(pointer, str(index)),
+        )
+        for index, scope in enumerate(scopes)
+        if scope not in declared
+    ]
+    if undeclared:
+        raise _SecurityIssues(undeclared)
 
 
 def _parameter_examples(

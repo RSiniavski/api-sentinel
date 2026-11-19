@@ -307,6 +307,21 @@ def test_openapi_30_rejects_security_scheme_missing_required_field(
         parse_openapi_document(security_scheme_document("3.0.3", scheme), "api.json")
 
 
+@pytest.mark.parametrize("version", ["3.0.3", "3.1.1"])
+def test_parser_accepts_an_undeclared_oauth2_scope_in_a_security_requirement(version: str) -> None:
+    # Records what the real openapi-spec-validator does with an undeclared scope, which is
+    # why the Generator (not the Parser) reports `unsupported_security_scope`.
+    document = openapi_document(version)
+    document["components"] = {
+        "securitySchemes": {"oauth": SECURITY_SCHEME_DEFINITIONS["oauth2"]}
+    }
+    document["security"] = [{"oauth": ["not-declared-by-any-flow"]}]
+
+    result = parse_openapi_document(json.dumps(document), "api.json")
+
+    assert result["security"] == [{"oauth": ["not-declared-by-any-flow"]}]
+
+
 def test_openapi_30_rejects_mutual_tls_security_scheme() -> None:
     with pytest.raises(OpenAPIValidationError):
         parse_openapi_document(

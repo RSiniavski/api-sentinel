@@ -131,7 +131,6 @@ Still planned:
 
 - Support for further schema keywords (formats beyond the closed set, patterns beyond the bounded subset) and compositions.
 - Request media types other than `application/json`.
-- OAuth2 scope validation against declared flows and resolved scheme metadata in generated cases.
 - Contract validation of responses, together with the Test Execution Engine (Phase 5).
 
 ## 6. Phase 5 — Test Execution Engine
