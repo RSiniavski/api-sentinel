@@ -123,6 +123,7 @@ _EXPANSION_BUDGET_CODE = "generation_expansion_budget_exceeded"
 _CASE_BUDGET_CODE = "generation_case_budget_exceeded"
 _DIAGNOSTIC_BUDGET_CODE = "generation_diagnostic_budget_exceeded"
 _PATTERN_BUDGET_CODE = "generation_pattern_budget_exceeded"
+_ANCESTOR_LITERAL_CODE = "negative_case_ancestor_literal_conflict"
 
 
 class _GenerationBudget:
@@ -633,6 +634,23 @@ def _required_property_negative_cases(
     if not property_paths and not undeclared_required:
         return (), ()
 
+    # An omission whose body would leave a const or enum on a root or ancestor
+    # object is blocked before anything is charged. Only paths below such a
+    # literal are copied here; the copy is reused by the loop below.
+    kept: list[tuple[tuple[str, ...], str, _Lineage]] = []
+    blocked: list[tuple[tuple[str, ...], str]] = []
+    omitted_bodies: dict[tuple[str, ...], Any] = {}
+    for entry in property_paths:
+        entry_path, _, entry_lineage = entry
+        if _lineage_has_literal(entry_lineage):
+            omitted = _without_property(positive.request_body.value, entry_path)
+            keyword = _literal_conflict(entry_lineage, omitted)
+            if keyword is not None:
+                blocked.append((entry_path, keyword))
+                continue
+            omitted_bodies[entry_path] = omitted
+        kept.append(entry)
+
     # This step is all-or-nothing. If its cases cannot all fit, fail now with the
     # exhaustion the loop below would raise, before any body is copied or
     # validated. Charging and restoring touches only the two case counters.
@@ -640,15 +658,17 @@ def _required_property_negative_cases(
     if budget is not None:
         counts = budget.case_counts()
         try:
-            for _ in property_paths:
+            for _ in kept:
                 budget.charge_case()
         finally:
             budget.restore_case_counts(counts)
 
     root = _endpoint_pointer(endpoint)
     cases: list[GeneratedTestCase] = []
-    for property_path, property_schema_pointer in property_paths:
-        body_value = _without_property(positive.request_body.value, property_path)
+    for property_path, property_schema_pointer, _ in kept:
+        body_value = omitted_bodies.get(property_path)
+        if body_value is None:
+            body_value = _without_property(positive.request_body.value, property_path)
 
         property_reference = _json_pointer(property_path)
         cases.append(
@@ -693,6 +713,12 @@ def _required_property_negative_cases(
         )
         for name, pointer in undeclared_required
     ]
+    diagnostics.extend(
+        _ancestor_literal_diagnostic(
+            endpoint, "required_property", _json_pointer(blocked_path), keyword
+        )
+        for blocked_path, keyword in blocked
+    )
     if not any(_declares_client_error(status) for status in endpoint.responses):
         diagnostics.append(
             GenerationDiagnostic(
@@ -728,7 +754,7 @@ def _wrong_type_negative_cases(
     root_pointer = _child(body_pointer, "content", "application/json", "schema")
     raw_schema = media.schema.raw
     body_value = positive.request_body.value
-    targets: list[tuple[tuple[str, ...], tuple[str, ...], Any, str]] = []
+    targets: list[tuple[tuple[str, ...], tuple[str, ...], Any, str, _Lineage]] = []
     diagnostics: list[GenerationDiagnostic] = []
 
     def report_issue(issue: _UnsupportedOperation) -> None:
@@ -743,7 +769,13 @@ def _wrong_type_negative_cases(
             )
         )
 
-    def visit(schema: Any, value: Any, path: tuple[str, ...], pointer: str) -> None:
+    def visit(
+        schema: Any,
+        value: Any,
+        path: tuple[str, ...],
+        pointer: str,
+        lineage: _Lineage = (),
+    ) -> None:
         followed = _follow_property_schema(schema, pointer, report_issue)
         if followed is None:
             return
@@ -753,6 +785,8 @@ def _wrong_type_negative_cases(
         properties = schema.get("properties")
         if not isinstance(properties, dict):
             return
+        # The target's own schema is not on its lineage: its type is violated on purpose.
+        here: _Lineage = (*lineage, (schema, pointer, path))
         for name in sorted(properties):
             if name not in value:
                 continue
@@ -817,15 +851,15 @@ def _wrong_type_negative_cases(
                         candidate_type = _json_value_type(candidate)
                         if candidate_type not in allowed_types:
                             targets.append(
-                                (child_path, allowed_types, candidate, child_pointer)
+                                (child_path, allowed_types, candidate, child_pointer, here)
                             )
 
-            visit(child_schema, value[name], child_path, child_pointer)
+            visit(child_schema, value[name], child_path, child_pointer, here)
 
     visit(raw_schema, body_value, (), root_pointer)
 
     cases: list[GeneratedTestCase] = []
-    for path, _, candidate, schema_pointer in targets:
+    for path, _, candidate, schema_pointer, lineage in targets:
         generated_value = deepcopy(body_value)
         parent = generated_value
         for name in path[:-1]:
@@ -833,6 +867,13 @@ def _wrong_type_negative_cases(
         parent[path[-1]] = candidate
 
         property_pointer = _json_pointer(path)
+        if _lineage_has_literal(lineage):
+            keyword = _literal_conflict(lineage, generated_value)
+            if keyword is not None:
+                diagnostics.append(
+                    _ancestor_literal_diagnostic(endpoint, "type", property_pointer, keyword)
+                )
+                continue
         type_pointer = _child(schema_pointer, "type")
         cases.append(
             _counted_case(
@@ -880,7 +921,7 @@ def _enum_const_negative_cases(
 
     body_schema_pointer = _child(body_pointer, "content", "application/json", "schema")
     body_value = positive.request_body.value
-    targets: list[tuple[tuple[str, ...], str, str, Any]] = []
+    targets: list[tuple[tuple[str, ...], str, str, Any, _Lineage]] = []
     diagnostics: list[GenerationDiagnostic] = []
 
     def add_diagnostic(
@@ -911,6 +952,7 @@ def _enum_const_negative_cases(
         path: tuple[str, ...],
         pointer: str,
         depth: int,
+        lineage: _Lineage = (),
     ) -> None:
         followed = _follow_property_schema(schema, pointer, report_issue)
         if followed is None:
@@ -929,6 +971,8 @@ def _enum_const_negative_cases(
         if not isinstance(properties, dict):
             return
 
+        # The target's own schema is not on its lineage: its literal is violated on purpose.
+        here: _Lineage = (*lineage, (schema, pointer, path))
         for name in sorted(properties):
             if name not in value:
                 continue
@@ -986,16 +1030,18 @@ def _enum_const_negative_cases(
                                 )
                             else:
                                 targets.append(
-                                    (child_path, child_pointer, keyword, candidate)
+                                    (child_path, child_pointer, keyword, candidate, here)
                                 )
 
             if isinstance(child_value, dict):
-                visit(child_schema, child_value, child_path, child_pointer, depth + 1)
+                visit(
+                    child_schema, child_value, child_path, child_pointer, depth + 1, here
+                )
 
     visit(media.schema.raw, body_value, (), body_schema_pointer, 0)
 
     cases: list[GeneratedTestCase] = []
-    for path, schema_pointer, keyword, candidate in targets:
+    for path, schema_pointer, keyword, candidate, lineage in targets:
         generated_value = deepcopy(body_value)
         parent = generated_value
         for name in path[:-1]:
@@ -1003,6 +1049,13 @@ def _enum_const_negative_cases(
         parent[path[-1]] = candidate
 
         property_pointer = _json_pointer(path)
+        if _lineage_has_literal(lineage):
+            conflict = _literal_conflict(lineage, generated_value)
+            if conflict is not None:
+                diagnostics.append(
+                    _ancestor_literal_diagnostic(endpoint, keyword, property_pointer, conflict)
+                )
+                continue
         keyword_pointer = _child(schema_pointer, keyword)
         cases.append(
             _counted_case(
@@ -1137,7 +1190,7 @@ def _string_boundary_negative_cases(
         return (), ()
 
     root_pointer = _child(body_pointer, "content", "application/json", "schema")
-    targets: list[tuple[tuple[str, ...], str, str, str]] = []
+    targets: list[tuple[tuple[str, ...], str, str, str, _Lineage]] = []
     diagnostics: list[GenerationDiagnostic] = []
 
     def report_issue(issue: _UnsupportedOperation) -> None:
@@ -1151,7 +1204,13 @@ def _string_boundary_negative_cases(
             )
         )
 
-    def visit(schema: Any, value: Any, path: tuple[str, ...], pointer: str) -> None:
+    def visit(
+        schema: Any,
+        value: Any,
+        path: tuple[str, ...],
+        pointer: str,
+        lineage: _Lineage = (),
+    ) -> None:
         followed = _follow_property_schema(schema, pointer, report_issue)
         if followed is None:
             return
@@ -1161,6 +1220,7 @@ def _string_boundary_negative_cases(
         properties = schema.get("properties")
         if not isinstance(properties, dict):
             return
+        here: _Lineage = (*lineage, (schema, pointer, path))
         for name in sorted(properties):
             if name not in value:
                 continue
@@ -1233,15 +1293,21 @@ def _string_boundary_negative_cases(
                                     )
                                 else:
                                     targets.append(
-                                        (child_path, constraint, candidate, child_pointer)
+                                        (
+                                            child_path,
+                                            constraint,
+                                            candidate,
+                                            child_pointer,
+                                            here,
+                                        )
                                     )
 
-            visit(child_schema, value[name], child_path, child_pointer)
+            visit(child_schema, value[name], child_path, child_pointer, here)
 
     visit(media.schema.raw, positive.request_body.value, (), root_pointer)
 
     cases: list[GeneratedTestCase] = []
-    for path, constraint, candidate, schema_pointer in targets:
+    for path, constraint, candidate, schema_pointer, lineage in targets:
         generated_value = deepcopy(positive.request_body.value)
         parent = generated_value
         for name in path[:-1]:
@@ -1249,6 +1315,15 @@ def _string_boundary_negative_cases(
         parent[path[-1]] = candidate
 
         property_pointer = _json_pointer(path)
+        if _lineage_has_literal(lineage):
+            keyword = _literal_conflict(lineage, generated_value)
+            if keyword is not None:
+                diagnostics.append(
+                    _ancestor_literal_diagnostic(
+                        endpoint, constraint, property_pointer, keyword
+                    )
+                )
+                continue
         constraint_pointer = _child(schema_pointer, constraint)
         cases.append(
             _counted_case(
@@ -1757,7 +1832,70 @@ def _array_bound_negative_cases(
             affected_property=property_pointer,
         )
 
-    cases = [build_case(target) for target in targets]
+    def literal_block(
+        target: tuple[tuple[str, ...], str, list[Any], str, _Insertions]
+    ) -> tuple[str, bool] | None:
+        """The first visited literal that rejects the final body, and whether it is an array's.
+
+        The lineage is the already-recorded ``visited`` chain of the target's path,
+        including the target's own node; no schema is traversed or resolved again.
+        A literal on an array node (also a root array) or on an ``items`` schema (an
+        element of an array) is array-specific; object ancestors and an object root are not.
+        """
+        path = target[0]
+        lineage: _Lineage = tuple(
+            (*visited[path[:length]], path[:length])
+            for length in range(len(path) + 1)
+            if path[:length] in visited
+        )
+        if not _lineage_has_literal(lineage):
+            return None
+        final_body = assemble(target)
+        index = _literal_conflict_index(lineage, final_body)
+        if index is None:
+            return None
+        schema, pointer, node_path = lineage[index]
+        keyword = _literal_pointer(schema, pointer)
+        assert keyword is not None
+        # The role comes from the final value: an array node holds a list, and an
+        # ``items`` schema describes an element of a list. A schema's own keywords
+        # (an inapplicable ``items`` on an object) do not matter.
+        array_specific = _is_array_value_at(final_body, node_path) or (
+            bool(node_path) and _is_array_value_at(final_body, node_path[:-1])
+        )
+        return keyword, array_specific
+
+    def report_literal_block(
+        target: tuple[tuple[str, ...], str, list[Any], str, _Insertions],
+        blocked: tuple[str, bool],
+    ) -> None:
+        keyword, array_specific = blocked
+        property_pointer = _json_pointer(target[0])
+        if array_specific:
+            report(
+                "array_bound_no_safe_candidate",
+                _ancestor_literal_message(target[1], property_pointer, keyword),
+                keyword,
+            )
+        else:
+            diagnostics.append(
+                _ancestor_literal_diagnostic(endpoint, target[1], property_pointer, keyword)
+            )
+
+    def build_unblocked(
+        start: int,
+    ) -> list[GeneratedTestCase]:
+        """Cases of ``targets[start:]``; literal-blocked ones are reported, not built."""
+        built: list[GeneratedTestCase] = []
+        for target in targets[start:]:
+            blocked = literal_block(target)
+            if blocked is not None:
+                report_literal_block(target, blocked)
+                continue
+            built.append(build_case(target))
+        return built
+
+    cases = build_unblocked(0)
 
     # Phase 3: array bounds below absent optional object properties. The parent
     # is created in the negative body only; the positive body is not changed.
@@ -1835,7 +1973,7 @@ def _array_bound_negative_cases(
     empty_mark = len(empty_arrays)
     try:
         create_absent_parents()
-        cases.extend([build_case(target) for target in targets[target_mark:]])
+        cases.extend(build_unblocked(target_mark))
     except _BudgetExhausted as exhausted:
         if budget is not None and counts is not None:
             budget.restore_case_counts(counts)
@@ -1917,23 +2055,6 @@ def _array_bound_negative_cases(
                 empties_done += 1
             absents_done = create_absent_parents(absents_done)
 
-    def literal_block(
-        target: tuple[tuple[str, ...], str, list[Any], str, _Insertions]
-    ) -> str | None:
-        """Keyword pointer of the first visited literal that rejects the final body."""
-        path = target[0]
-        final = assemble(target)
-        for length in range(len(path) + 1):
-            node = visited.get(path[:length])
-            if node is None:
-                continue
-            keyword = _literal_pointer(*node)
-            if keyword is not None and not _literal_accepts(
-                node[0], _value_at(final, path[:length])
-            ):
-                return keyword
-        return None
-
     counts4 = budget.case_counts() if budget is not None else None
     target_mark4, diagnostic_mark4 = len(targets), len(diagnostics)
     final_body_mode[0] = True
@@ -1942,17 +2063,9 @@ def _array_bound_negative_cases(
         accepted = []
         seen_cases: set[tuple[tuple[str, ...], str, int]] = set()
         for target in targets[target_mark4:]:
-            keyword = literal_block(target)
-            if keyword is not None:
-                report(
-                    "array_bound_no_safe_candidate",
-                    (
-                        f"The {target[1]} case for '{_json_pointer(target[0])}' was not "
-                        f"generated: the changed body would also violate the literal at "
-                        f"{keyword}."
-                    ),
-                    keyword,
-                )
+            blocked = literal_block(target)
+            if blocked is not None:
+                report_literal_block(target, blocked)
                 continue
             case_key = (target[0], target[1], len(target[2]))
             if case_key not in seen_cases:
@@ -2072,6 +2185,71 @@ def _literal_pointer(schema: dict[str, Any], pointer: str) -> str | None:
     return None
 
 
+# The strict ancestors of a negative target, root first: each is the followed
+# schema, its pointer and its path in the body. Steps build it from the schemas
+# they already follow, so checking it needs no further traversal or $ref work.
+_Lineage = tuple[tuple[dict[str, Any], str, tuple[str, ...]], ...]
+
+
+def _lineage_has_literal(lineage: _Lineage) -> bool:
+    """Whether any schema on a lineage has a const or enum."""
+    return any("const" in schema or "enum" in schema for schema, _, _ in lineage)
+
+
+def _literal_conflict_index(lineage: _Lineage, final_body: Any) -> int | None:
+    """Index of the first lineage node, root first, whose const/enum rejects a final body.
+
+    A node that is absent from the final body has no value to validate.
+    """
+    for index, (schema, pointer, path) in enumerate(lineage):
+        if _literal_pointer(schema, pointer) is None:
+            continue
+        try:
+            value = _value_at(final_body, path)
+        except (KeyError, IndexError, TypeError, ValueError):
+            continue
+        if not _literal_accepts(schema, value):
+            return index
+    return None
+
+
+def _literal_conflict(lineage: _Lineage, final_body: Any) -> str | None:
+    """Keyword pointer of the first const/enum, root first, that rejects a final body."""
+    index = _literal_conflict_index(lineage, final_body)
+    if index is None:
+        return None
+    schema, pointer, _ = lineage[index]
+    return _literal_pointer(schema, pointer)
+
+
+def _is_array_value_at(body: Any, path: tuple[str, ...]) -> bool:
+    """Whether the final body holds an array at a path (an absent path holds none)."""
+    try:
+        return isinstance(_value_at(body, path), list)
+    except (KeyError, IndexError, TypeError, ValueError):
+        return False
+
+
+def _ancestor_literal_message(constraint: str, property_pointer: str, keyword: str) -> str:
+    return (
+        f"The {constraint} case for '{property_pointer}' was not generated: the "
+        f"changed body would also violate the literal at {keyword}."
+    )
+
+
+def _ancestor_literal_diagnostic(
+    endpoint: Endpoint, constraint: str, property_pointer: str, keyword: str
+) -> GenerationDiagnostic:
+    return GenerationDiagnostic(
+        code=_ANCESTOR_LITERAL_CODE,
+        message=_ancestor_literal_message(constraint, property_pointer, keyword),
+        endpoint_path=endpoint.path,
+        endpoint_method=endpoint.method,
+        source_pointer=keyword,
+        reference_uri=None,
+    )
+
+
 def _has_duplicate_items(items: list[Any]) -> bool:
     """Whether two items are equal under the JSON Schema equality of _equal."""
     return any(
@@ -2116,7 +2294,7 @@ def _numeric_boundary_negative_cases(
     schema = media.schema.raw
     root_pointer = _child(body_pointer, "content", "application/json", "schema")
     body_value = positive.request_body.value
-    targets: list[tuple[tuple[str, ...], dict[str, Any], str, str]] = []
+    targets: list[tuple[tuple[str, ...], dict[str, Any], str, str, _Lineage]] = []
     issues: list[_UnsupportedOperation] = []
     _collect_numeric_targets(schema, (), root_pointer, targets, issues)
 
@@ -2132,7 +2310,7 @@ def _numeric_boundary_negative_cases(
         )
         for issue in issues
     ]
-    for path, target_schema, schema_pointer, constraint in targets:
+    for path, target_schema, schema_pointer, constraint, lineage in targets:
         keyword_pointer = _child(schema_pointer, constraint)
         try:
             _check_schema(target_schema, version, schema_pointer, "request", 0)
@@ -2250,6 +2428,15 @@ def _numeric_boundary_negative_cases(
             generated_value = value
 
         property_pointer = _json_pointer(path) if path else ""
+        if _lineage_has_literal(lineage):
+            keyword = _literal_conflict(lineage, generated_value)
+            if keyword is not None:
+                diagnostics.append(
+                    _ancestor_literal_diagnostic(
+                        endpoint, constraint, property_pointer, keyword
+                    )
+                )
+                continue
         cases.append(
             _counted_case(
                 case_id=build_case_id(
@@ -2286,14 +2473,16 @@ def _collect_numeric_targets(
     schema: Any,
     path: tuple[str, ...],
     pointer: str,
-    targets: list[tuple[tuple[str, ...], dict[str, Any], str, str]],
+    targets: list[tuple[tuple[str, ...], dict[str, Any], str, str, _Lineage]],
     issues: list[_UnsupportedOperation],
     active: tuple[str, ...] = (),
+    lineage: _Lineage = (),
 ) -> None:
     """Walk object schemas in stable property order and collect numeric bounds.
 
     Unusable references are appended to issues. A schema already being expanded
-    (a recursive reference) is not expanded again.
+    (a recursive reference) is not expanded again. Each target carries the
+    lineage of its strict ancestors, taken from the schemas this walk follows.
     """
     followed = _follow_property_schema(schema, pointer, issues.append)
     if followed is None:
@@ -2313,12 +2502,13 @@ def _collect_numeric_targets(
                 and isinstance(schema[constraint], bool)
                 and schema[constraint] is False
             ):
-                targets.append((path, schema, pointer, constraint))
+                targets.append((path, schema, pointer, constraint, lineage))
         return
 
     properties = schema.get("properties")
     if not isinstance(properties, dict):
         return
+    here: _Lineage = (*lineage, (schema, pointer, path))
     for name in sorted(properties):
         child_pointer = _child(pointer, "properties", name)
         followed_child = _follow_property_schema(properties[name], child_pointer, issues.append)
@@ -2343,7 +2533,7 @@ def _collect_numeric_targets(
                     and isinstance(child[constraint], bool)
                     and child[constraint] is False
                 ):
-                    targets.append((child_path, child, child_pointer, constraint))
+                    targets.append((child_path, child, child_pointer, constraint, here))
         elif isinstance(child.get("properties"), dict):
             _collect_numeric_targets(
                 child,
@@ -2352,6 +2542,7 @@ def _collect_numeric_targets(
                 targets,
                 issues,
                 (*active, pointer),
+                here,
             )
 
 
@@ -2703,11 +2894,16 @@ def _required_writable_property_paths(
     path: tuple[str, ...] = (),
     *,
     schema_pointer: str,
+    lineage: _Lineage = (),
 ) -> tuple[
-    tuple[tuple[tuple[str, ...], str], ...],
+    tuple[tuple[tuple[str, ...], str, _Lineage], ...],
     tuple[tuple[str, str], ...],
 ]:
-    """Return supported omissions and required names lacking property schemas."""
+    """Return supported omissions and required names lacking property schemas.
+
+    Each omission carries the lineage of its strict ancestors, taken from the
+    schemas this walk already follows.
+    """
     followed_root = _follow_property_schema(schema, schema_pointer, _skip_issue)
     if followed_root is None:
         return (), ()
@@ -2718,7 +2914,8 @@ def _required_writable_property_paths(
     if not isinstance(properties, dict):
         return (), ()
 
-    found: list[tuple[tuple[str, ...], str]] = []
+    here: _Lineage = (*lineage, (schema, schema_pointer, path))
+    found: list[tuple[tuple[str, ...], str, _Lineage]] = []
     undeclared: list[tuple[str, str]] = []
     for name in sorted(set(schema.get("required", []))):
         if name not in properties:
@@ -2739,7 +2936,7 @@ def _required_writable_property_paths(
         if not isinstance(value, dict) or name not in value:
             continue
         property_path = (*path, name)
-        found.append((property_path, property_schema_pointer))
+        found.append((property_path, property_schema_pointer, here))
         child_value = value[name]
         if isinstance(child_schema, dict) and isinstance(child_value, dict):
             nested_found, nested_undeclared = _required_writable_property_paths(
@@ -2747,6 +2944,7 @@ def _required_writable_property_paths(
                 child_value,
                 property_path,
                 schema_pointer=child_schema_pointer,
+                lineage=here,
             )
             found.extend(nested_found)
             undeclared.extend(nested_undeclared)

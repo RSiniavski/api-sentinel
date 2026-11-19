@@ -5016,11 +5016,19 @@ def array_summary(suite: GeneratedTestSuite) -> list[tuple[str | None, str | Non
     return summary
 
 
+def is_array_literal_conflict(item: GenerationDiagnostic) -> bool:
+    """An ancestor-literal diagnostic of an Array Bounds case (other steps share the code)."""
+    return item.code == "negative_case_ancestor_literal_conflict" and item.message.startswith(
+        ("The minItems case", "The maxItems case")
+    )
+
+
 def array_diagnostics(suite: GeneratedTestSuite) -> list[tuple[str, str | None]]:
     return [
         (item.code, item.source_pointer)
         for item in suite.diagnostics
         if item.code.startswith("array_bound_")
+        or is_array_literal_conflict(item)
     ]
 
 
@@ -12605,7 +12613,7 @@ def test_literal_accepting_the_final_body_while_the_positive_body_is_valid() -> 
     assert array_values(suite) == [("/rows/0/tags", "minItems", members[1])]
     assert len(members[1]["rows"][0]["tags"]) < ELEMENT_TAGS["minItems"]  # type: ignore[index, operator]
     assert array_diagnostics(suite) == [
-        ("array_bound_no_safe_candidate", f"{ARRAY_BODY_POINTER}/enum")
+        ("negative_case_ancestor_literal_conflict", f"{ARRAY_BODY_POINTER}/enum")
     ]
 
 
@@ -12752,7 +12760,7 @@ def test_items_resolved_through_a_reference() -> None:
 
 def literal_case(body: object, schemas: dict[str, object] | None = None) -> tuple[list[object], list[tuple[str, str]]]:
     suite = element_suite(body, schemas)
-    return array_values(suite), [(item.code, item.source_pointer) for item in suite.diagnostics if item.code.startswith("array_")]
+    return array_values(suite), [(item.code, item.source_pointer) for item in suite.diagnostics if item.code.startswith("array_") or is_array_literal_conflict(item)]
 
 
 # "outer" is an array whose only literal member holds the empty array "rows".
@@ -12805,8 +12813,14 @@ def test_ancestor_literals_that_reject_the_final_body_block_both_cases(
 ) -> None:
     values, diagnostics = literal_case(body, schemas)
 
+    # Object ancestors use the shared code; an enclosing array or items literal keeps its own.
+    code = (
+        "array_bound_no_safe_candidate"
+        if name in ("enclosing array", "items schema")
+        else CONFLICT_CODE
+    )
     assert values == [], name
-    assert diagnostics == [("array_bound_no_safe_candidate", literal_pointer)] * 2
+    assert diagnostics == [(code, literal_pointer)] * 2
 
 
 def test_enclosing_array_literal_scenario_has_a_valid_positive_body_and_blocks_the_created_element() -> None:
@@ -13228,7 +13242,7 @@ def test_const_and_enum_on_one_node_report_the_rejecting_const_when_enum_accepts
     assert suite.cases[0].request_body.value == {"rows": []}  # type: ignore[union-attr]
     assert array_values(suite) == []
     assert array_diagnostics(suite) == [
-        ("array_bound_no_safe_candidate", f"{ARRAY_BODY_POINTER}/const")
+        ("negative_case_ancestor_literal_conflict", f"{ARRAY_BODY_POINTER}/const")
     ] * 2
 
 
@@ -13239,7 +13253,7 @@ def test_const_and_enum_on_one_node_that_both_reject_report_the_const_once_per_c
 
     assert array_values(suite) == []
     assert array_diagnostics(suite) == [
-        ("array_bound_no_safe_candidate", f"{ARRAY_BODY_POINTER}/const")
+        ("negative_case_ancestor_literal_conflict", f"{ARRAY_BODY_POINTER}/const")
     ] * 2
 
 
@@ -13488,3 +13502,521 @@ def test_absent_arrays_below_an_inserted_element_are_deterministic_and_leave_the
     assert array_values(first)[0][2] == {"rows": [{"unique": ["x", "x"]}]}  # no other property leaks in
     assert array_values(first)[3][2] == {"rows": [{"meta": {"tags": ["x"]}}]}
     assert first.cases[0].request_body.value == {"rows": []}  # type: ignore[union-attr]
+
+
+# --- Ancestor literal conflict validation (all negative steps) -------------------------
+
+CONFLICT_CODE = "negative_case_ancestor_literal_conflict"
+META_POSITIVE = {"name": "abc", "n": 2, "k": "k", "r": "ok"}
+META_PROPERTIES: dict[str, object] = {
+    "name": {"type": "string", "minLength": 3, "maxLength": 3, "example": "abc"},
+    "n": {"type": "integer", "minimum": 1, "maximum": 3, "example": 2},
+    "k": {"type": "string", "enum": ["k"]},
+    "r": {"type": "string", "example": "ok"},
+}
+META_REQUIRED = ("name", "n", "k", "r")
+NUMERIC_ONLY: dict[str, object] = {"n": {"type": "integer", "minimum": 1, "maximum": 3, "example": 2}}
+
+
+def meta_schema(**literal: object) -> dict[str, object]:
+    return {**empty_obj(META_PROPERTIES, META_REQUIRED), **literal}
+
+
+def conflicts(suite: GeneratedTestSuite) -> list[tuple[str, str | None]]:
+    """(constraint, pointer of the blocking literal) of every ancestor-literal diagnostic."""
+    return [
+        (item.message.split(" ")[1], item.source_pointer)
+        for item in suite.diagnostics
+        if item.code == CONFLICT_CODE
+    ]
+
+
+def negative_keys(suite: GeneratedTestSuite) -> list[tuple[str | None, str | None]]:
+    return [(c.violated_constraint, c.affected_property) for c in suite.cases if c.category == "negative"]
+
+
+def value_at_or_absent(value: object, pointer: str) -> object:
+    for token in [part for part in pointer.split("/") if part]:
+        if isinstance(value, list):
+            value = value[int(token)]
+        elif isinstance(value, dict) and token in value:
+            value = value[token]
+        else:
+            return "<absent>"
+    return value
+
+
+def strict_ancestor_leaks(suite: GeneratedTestSuite, literals: dict[str, dict[str, object]]) -> list[str]:
+    """Negative cases whose body violates a literal that sits strictly above the target."""
+    leaks = []
+    for case in suite.cases:
+        if case.category != "negative" or case.request_body is None:
+            continue
+        target = case.affected_property or ""
+        for pointer, literal in literals.items():
+            if not target.startswith(f"{pointer}/") and pointer:
+                continue
+            if target == pointer:
+                continue
+            found = value_at_or_absent(case.request_body.value, pointer)
+            if found != "<absent>" and not generator_module._literal_accepts(literal, found):
+                leaks.append(f"{case.violated_constraint}:{target}")
+    return leaks
+
+
+LITERAL_SCENARIOS = {
+    "present enum": (
+        empty_obj({"meta": meta_schema(enum=[META_POSITIVE])}, ("meta",)),
+        None,
+        {"/meta": {"enum": [META_POSITIVE]}},
+        "/properties/meta/enum",
+    ),
+    "present const": (
+        empty_obj({"meta": meta_schema(const=META_POSITIVE)}, ("meta",)),
+        None,
+        {"/meta": {"const": META_POSITIVE}},
+        "/properties/meta/const",
+    ),
+    "root const": ({**meta_schema(), "const": META_POSITIVE}, None, {"": {"const": META_POSITIVE}}, "/const"),
+    "root enum": ({**meta_schema(), "enum": [META_POSITIVE]}, None, {"": {"enum": [META_POSITIVE]}}, "/enum"),
+    "nested ancestors": (
+        empty_obj(
+            {
+                "o": {
+                    **empty_obj({"i": meta_schema(enum=[META_POSITIVE])}, ("i",)),
+                    "enum": [{"i": META_POSITIVE}],
+                }
+            },
+            ("o",),
+        ),
+        None,
+        {"/o": {"enum": [{"i": META_POSITIVE}]}, "/o/i": {"enum": [META_POSITIVE]}},
+        "/properties/o/enum",
+    ),
+    "reference ancestor": (
+        empty_obj({"meta": schema_reference("Meta")}, ("meta",)),
+        {"Meta": meta_schema(enum=[META_POSITIVE])},
+        {"/meta": {"enum": [META_POSITIVE]}},
+        "/components/schemas/Meta/enum",
+    ),
+}
+
+
+@pytest.mark.parametrize("name", list(LITERAL_SCENARIOS))
+def test_no_object_step_leaves_a_strict_ancestor_literal(name: str) -> None:
+    body, schemas, literals, pointer_suffix = LITERAL_SCENARIOS[name]
+    schemas_before = deepcopy((body, schemas))
+
+    suite = element_suite(body, schemas)
+
+    assert strict_ancestor_leaks(suite, literals) == [], name
+    assert (body, schemas) == schemas_before
+    reported = conflicts(suite)
+    assert reported, name
+    assert any(pointer.endswith(pointer_suffix) for _, pointer in reported), (name, reported)
+    constraints = {constraint for constraint, _ in reported}
+    # Every object-oriented step is blocked at least once in each scenario.
+    assert {"required_property", "type", "minLength", "maxLength", "minimum", "maximum", "enum"} <= constraints
+
+
+def test_blocked_candidates_are_reported_once_each_and_retained_cases_keep_their_ids() -> None:
+    plain = element_suite(empty_obj({"meta": meta_schema()}, ("meta",)))
+    literal = element_suite(empty_obj({"meta": meta_schema(enum=[META_POSITIVE])}, ("meta",)))
+
+    plain_ids = {(c.violated_constraint, c.affected_property): c.case_id for c in plain.cases}
+    retained = [(c.violated_constraint, c.affected_property) for c in literal.cases]
+    # Retained cases keep their ID and their relative order.
+    assert [c.case_id for c in literal.cases] == [plain_ids[key] for key in retained]
+    assert retained == [key for key in plain_ids if key in set(retained)]
+    # Every other candidate was reported exactly once.
+    messages = [item.message for item in literal.diagnostics if item.code == CONFLICT_CODE]
+    assert len(messages) == len(set(messages)) == len(plain.cases) - len(literal.cases)
+
+
+def test_a_literal_that_accepts_the_changed_body_keeps_the_case() -> None:
+    without_r = {key: value for key, value in META_POSITIVE.items() if key != "r"}
+    suite = element_suite(empty_obj({"meta": meta_schema(enum=[META_POSITIVE, without_r])}, ("meta",)))
+
+    assert ("required_property", "/meta/r") in negative_keys(suite)
+    assert ("required_property", "/meta/n") not in negative_keys(suite)
+    blocked = [item.message for item in suite.diagnostics if item.code == CONFLICT_CODE]
+    assert not any(message.startswith("The required_property case for '/meta/r'") for message in blocked)
+    assert any(message.startswith("The required_property case for '/meta/n'") for message in blocked)
+
+
+def test_schemas_without_ancestor_literals_report_nothing_and_are_unchanged() -> None:
+    suite = element_suite(empty_obj({"meta": meta_schema()}, ("meta",)))
+
+    assert [item for item in suite.diagnostics if item.code == CONFLICT_CODE] == []
+    assert len(suite.cases) == 17
+
+
+def test_the_target_own_literal_is_excluded_for_wrong_type_and_enum() -> None:
+    suite = element_suite(empty_obj({"meta": meta_schema()}, ("meta",)))
+    keys = negative_keys(suite)
+
+    # "/meta/k" carries enum ["k"]: violating it is the point of these two cases.
+    assert ("type", "/meta/k") in keys
+    assert ("enum", "/meta/k") in keys
+    assert conflicts(suite) == []
+    # Even a literal on the target itself does not block its own wrong_type case.
+    own = element_suite(empty_obj({"meta": {**meta_schema(), "enum": [META_POSITIVE]}}, ("meta",)))
+    assert ("type", "/meta") in negative_keys(own)
+
+
+def test_numeric_targets_below_an_absent_optional_parent_respect_the_parent_literal() -> None:
+    own = element_suite(empty_obj({"meta": {**empty_obj(NUMERIC_ONLY), "enum": [{"n": 2}]}}))
+
+    assert own.cases[0].request_body.value == {}  # type: ignore[union-attr]
+    assert not [key for key in negative_keys(own) if key[0] in ("minimum", "maximum")]
+    assert {constraint for constraint, _ in conflicts(own)} == {"minimum", "maximum"}
+
+    above = element_suite(
+        empty_obj({"o": {**empty_obj({"meta": empty_obj(NUMERIC_ONLY)}), "enum": [{}]}}, ("o",))
+    )
+    assert not [key for key in negative_keys(above) if key[0] in ("minimum", "maximum")]
+    assert {constraint for constraint, _ in conflicts(above)} == {"minimum", "maximum"}
+
+
+def test_numeric_boundary_below_an_absent_parent_is_kept_without_a_literal() -> None:
+    suite = element_suite(empty_obj({"meta": empty_obj(NUMERIC_ONLY)}))
+
+    assert {("minimum", "/meta/n"), ("maximum", "/meta/n")} <= set(negative_keys(suite))
+    assert conflicts(suite) == []
+
+
+# Array Bounds: phases 1-3 now use the shared validation; phase 4 keeps its semantics.
+def array_conflicts(suite: GeneratedTestSuite) -> list[tuple[str, str | None]]:
+    return [
+        (item.message.split(" ")[1], item.source_pointer)
+        for item in suite.diagnostics
+        if item.code == CONFLICT_CODE and item.message.startswith(("The minItems", "The maxItems"))
+    ]
+
+
+def test_array_phase_one_blocks_candidates_that_leave_a_present_ancestor_literal() -> None:
+    body = empty_obj(
+        {"o": {**empty_obj({"tags": ELEMENT_TAGS}, ("tags",)), "enum": [{"tags": ["x", "x"]}]}}, ("o",)
+    )
+
+    suite = element_suite(body)
+
+    assert suite.cases[0].request_body.value == {"o": {"tags": ["x", "x"]}}  # type: ignore[union-attr]
+    assert array_values(suite) == []
+    assert array_conflicts(suite) == [
+        ("minItems", f"{ARRAY_BODY_POINTER}/properties/o/enum"),
+        ("maxItems", f"{ARRAY_BODY_POINTER}/properties/o/enum"),
+    ]
+    assert [c for c in array_cases(suite)] == []
+
+
+def test_array_phase_one_blocks_candidates_below_a_root_literal() -> None:
+    body = {**empty_obj({"tags": ELEMENT_TAGS}, ("tags",)), "const": {"tags": ["x", "x"]}}
+
+    suite = element_suite(body)
+
+    assert array_values(suite) == []
+    assert array_conflicts(suite) == [
+        ("minItems", f"{ARRAY_BODY_POINTER}/const"),
+        ("maxItems", f"{ARRAY_BODY_POINTER}/const"),
+    ]
+
+
+def test_array_phase_one_keeps_candidates_that_the_literal_accepts() -> None:
+    accepted = {"tags": ["x"]}
+    body = {**empty_obj({"tags": ELEMENT_TAGS}, ("tags",)), "enum": [{"tags": ["x", "x"]}, accepted]}
+
+    suite = element_suite(body)
+
+    assert array_values(suite) == [("/tags", "minItems", accepted)]
+    assert array_conflicts(suite) == [("maxItems", f"{ARRAY_BODY_POINTER}/enum")]
+
+
+def test_array_phase_two_blocks_element_candidates_below_an_ancestor_literal() -> None:
+    rows = empty_arr(empty_obj({"tags": ELEMENT_TAGS}, ("tags",)))
+    body = empty_obj(
+        {"o": {**empty_obj({"rows": rows}, ("rows",)), "enum": [{"rows": [{"tags": ["x", "x"]}]}]}},
+        ("o",),
+    )
+
+    suite = element_suite(body)
+
+    assert suite.cases[0].request_body.value == {"o": {"rows": [{"tags": ["x", "x"]}]}}  # type: ignore[union-attr]
+    assert array_values(suite) == []
+    pointer = f"{ARRAY_BODY_POINTER}/properties/o/enum"
+    assert array_conflicts(suite) == [("minItems", pointer), ("maxItems", pointer)]
+    assert all(
+        "'/o/rows/0/tags'" in item.message
+        for item in suite.diagnostics
+        if item.code == CONFLICT_CODE and item.message.startswith(("The minItems", "The maxItems"))
+    )
+
+
+def test_array_phase_three_blocks_candidates_below_an_absent_parent_under_a_literal() -> None:
+    body = empty_obj(
+        {"o": {**empty_obj({"meta": empty_obj({"tags": ELEMENT_TAGS}, ("tags",))}), "enum": [{}]}}, ("o",)
+    )
+
+    suite = element_suite(body)
+
+    assert suite.cases[0].request_body.value == {"o": {}}  # type: ignore[union-attr]
+    assert array_values(suite) == []
+    pointer = f"{ARRAY_BODY_POINTER}/properties/o/enum"
+    assert array_conflicts(suite) == [("minItems", pointer), ("maxItems", pointer)]
+
+
+def test_array_phase_three_absent_parent_own_literal_keeps_its_existing_code() -> None:
+    body = empty_obj(
+        {"meta": {**empty_obj({"tags": ELEMENT_TAGS}, ("tags",)), "enum": [{"tags": ["x", "x"]}]}}
+    )
+
+    suite = element_suite(body)
+
+    assert array_values(suite) == []
+    assert [item.code for item in suite.diagnostics if item.code.startswith("array_")] == [
+        "array_bound_no_safe_candidate"
+    ]
+    assert array_conflicts(suite) == []
+
+
+def test_enclosing_array_blocker_keeps_its_own_code_for_elements_of_present_arrays() -> None:
+    body = empty_obj(
+        {
+            "outer": empty_arr(
+                empty_obj({"tags": ELEMENT_TAGS}, ("tags",)), enum=[[{"tags": ["x", "x"]}]]
+            )
+        },
+        ("outer",),
+    )
+
+    suite = element_suite(body)
+
+    assert array_values(suite) == []
+    assert [item.code for item in suite.diagnostics if item.code.startswith("array_")] == [
+        "array_bound_no_safe_candidate"
+    ] * 2
+    assert array_conflicts(suite) == []
+
+
+def test_array_phase_three_keeps_candidates_below_an_absent_parent_without_a_literal() -> None:
+    suite = element_suite(empty_obj({"meta": empty_obj({"tags": ELEMENT_TAGS}, ("tags",))}))
+
+    assert {(path, constraint) for path, constraint, _ in array_values(suite)} == {
+        ("/meta/tags", "minItems"),
+        ("/meta/tags", "maxItems"),
+    }
+    assert array_conflicts(suite) == []
+
+
+def test_array_phase_four_splits_object_ancestor_and_array_literal_blocks() -> None:
+    # An enclosing array literal keeps the array code (final-body check of phase 4).
+    assert {code for code, _ in array_diagnostics(element_suite(ENCLOSING_ARRAY_BODY))} == {
+        "array_bound_no_safe_candidate"
+    }
+    # A root array literal is an array literal as well.
+    root = element_suite(empty_arr(TAGS_ITEM, enum=[[]]))
+    assert {code for code, _ in array_diagnostics(root)} == {"array_bound_no_safe_candidate"}
+    # An object ancestor above the empty array gets the shared code.
+    ancestor = element_suite(
+        empty_obj({"w": {**empty_obj({"rows": empty_arr(TAGS_ITEM)}, ("rows",)), "enum": [{"rows": []}]}}, ("w",))
+    )
+    pointer = f"{ARRAY_BODY_POINTER}/properties/w/enum"
+    assert array_diagnostics(ancestor) == [(CONFLICT_CODE, pointer)] * 2
+
+
+def test_array_phases_one_to_three_split_object_ancestor_and_array_literal_blocks() -> None:
+    items_literal = {**empty_obj({"tags": ELEMENT_TAGS}, ("tags",)), "enum": [{"tags": ["x", "x"]}]}
+    # Phase 1/2: the items schema literal blocks the element target with the array code.
+    rows = element_suite(empty_obj({"rows": empty_arr(items_literal)}, ("rows",)))
+    assert {code for code, _ in array_diagnostics(rows)} == {"array_bound_no_safe_candidate"}
+    # Phase 3 below an absent parent inside an element: the items literal keeps the array code ...
+    absent = empty_obj({"meta": empty_obj({"tags": ELEMENT_TAGS}, ("tags",))})
+    inner = element_suite(empty_obj({"outer": empty_arr({**absent, "enum": [{}]})}, ("outer",)))
+    assert {code for code, _ in array_diagnostics(inner)} == {"array_bound_no_safe_candidate"}
+    # ... and an object ancestor above the element gets the shared code.
+    above = element_suite(
+        empty_obj({"o": {**empty_obj({"outer": empty_arr(absent)}, ("outer",)), "enum": [{"outer": [{}]}]}}, ("o",))
+    )
+    assert {code for code, _ in array_diagnostics(above)} <= {CONFLICT_CODE}
+
+@pytest.mark.parametrize("keyword", ["enum", "const"])
+@pytest.mark.parametrize("parent", [False, True], ids=["phase-1-present", "phase-3-absent-parent"])
+def test_array_phases_one_to_three_never_violate_the_target_arrays_own_literal(
+    keyword: str, parent: bool
+) -> None:
+    positive = ["x", "x"]
+    literal = [positive] if keyword == "enum" else positive
+    tags = {**ELEMENT_TAGS, keyword: literal}
+    body = empty_obj({"meta": empty_obj({"tags": tags})}) if parent else empty_obj({"tags": tags}, ("tags",))
+    prefix = "/meta/tags" if parent else "/tags"
+
+    suite = element_suite(body)
+
+    # The literal accepts the positive body; no minItems/maxItems candidate may leave it.
+    assert generator_module._literal_accepts(tags, positive)
+    assert array_values(suite) == []
+    # The selection of a candidate already honors the array's own literal, so the reason keeps
+    # the existing code and the bound keyword; the ancestor-literal code is never used.
+    reported = array_diagnostics(suite)
+    assert [code for code, _ in reported] == ["array_bound_no_safe_candidate"] * 2
+    assert [pointer.rsplit("/", 1)[1] for _, pointer in reported] == ["minItems", "maxItems"]
+    assert all("/properties/tags/" in pointer for _, pointer in reported)
+    assert CONFLICT_CODE not in {item.code for item in suite.diagnostics if prefix in item.message}
+
+
+def test_array_phase_one_keeps_the_candidate_that_the_target_arrays_own_literal_accepts() -> None:
+    tags = {**ELEMENT_TAGS, "enum": [["x", "x"], ["x"]]}
+
+    suite = element_suite(empty_obj({"tags": tags}, ("tags",)))
+
+    assert array_values(suite) == [("/tags", "minItems", {"tags": ["x"]})]
+    assert [code for code, _ in array_diagnostics(suite)] == ["array_bound_no_safe_candidate"]
+
+
+@pytest.mark.parametrize("keyword", ["enum", "const"])
+def test_object_ancestor_with_an_inapplicable_items_keyword_uses_the_shared_code(keyword: str) -> None:
+    literal = [{"rows": []}] if keyword == "enum" else {"rows": []}
+    shape = {**empty_obj({"rows": empty_arr(TAGS_ITEM)}, ("rows",)), "items": {"type": "string"}, keyword: literal}
+
+    # The literal rejects the created element; "items" does not make "w" an array.
+    nested = element_suite(empty_obj({"w": shape}, ("w",)))
+    assert nested.cases[0].request_body.value == {"w": {"rows": []}}  # type: ignore[union-attr]
+    pointer = f"{ARRAY_BODY_POINTER}/properties/w/{keyword}"
+    assert array_diagnostics(nested) == [(CONFLICT_CODE, pointer)] * 2
+
+    # An object root with the same keyword behaves the same way.
+    root = element_suite(shape)
+    assert array_diagnostics(root) == [(CONFLICT_CODE, f"{ARRAY_BODY_POINTER}/{keyword}")] * 2
+
+
+def test_items_schema_literal_of_object_elements_keeps_the_array_code() -> None:
+    items = {**empty_obj({"tags": ELEMENT_TAGS}, ("tags",)), "enum": [{"tags": ["x", "x"]}]}
+    suite = element_suite(empty_obj({"rows": empty_arr(items)}, ("rows",)))
+
+    assert {code for code, _ in array_diagnostics(suite)} == {"array_bound_no_safe_candidate"}
+
+
+
+
+
+# Budgets.
+def test_blocked_candidates_do_not_consume_the_endpoint_case_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Retained: the root literal accepts nothing but the positive body, so only the three
+    # wrong-type candidates ... none; the case budget of 3 would not fit the unrestricted run.
+    plain = {name: {"type": "string", "example": "x"} for name in "abc"}
+    body = {**empty_obj(plain, tuple("abc")), "const": {"a": "x", "b": "x", "c": "x"}}
+    unrestricted = empty_obj(plain, tuple("abc"))
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_CASES", 3)
+
+    suite = generate_test_suite(make_result(post_endpoint(body)))
+    full = generate_test_suite(make_result(post_endpoint(unrestricted)))
+
+    assert "generation_case_budget_exceeded" not in {d.code for d in suite.diagnostics}
+    assert conflicts(suite)
+    assert "generation_case_budget_exceeded" in {d.code for d in full.diagnostics}
+
+
+def test_required_property_precharge_ignores_blocked_candidates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = {
+        **empty_obj({name: {"type": "string", "example": "x"} for name in "abc"}, tuple("abc")),
+        "enum": [{"a": "x", "b": "x", "c": "x"}, {"a": "x", "b": "x"}],
+    }
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_CASES", 3)
+
+    suite = generate_test_suite(make_result(post_endpoint(body)))
+
+    # Only the "c" omission is accepted by the enum; 2 other omissions are blocked,
+    # so the one retained case fits next to the positive case with no budget diagnostic.
+    required = [c for c in suite.cases if c.violated_constraint == "required_property"]
+    assert [c.affected_property for c in required] == ["/c"]
+    assert "generation_case_budget_exceeded" not in {d.code for d in suite.diagnostics}
+    assert [
+        item.message.split("'")[1]
+        for item in suite.diagnostics
+        if item.code == CONFLICT_CODE and item.message.startswith("The required_property")
+    ] == ["/a", "/b"]
+
+
+def test_blocked_candidates_do_not_consume_the_suite_case_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = {
+        **empty_obj({name: {"type": "string", "example": "x"} for name in "abc"}, tuple("abc")),
+        "const": {"a": "x", "b": "x", "c": "x"},
+    }
+    other = make_endpoint("/plain")
+    plain_count = len(generate_test_suite(make_result(post_endpoint(body), other)).cases)
+    monkeypatch.setattr(generator_module, "_MAX_SUITE_CASES", plain_count)
+
+    suite = generate_test_suite(make_result(post_endpoint(body), other))
+
+    assert len(suite.cases) == plain_count
+    assert "generation_case_budget_exceeded" not in {d.code for d in suite.diagnostics}
+
+
+def test_conflict_diagnostics_use_the_endpoint_diagnostic_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = empty_obj({"meta": meta_schema(enum=[META_POSITIVE])}, ("meta",))
+    full = element_suite(body)
+    assert sum(item.code == CONFLICT_CODE for item in full.diagnostics) > 2
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_DIAGNOSTICS", 2)
+
+    suite = element_suite(body)
+
+    codes = [item.code for item in suite.diagnostics]
+    assert codes.count(CONFLICT_CODE) == 2
+    assert codes[-1] == "generation_diagnostic_budget_exceeded"
+    assert "per-endpoint limit of 2" in suite.diagnostics[-1].message
+    # Truncation never affects the cases.
+    assert [c.case_id for c in suite.cases] == [c.case_id for c in full.cases]
+
+
+def test_conflict_diagnostics_use_the_suite_diagnostic_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(generator_module, "_MAX_SUITE_DIAGNOSTICS", 3)
+    body = empty_obj({"meta": meta_schema(enum=[META_POSITIVE])}, ("meta",))
+
+    suite = generate_test_suite(make_result(post_endpoint(body, "/one"), post_endpoint(body, "/two")))
+
+    codes = [item.code for item in suite.diagnostics]
+    assert codes.count(CONFLICT_CODE) == 3
+    assert codes[-1] == "generation_diagnostic_budget_exceeded"
+    assert suite.diagnostics[-1].endpoint_path is None
+    assert "per-suite limit of 3" in suite.diagnostics[-1].message
+
+
+def test_ancestor_literal_validation_is_deterministic_and_does_not_mutate_inputs() -> None:
+    body = empty_obj({"meta": meta_schema(enum=[META_POSITIVE])}, ("meta",))
+    before = deepcopy(body)
+
+    first = element_suite(body)
+    second = element_suite(body)
+
+    assert body == before
+    assert first.model_dump_json() == second.model_dump_json()
+
+
+@pytest.mark.parametrize("literal", [{}, {"enum": [META_POSITIVE]}])
+def test_ancestor_literal_validation_leaves_the_expansion_budget_unchanged(
+    monkeypatch: pytest.MonkeyPatch, literal: dict[str, object]
+) -> None:
+    # The lineage reuses the schemas the traversal already followed: the smallest
+    # per-endpoint expansion limit that still generates every step is 15 with or
+    # without a literal (it was 15 before the validation existed).
+    body = empty_obj({"meta": schema_reference("Meta")}, ("meta",))
+    schemas = {"Meta": meta_schema(**literal)}
+
+    def budget_codes(limit: int) -> set[str]:
+        monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_EXPANSIONS", limit)
+        return {item.code for item in element_suite(body, schemas).diagnostics} & {
+            "generation_expansion_budget_exceeded"
+        }
+
+    assert budget_codes(15) == set()
+    assert budget_codes(14) == {"generation_expansion_budget_exceeded"}

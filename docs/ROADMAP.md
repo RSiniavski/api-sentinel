@@ -121,9 +121,11 @@ Known limitations of Array Bounds Generation (the feature is implemented; these 
 - An absent optional parent object with `const` or `enum` is not created: no suitable enum member is selected, and `array_bound_no_safe_candidate` is reported at the literal keyword.
 - For an array with `uniqueItems: true`, `minItems`/`maxItems` violations that need more than one item are not generated (`array_bound_no_safe_candidate`), because the generator does not synthesize distinct valid item values.
 
-Known general limitation (not specific to Array Bounds):
+Ancestor literal validation (Step 8.37):
 
-- Negative-case generators do not consistently validate the final generated body against `const`/`enum` on present object ancestors (and the root). The array-bound phases 1-3 and the other negative steps (required property, wrong type, string and numeric bounds, enum/const) can produce a case that violates both the target constraint and such an ancestor literal. Array-bound phase 3 checks only the literal of the parent it creates, and enclosing array or `items` literals. Array-bound phase 4 checks `const`/`enum` along the whole path against the final body, but this is not implemented across all negative-generation steps.
+- Required property, wrong type, string and numeric boundaries and enum/const check `const`/`enum` on the root and on every strict ancestor against the final negative body. These steps exclude their own target schema where violating its constraint is intentional (wrong type, enum/const). Blocked candidates are not generated and are reported as `negative_case_ancestor_literal_conflict`; they do not consume case budgets, and the diagnostics use the existing diagnostic limits.
+- Array Bounds phases 1-4 check the same lineage, and (as phase 4 always did) also include the target array's own node. A literal on an array schema (also a root array) or on an `items` schema keeps `array_bound_no_safe_candidate`; object roots and object ancestors use `negative_case_ancestor_literal_conflict`. For phases 1-3 the target array's own literal is already honored when the candidate is chosen, so such a literal yields `array_bound_no_safe_candidate` at the bound keyword and the lineage check on the target node is a consistency guard.
+- Only literals on the schemas visited by the existing traversal are checked.
 
 Still planned:
 
