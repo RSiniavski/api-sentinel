@@ -4,9 +4,14 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
-from app.services.openapi.models import JsonValue, Schema, SecurityRequirement
+from app.services.openapi.models import (
+    JsonValue,
+    Schema,
+    SecurityRequirement,
+    Server,
+)
 
 
 class GeneratedModel(BaseModel):
@@ -31,6 +36,62 @@ class GeneratedBody(GeneratedModel):
     value: JsonValue
 
 
+class ResolvedResponseSchema(GeneratedModel):
+    """A response schema whose top-level local reference chain was followed.
+
+    `resolved` is a detached copy of the final component schema; references
+    nested inside it are not resolved.
+    """
+
+    reference_chain: tuple[str, ...]
+    # JSON Pointer of the declaration of the final, non-reference schema.
+    pointer: str
+    resolved: Schema
+
+
+class ResponseHeaderExpectation(GeneratedModel):
+    """A declared response header, kept as passive metadata.
+
+    Only the fields listed here are retained. `style` and `explode` are kept
+    only when declared; no default is applied and no serialization is implied.
+    """
+
+    name: str
+    reference_chain: tuple[str, ...] = ()
+    description: str | None = None
+    required: bool = False
+    deprecated: bool = False
+    header_schema: Schema | None = None
+    # Media type to schema for a header declared with `content`.
+    content_schemas: dict[str, Schema | None] | None = None
+    style: str | None = None
+    explode: bool | None = None
+    extensions: dict[str, JsonValue] = Field(default_factory=dict)
+
+
+class LinkRequestBody(GeneratedModel):
+    """A declared Link Object `requestBody`, so that an explicit null is kept."""
+
+    value: JsonValue
+
+
+class ResponseLinkExpectation(GeneratedModel):
+    """A declared response link, kept as passive metadata and never executed.
+
+    Runtime expressions inside `parameters` and `request_body` stay literal.
+    """
+
+    name: str
+    reference_chain: tuple[str, ...] = ()
+    operation_id: str | None = None
+    operation_ref: str | None = None
+    description: str | None = None
+    parameters: dict[str, JsonValue] = Field(default_factory=dict)
+    request_body: LinkRequestBody | None = None
+    server: Server | None = None
+    extensions: dict[str, JsonValue] = Field(default_factory=dict)
+
+
 class ResponseExpectation(GeneratedModel):
     """A declared response contract retained for later execution checks."""
 
@@ -38,6 +99,12 @@ class ResponseExpectation(GeneratedModel):
     media_types: tuple[str, ...]
     schemas_by_media_type: dict[str, Schema | None]
     response_reference_uri: str | None
+    # Only media types whose top-level schema `$ref` chain was resolved.
+    resolved_schemas_by_media_type: dict[str, ResolvedResponseSchema] = Field(
+        default_factory=dict
+    )
+    headers: tuple[ResponseHeaderExpectation, ...] = ()
+    links: tuple[ResponseLinkExpectation, ...] = ()
 
 
 class GenerationDiagnostic(GeneratedModel):

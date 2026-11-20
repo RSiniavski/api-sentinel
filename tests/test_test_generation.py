@@ -6,7 +6,7 @@ import json
 from copy import deepcopy
 
 import pytest
-from pydantic import ValidationError
+from pydantic import Field, ValidationError
 
 import app.services.test_generation.generator as generator_module
 from app.services.openapi.models import (
@@ -16,6 +16,7 @@ from app.services.openapi.models import (
     Endpoint,
     LocalReference,
     MediaType,
+    Model,
     NormalizationResult,
     Parameter,
     ParameterOverrideDiagnostic,
@@ -25,14 +26,20 @@ from app.services.openapi.models import (
     Schema,
     SecurityRequirement,
     SecurityScheme,
+    Server,
 )
+from app.services.openapi import normalize_openapi_document
 from app.services.test_generation import (
     GeneratedBody,
     GeneratedParameterValue,
     GeneratedTestCase,
     GeneratedTestSuite,
     GenerationDiagnostic,
+    LinkRequestBody,
+    ResolvedResponseSchema,
     ResponseExpectation,
+    ResponseHeaderExpectation,
+    ResponseLinkExpectation,
     build_case_id,
     generate_test_suite,
 )
@@ -4604,7 +4611,12 @@ def make_result_with_responses(
             openapi_version="3.1.1",
             info=ApiInfo(title="Generated API", version="1.0"),
             endpoints=endpoints,
-            components=Components(responses=responses),
+            components=Components(
+                responses=responses,
+                # NOT_FOUND_RESPONSE refers to it; a dangling response schema
+                # reference is now reported, so the fixture declares the target.
+                schemas={"Problem": Schema(raw={"type": "object"})},
+            ),
         )
     )
 
@@ -4655,6 +4667,13 @@ def test_direct_response_reference_is_resolved_into_the_expectation() -> None:
             "application/problem+json": None,
         },
         response_reference_uri="#/components/responses/NotFound",
+        resolved_schemas_by_media_type={
+            "application/json": ResolvedResponseSchema(
+                reference_chain=("#/components/schemas/Problem",),
+                pointer="/components/schemas/Problem",
+                resolved=Schema(raw={"type": "object"}),
+            )
+        },
     )
     assert expectation_for(suite, "200").response_reference_uri is None
 
@@ -4945,7 +4964,8 @@ def alias_chain_result(extra: tuple[Endpoint, ...] = ()) -> NormalizationResult:
 def test_response_reference_hops_are_charged_to_the_endpoint_expansion_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    assert count_expansions(alias_chain_result()) == 3
+    # Three response hops plus one hop for the referenced response schema.
+    assert count_expansions(alias_chain_result()) == 4
     monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_EXPANSIONS", 2)
 
     suite = generate_test_suite(
@@ -4966,7 +4986,8 @@ def test_response_reference_hops_are_charged_to_the_endpoint_expansion_budget(
 def test_response_reference_hops_are_charged_to_the_suite_expansion_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(generator_module, "_MAX_SUITE_EXPANSIONS", 2)
+    # Each endpoint costs two hops: the response and its response schema.
+    monkeypatch.setattr(generator_module, "_MAX_SUITE_EXPANSIONS", 4)
     endpoints = tuple(
         get_with_responses({"404": response_reference("NotFound")}, f"/e{index}")
         for index in range(4)
@@ -4981,7 +5002,7 @@ def test_response_reference_hops_are_charged_to_the_suite_expansion_budget(
         "generation_expansion_budget_exceeded"
     ]
     assert suite.diagnostics[0].endpoint_path == "/e2"
-    assert "per-suite limit of 2" in suite.diagnostics[0].message
+    assert "per-suite limit of 4" in suite.diagnostics[0].message
     assert "1 following endpoint(s)" in suite.diagnostics[0].message
 
 
@@ -14668,3 +14689,1368 @@ def test_optional_body_diagnostics_use_the_existing_diagnostic_budget(
 
     assert [item.code for item in suite.diagnostics] == ["generation_diagnostic_budget_exceeded"]
     assert suite.cases and suite.cases[0].request_body is None
+
+
+# --- Step 8.41.2: response schema references, headers and links ---
+
+JSON_MEDIA = "application/json"
+RESPONSES_POINTER = "/paths/~1items/get/responses"
+SCHEMA_SUFFIX = "content/application~1json/schema"
+ITEM_URI = "#/components/schemas/Item"
+ITEM_RAW: dict[str, object] = {
+    "type": "object",
+    "properties": {"id": {"type": "integer"}, "tags": {"$ref": "#/components/schemas/Tag"}},
+}
+RESPONSE_CODES = {
+    "unsupported_response_schema_reference",
+    "unsupported_response_header",
+    "unsupported_response_link",
+}
+
+
+def schema_response(raw: object, media_type: str = JSON_MEDIA) -> Response:
+    return Response(description="OK", content={media_type: MediaType(schema=Schema(raw=raw))})  # type: ignore[arg-type]
+
+
+def components_with(
+    schemas: dict[str, object] | None = None,
+    other: dict[str, dict[str, object]] | None = None,
+    responses: dict[str, Response | LocalReference] | None = None,
+) -> Components:
+    return Components(
+        schemas={name: Schema(raw=raw) for name, raw in (schemas or {}).items()},  # type: ignore[arg-type]
+        responses=responses or {},
+        other=other or {},  # type: ignore[arg-type]
+    )
+
+
+def response_suite(
+    responses: dict[str, Response | LocalReference],
+    components: Components | None = None,
+    *,
+    version: str = "3.1.1",
+    **endpoint_kwargs: object,
+) -> GeneratedTestSuite:
+    endpoint = make_endpoint("/items", responses=responses, **endpoint_kwargs)  # type: ignore[arg-type]
+    return generate_test_suite(make_result(endpoint, version=version, components=components))
+
+
+def baseline_expectation(suite: GeneratedTestSuite, status: str = "200") -> ResponseExpectation:
+    return next(
+        item for item in suite.cases[0].response_expectations if item.status_key == status
+    )
+
+
+def response_diagnostics(suite: GeneratedTestSuite) -> list[GenerationDiagnostic]:
+    return [item for item in suite.diagnostics if item.code in RESPONSE_CODES]
+
+
+def test_inline_response_schema_gets_no_resolved_snapshot() -> None:
+    suite = response_suite({"200": schema_response({"type": "string"})})
+
+    expectation = baseline_expectation(suite)
+    assert expectation.schemas_by_media_type == {JSON_MEDIA: Schema(raw={"type": "string"})}
+    assert expectation.resolved_schemas_by_media_type == {}
+    assert suite.diagnostics == ()
+
+
+@pytest.mark.parametrize("version", ["3.0.3", "3.1.1"])
+def test_direct_response_schema_reference_is_resolved_and_the_declared_schema_kept(
+    version: str,
+) -> None:
+    suite = response_suite(
+        {"200": schema_response({"$ref": ITEM_URI})},
+        components_with(schemas={"Item": ITEM_RAW}),
+        version=version,
+    )
+
+    expectation = baseline_expectation(suite)
+    assert expectation.schemas_by_media_type == {JSON_MEDIA: Schema(raw={"$ref": ITEM_URI})}
+    assert expectation.resolved_schemas_by_media_type == {
+        JSON_MEDIA: ResolvedResponseSchema(
+            reference_chain=(ITEM_URI,),
+            pointer="/components/schemas/Item",
+            resolved=Schema(raw=ITEM_RAW),  # type: ignore[arg-type]
+        )
+    }
+    assert suite.diagnostics == ()
+
+
+def test_response_schema_alias_chain_keeps_every_hop_and_the_final_pointer() -> None:
+    suite = response_suite(
+        {"200": schema_response({"$ref": "#/components/schemas/A"})},
+        components_with(
+            schemas={
+                "A": {"$ref": "#/components/schemas/B"},
+                "B": {"$ref": ITEM_URI},
+                "Item": {"type": "string"},
+            }
+        ),
+    )
+
+    snapshot = baseline_expectation(suite).resolved_schemas_by_media_type[JSON_MEDIA]
+    assert snapshot.reference_chain == (
+        "#/components/schemas/A",
+        "#/components/schemas/B",
+        ITEM_URI,
+    )
+    assert snapshot.pointer == "/components/schemas/Item"
+    assert snapshot.resolved == Schema(raw={"type": "string"})
+
+
+def test_nested_references_stay_unresolved_inside_the_resolved_snapshot() -> None:
+    suite = response_suite(
+        {"200": schema_response({"$ref": ITEM_URI})},
+        components_with(schemas={"Item": ITEM_RAW, "Tag": {"type": "string"}}),
+    )
+
+    resolved = baseline_expectation(suite).resolved_schemas_by_media_type[JSON_MEDIA].resolved
+    assert resolved.raw["properties"]["tags"] == {"$ref": "#/components/schemas/Tag"}  # type: ignore[index]
+
+
+def test_resolved_response_schema_hops_are_counted_once_per_traversal_hop() -> None:
+    result = make_result(
+        make_endpoint(
+            "/items", responses={"200": schema_response({"$ref": "#/components/schemas/A"})}
+        ),
+        components=components_with(
+            schemas={
+                "A": {"$ref": "#/components/schemas/B"},
+                "B": {"$ref": ITEM_URI},
+                "Item": {"type": "string"},
+            }
+        ),
+    )
+
+    assert count_expansions(result) == 3
+
+
+@pytest.mark.parametrize(
+    ("raw", "components", "pointer", "uri", "reason"),
+    [
+        (
+            {"$ref": "#/components/schemas/Nope"},
+            {},
+            f"{RESPONSES_POINTER}/200/{SCHEMA_SUFFIX}",
+            "#/components/schemas/Nope",
+            "target was not found",
+        ),
+        (
+            {"$ref": "#/components/schemas/A"},
+            {
+                "A": {"$ref": "#/components/schemas/B"},
+                "B": {"$ref": "#/components/schemas/A"},
+            },
+            "/components/schemas/B",
+            "#/components/schemas/A",
+            "cycle",
+        ),
+        (
+            {"$ref": "other.yaml#/Item"},
+            {},
+            f"{RESPONSES_POINTER}/200/{SCHEMA_SUFFIX}",
+            "other.yaml#/Item",
+            "references are supported",
+        ),
+        (
+            {"$ref": "#/components/parameters/Limit"},
+            {},
+            f"{RESPONSES_POINTER}/200/{SCHEMA_SUFFIX}",
+            "#/components/parameters/Limit",
+            "references are supported",
+        ),
+    ],
+)
+@pytest.mark.parametrize("version", ["3.0.3", "3.1.1"])
+def test_unusable_response_schema_reference_is_diagnosed_without_dropping_the_endpoint(
+    version: str,
+    raw: dict[str, object],
+    components: dict[str, object],
+    pointer: str,
+    uri: str,
+    reason: str,
+) -> None:
+    suite = response_suite(
+        {"200": schema_response(raw)}, components_with(schemas=components), version=version
+    )
+
+    assert [case.category for case in suite.cases] == ["positive"]
+    [diagnostic] = suite.diagnostics
+    assert diagnostic.code == "unsupported_response_schema_reference"
+    assert diagnostic.endpoint_path == "/items"
+    assert diagnostic.endpoint_method == "get"
+    assert diagnostic.source_pointer == pointer
+    assert diagnostic.reference_uri == uri
+    assert reason in diagnostic.message
+    expectation = baseline_expectation(suite)
+    assert expectation.resolved_schemas_by_media_type == {}
+    assert expectation.schemas_by_media_type == {JSON_MEDIA: Schema(raw=raw)}  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("version", ["3.0.3", "3.1.1"])
+def test_annotation_siblings_next_to_a_response_schema_reference_are_supported(
+    version: str,
+) -> None:
+    declared = {"$ref": ITEM_URI, "description": "d", "title": "t", "x-note": 1}
+    suite = response_suite(
+        {"200": schema_response(declared)},
+        components_with(schemas={"Item": {"type": "string"}}),
+        version=version,
+    )
+
+    expectation = baseline_expectation(suite)
+    assert suite.diagnostics == ()
+    # The resolved snapshot is the target; the declared schema keeps the siblings.
+    assert expectation.resolved_schemas_by_media_type[JSON_MEDIA].resolved == Schema(
+        raw={"type": "string"}
+    )
+    assert expectation.schemas_by_media_type[JSON_MEDIA] == Schema(raw=declared)
+
+
+@pytest.mark.parametrize("version", ["3.0.3", "3.1.1"])
+@pytest.mark.parametrize("sibling", [("type", "string"), ("minLength", 1), ("nullable", True)])
+def test_other_siblings_next_to_a_response_schema_reference_are_not_resolved(
+    version: str, sibling: tuple[str, object]
+) -> None:
+    key, value = sibling
+    declared = {"$ref": ITEM_URI, key: value}
+    suite = response_suite(
+        {"200": schema_response(declared)},
+        components_with(schemas={"Item": {"type": "string"}}),
+        version=version,
+    )
+
+    [diagnostic] = suite.diagnostics
+    assert diagnostic.code == "unsupported_response_schema_reference"
+    assert diagnostic.source_pointer == f"{RESPONSES_POINTER}/200/{SCHEMA_SUFFIX}/{key}"
+    assert diagnostic.reference_uri == ITEM_URI
+    assert "unsupported_schema_reference_siblings" in diagnostic.message
+    expectation = baseline_expectation(suite)
+    assert expectation.resolved_schemas_by_media_type == {}
+    assert expectation.schemas_by_media_type[JSON_MEDIA] == Schema(raw=declared)  # type: ignore[arg-type]
+
+
+def test_schema_failure_in_a_referenced_response_points_at_the_component() -> None:
+    suite = response_suite(
+        {"404": LocalReference(uri="#/components/responses/NotFound")},
+        components_with(
+            schemas={},
+            responses={"NotFound": schema_response({"$ref": "#/components/schemas/Gone"})},
+        ),
+    )
+
+    [diagnostic] = suite.diagnostics
+    assert diagnostic.source_pointer == f"/components/responses/NotFound/{SCHEMA_SUFFIX}"
+    assert diagnostic.reference_uri == "#/components/schemas/Gone"
+    assert baseline_expectation(suite, "404").response_reference_uri == (
+        "#/components/responses/NotFound"
+    )
+
+
+def test_response_diagnostics_are_ordered_by_status_then_media_type_and_deduplicated() -> None:
+    shared = Response(
+        description="Shared",
+        content={
+            "text/plain": MediaType(schema=Schema(raw={"$ref": "#/components/schemas/B"})),
+            JSON_MEDIA: MediaType(schema=Schema(raw={"$ref": "#/components/schemas/A"})),
+        },
+    )
+    suite = response_suite(
+        {
+            "default": LocalReference(uri="#/components/responses/Shared"),
+            "404": LocalReference(uri="#/components/responses/Shared"),
+            "200": schema_response({"$ref": "#/components/schemas/Z"}),
+        },
+        components_with(responses={"Shared": shared}),
+    )
+
+    assert [(item.source_pointer, item.reference_uri) for item in suite.diagnostics] == [
+        (f"{RESPONSES_POINTER}/200/{SCHEMA_SUFFIX}", "#/components/schemas/Z"),
+        (f"/components/responses/Shared/{SCHEMA_SUFFIX}", "#/components/schemas/A"),
+        (
+            "/components/responses/Shared/content/text~1plain/schema",
+            "#/components/schemas/B",
+        ),
+    ]
+
+
+def test_response_diagnostics_follow_the_existing_parameter_diagnostics() -> None:
+    optional = Parameter(
+        name="q", location="query", required=False,
+        schema=Schema(raw={"type": "string", "pattern": "^(a)$"}), source_scope="operation",
+    )
+    suite = response_suite(
+        {"200": schema_response({"$ref": "#/components/schemas/Nope"})},
+        parameters=(optional,),
+    )
+
+    assert [item.code for item in suite.diagnostics] == [
+        "optional_parameter_unsupported_schema",
+        "unsupported_response_schema_reference",
+    ]
+
+
+def test_response_schema_resolution_budget_exhaustion_is_not_an_unsupported_reference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_EXPANSIONS", 2)
+    components = components_with(
+        schemas={
+            "A": {"$ref": "#/components/schemas/B"},
+            "B": {"$ref": ITEM_URI},
+            "Item": {"type": "string"},
+        }
+    )
+    suite = generate_test_suite(
+        make_result(
+            make_endpoint(
+                "/items", responses={"200": schema_response({"$ref": "#/components/schemas/A"})}
+            ),
+            make_endpoint("/plain"),
+            components=components,
+        )
+    )
+
+    assert [case.path for case in suite.cases] == ["/plain"]
+    assert [item.code for item in suite.diagnostics] == ["generation_expansion_budget_exceeded"]
+    assert suite.diagnostics[0].endpoint_path == "/items"
+    assert "per-endpoint limit of 2" in suite.diagnostics[0].message
+
+
+def test_resolved_response_schemas_are_isolated_from_components_and_other_cases() -> None:
+    query = Parameter(
+        name="q", location="query", required=True,
+        schema=Schema(raw={"type": "string"}), source_scope="operation",
+    )
+    components = components_with(schemas={"Item": ITEM_RAW})
+    result = make_result(
+        make_endpoint(
+            "/items",
+            parameters=(query,),
+            responses={"200": schema_response({"$ref": ITEM_URI})},
+        ),
+        components=components,
+    )
+    before = result.model_dump_json()
+
+    suite = generate_test_suite(result)
+
+    assert len(suite.cases) >= 2
+    snapshots = [
+        case.response_expectations[0].resolved_schemas_by_media_type[JSON_MEDIA].resolved
+        for case in suite.cases
+    ]
+    assert snapshots[0].raw is not snapshots[1].raw
+    assert snapshots[0].raw is not components.schemas["Item"].raw
+    snapshots[0].raw["properties"]["id"]["type"] = "string"  # type: ignore[index]
+    assert snapshots[1].raw["properties"]["id"]["type"] == "integer"  # type: ignore[index]
+    assert result.model_dump_json() == before
+    fresh = generate_test_suite(result).cases[0].response_expectations[0]
+    assert fresh.resolved_schemas_by_media_type[JSON_MEDIA].resolved.raw["properties"]["id"][  # type: ignore[index]
+        "type"
+    ] == "integer"
+
+
+# Response headers
+
+
+def header_response(headers: dict[str, object]) -> Response:
+    return Response(description="OK", headers=headers)  # type: ignore[arg-type]
+
+
+def test_inline_response_headers_keep_the_approved_metadata_in_name_order() -> None:
+    suite = response_suite(
+        {
+            "200": header_response(
+                {
+                    "X-Rate": {
+                        "description": "Remaining",
+                        "required": True,
+                        "deprecated": True,
+                        "schema": {"$ref": "#/components/schemas/Rate"},
+                        "style": "simple",
+                        "explode": False,
+                    },
+                    "X-Alpha": {"schema": {"type": "string"}},
+                }
+            )
+        }
+    )
+
+    headers = baseline_expectation(suite).headers
+    assert [header.name for header in headers] == ["X-Alpha", "X-Rate"]
+    assert headers[0] == ResponseHeaderExpectation(
+        name="X-Alpha", header_schema=Schema(raw={"type": "string"})
+    )
+    assert headers[1] == ResponseHeaderExpectation(
+        name="X-Rate",
+        description="Remaining",
+        required=True,
+        deprecated=True,
+        # A header schema is kept as declared; it is not resolved.
+        header_schema=Schema(raw={"$ref": "#/components/schemas/Rate"}),
+        style="simple",
+        explode=False,
+    )
+    assert suite.diagnostics == ()
+
+
+def test_component_header_reference_and_alias_chain_are_resolved() -> None:
+    suite = response_suite(
+        {"200": header_response({"X-Rate": LocalReference(uri="#/components/headers/A")})},
+        components_with(
+            other={
+                "headers": {
+                    "A": LocalReference(uri="#/components/headers/B"),
+                    "B": {"description": "Remaining", "schema": {"type": "integer"}},
+                }
+            }
+        ),
+    )
+
+    [header] = baseline_expectation(suite).headers
+    assert header.name == "X-Rate"
+    assert header.reference_chain == ("#/components/headers/A", "#/components/headers/B")
+    assert header.description == "Remaining"
+    assert header.header_schema == Schema(raw={"type": "integer"})
+    assert suite.diagnostics == ()
+
+
+def test_header_content_keeps_the_single_media_type_schema() -> None:
+    suite = response_suite(
+        {
+            "200": header_response(
+                {"X-Json": {"content": {JSON_MEDIA: {"schema": {"type": "object"}}}}}
+            )
+        }
+    )
+
+    [header] = baseline_expectation(suite).headers
+    assert header.content_schemas == {JSON_MEDIA: Schema(raw={"type": "object"})}
+    assert header.header_schema is None
+
+
+@pytest.mark.parametrize(
+    ("definition", "pointer_suffix"),
+    [
+        ({"content": {JSON_MEDIA: {}, "text/plain": {}}}, "content"),
+        ({"content": {}}, "content"),
+        ({"schema": {"type": "string"}, "content": {JSON_MEDIA: {}}}, ""),
+        ({"content": {JSON_MEDIA: "not-an-object"}}, "content/application~1json"),
+        ({"schema": "string"}, "schema"),
+        ({"schema": {}, "required": "yes"}, "required"),
+        ({"schema": {}, "deprecated": 1}, "deprecated"),
+        ({"schema": {}, "description": 5}, "description"),
+        ({"schema": {}, "style": ["simple"]}, "style"),
+        ({"schema": {}, "explode": "no"}, "explode"),
+        ({"schema": {}, "name": "X-Bad"}, "name"),
+        ({"schema": {}, "in": "header"}, "in"),
+    ],
+)
+def test_unsupported_or_malformed_header_is_diagnosed_and_the_rest_is_kept(
+    definition: dict[str, object], pointer_suffix: str
+) -> None:
+    suite = response_suite(
+        {
+            "200": header_response(
+                {"X-Bad": definition, "X-Good": {"required": True, "schema": {}}}
+            ),
+            "404": Response(description="Missing"),
+        }
+    )
+
+    assert [case.category for case in suite.cases] == ["positive"]
+    [diagnostic] = suite.diagnostics
+    assert diagnostic.code == "unsupported_response_header"
+    expected = f"{RESPONSES_POINTER}/200/headers/X-Bad"
+    assert diagnostic.source_pointer == (
+        f"{expected}/{pointer_suffix}" if pointer_suffix else expected
+    )
+    assert diagnostic.reference_uri is None
+    assert [header.name for header in baseline_expectation(suite).headers] == ["X-Good"]
+    assert [item.status_key for item in suite.cases[0].response_expectations] == ["200", "404"]
+
+
+def test_content_type_response_header_is_ignored_in_any_case_without_a_diagnostic() -> None:
+    suite = response_suite(
+        {
+            "200": header_response(
+                {
+                    "Content-Type": {"required": "malformed"},
+                    "content-type": LocalReference(uri="#/components/headers/Missing"),
+                    "X-Kept": {"schema": {}},
+                }
+            )
+        }
+    )
+
+    assert [header.name for header in baseline_expectation(suite).headers] == ["X-Kept"]
+    assert suite.diagnostics == ()
+
+
+@pytest.mark.parametrize(
+    ("entry", "other", "pointer", "uri", "reason"),
+    [
+        (
+            LocalReference(uri="#/components/headers/Nope"),
+            {},
+            f"{RESPONSES_POINTER}/200/headers/X-H",
+            "#/components/headers/Nope",
+            "target was not found",
+        ),
+        (
+            LocalReference(uri="#/components/headers/A"),
+            {
+                "A": LocalReference(uri="#/components/headers/B"),
+                "B": LocalReference(uri="#/components/headers/A"),
+            },
+            "/components/headers/B",
+            "#/components/headers/A",
+            "cycle",
+        ),
+        (
+            LocalReference(uri="#/components/schemas/Item"),
+            {},
+            f"{RESPONSES_POINTER}/200/headers/X-H",
+            "#/components/schemas/Item",
+            "references are supported",
+        ),
+        (
+            LocalReference(uri="#/components/headers/H"),
+            {"H": {"schema": {}, "required": "yes"}},
+            "/components/headers/H/required",
+            "#/components/headers/H",
+            "must be a boolean",
+        ),
+    ],
+)
+def test_header_reference_failures_use_the_most_precise_pointer(
+    entry: LocalReference, other: dict[str, object], pointer: str, uri: str, reason: str
+) -> None:
+    suite = response_suite(
+        {"200": header_response({"X-H": entry})},
+        components_with(other={"headers": other} if other else {}),
+    )
+
+    [diagnostic] = suite.diagnostics
+    assert diagnostic.code == "unsupported_response_header"
+    assert diagnostic.source_pointer == pointer
+    assert diagnostic.reference_uri == uri
+    assert reason in diagnostic.message
+    assert baseline_expectation(suite).headers == ()
+    assert len(suite.cases) == 1
+
+
+def test_header_diagnostics_follow_schema_diagnostics_and_header_name_order() -> None:
+    response = Response(
+        description="OK",
+        content={JSON_MEDIA: MediaType(schema=Schema(raw={"$ref": "#/components/schemas/Nope"}))},
+        headers={  # type: ignore[arg-type]
+            "X-B": {"schema": {}, "required": 1},
+            "X-A": {"schema": {}, "required": 1},
+        },  # type: ignore[arg-type]
+    )
+    suite = response_suite({"200": response})
+
+    assert [item.code for item in suite.diagnostics] == [
+        "unsupported_response_schema_reference",
+        "unsupported_response_header",
+        "unsupported_response_header",
+    ]
+    assert [item.source_pointer for item in suite.diagnostics[1:]] == [
+        f"{RESPONSES_POINTER}/200/headers/X-A/required",
+        f"{RESPONSES_POINTER}/200/headers/X-B/required",
+    ]
+
+
+def test_header_reference_hops_are_charged_and_exhaustion_stays_a_budget_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    components = components_with(
+        other={
+            "headers": {
+                "A": LocalReference(uri="#/components/headers/B"),
+                "B": LocalReference(uri="#/components/headers/C"),
+                "C": {},
+            }
+        }
+    )
+    result = make_result(
+        make_endpoint(
+            "/items",
+            responses={"200": header_response({"X": LocalReference(uri="#/components/headers/A")})},
+        ),
+        components=components,
+    )
+    assert count_expansions(result) == 3
+
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_EXPANSIONS", 2)
+    suite = generate_test_suite(result)
+
+    assert suite.cases == ()
+    assert [item.code for item in suite.diagnostics] == ["generation_expansion_budget_exceeded"]
+
+
+# Response links
+
+
+def link_response(links: dict[str, object]) -> Response:
+    return Response(description="OK", links=links)  # type: ignore[arg-type]
+
+
+def test_inline_link_keeps_runtime_expressions_literal_and_sorts_by_name() -> None:
+    suite = response_suite(
+        {
+            "200": link_response(
+                {
+                    "Zeta": {"operationRef": "#/paths/~1a/get"},
+                    "GetUser": {
+                        "operationId": "getUser",
+                        "description": "The user",
+                        "parameters": {
+                            "userId": "$response.body#/id",
+                            "tenant": "{$request.path.tenant}",
+                            "fixed": 7,
+                        },
+                        "requestBody": "$request.body#/payload",
+                        "server": {
+                            "url": "https://{env}.example.com",
+                            "description": "Env",
+                            "variables": {"env": {"default": "api"}},
+                            "x-note": True,
+                        },
+                    },
+                }
+            )
+        }
+    )
+
+    links = baseline_expectation(suite).links
+    assert [link.name for link in links] == ["GetUser", "Zeta"]
+    assert links[0] == ResponseLinkExpectation(
+        name="GetUser",
+        operation_id="getUser",
+        description="The user",
+        parameters={
+            "fixed": 7,
+            "tenant": "{$request.path.tenant}",
+            "userId": "$response.body#/id",
+        },
+        request_body=LinkRequestBody(value="$request.body#/payload"),
+        server=Server(
+            url="https://{env}.example.com",
+            description="Env",
+            variables={"env": {"default": "api"}},
+            extensions={"x-note": True},
+        ),
+    )
+    assert links[1] == ResponseLinkExpectation(name="Zeta", operation_ref="#/paths/~1a/get")
+    assert suite.diagnostics == ()
+
+
+def test_link_request_body_distinguishes_an_explicit_null_from_an_absent_body() -> None:
+    suite = response_suite(
+        {
+            "200": link_response(
+                {"Absent": {"operationId": "a"}, "Null": {"operationId": "n", "requestBody": None}}
+            )
+        }
+    )
+
+    absent, null = baseline_expectation(suite).links
+    assert absent.request_body is None
+    assert null.request_body == LinkRequestBody(value=None)
+
+
+def test_component_link_reference_and_alias_chain_are_resolved() -> None:
+    suite = response_suite(
+        {"200": link_response({"Next": LocalReference(uri="#/components/links/A")})},
+        components_with(
+            other={
+                "links": {
+                    "A": LocalReference(uri="#/components/links/B"),
+                    "B": {"operationId": "getNext"},
+                }
+            }
+        ),
+    )
+
+    [link] = baseline_expectation(suite).links
+    assert link.reference_chain == ("#/components/links/A", "#/components/links/B")
+    assert link.operation_id == "getNext"
+    assert suite.diagnostics == ()
+
+
+@pytest.mark.parametrize(
+    ("definition", "pointer_suffix"),
+    [
+        ({"operationId": "a", "operationRef": "#/x"}, ""),
+        ({"operationId": 5}, "operationId"),
+        ({"operationId": "a", "description": []}, "description"),
+        ({"operationId": "a", "parameters": ["id"]}, "parameters"),
+        ({"operationId": "a", "server": "https://example.com"}, "server"),
+        ({"operationId": "a", "server": {"description": "no url"}}, "server/url"),
+        ({"operationId": "a", "server": {"url": "u", "variables": {"v": 1}}}, "server/variables/v"),
+    ],
+)
+def test_unsupported_or_malformed_link_is_diagnosed_and_the_rest_is_kept(
+    definition: dict[str, object], pointer_suffix: str
+) -> None:
+    suite = response_suite(
+        {"200": link_response({"Bad": definition, "Good": {"operationId": "ok"}})}
+    )
+
+    assert [case.category for case in suite.cases] == ["positive"]
+    [diagnostic] = suite.diagnostics
+    assert diagnostic.code == "unsupported_response_link"
+    expected = f"{RESPONSES_POINTER}/200/links/Bad"
+    assert diagnostic.source_pointer == (
+        f"{expected}/{pointer_suffix}" if pointer_suffix else expected
+    )
+    assert [link.name for link in baseline_expectation(suite).links] == ["Good"]
+
+
+@pytest.mark.parametrize(
+    ("entry", "other", "pointer", "uri"),
+    [
+        (
+            LocalReference(uri="#/components/links/Nope"),
+            {},
+            f"{RESPONSES_POINTER}/200/links/L",
+            "#/components/links/Nope",
+        ),
+        (
+            LocalReference(uri="#/components/links/A"),
+            {
+                "A": LocalReference(uri="#/components/links/B"),
+                "B": LocalReference(uri="#/components/links/A"),
+            },
+            "/components/links/B",
+            "#/components/links/A",
+        ),
+        (
+            LocalReference(uri="#/components/links/L"),
+            {"L": {"operationId": 1}},
+            "/components/links/L/operationId",
+            "#/components/links/L",
+        ),
+    ],
+)
+def test_link_reference_failures_use_the_most_precise_pointer(
+    entry: LocalReference, other: dict[str, object], pointer: str, uri: str
+) -> None:
+    suite = response_suite(
+        {"200": link_response({"L": entry})},
+        components_with(other={"links": other} if other else {}),
+    )
+
+    [diagnostic] = suite.diagnostics
+    assert diagnostic.code == "unsupported_response_link"
+    assert diagnostic.source_pointer == pointer
+    assert diagnostic.reference_uri == uri
+    assert baseline_expectation(suite).links == ()
+
+
+def test_links_do_not_add_cases_or_change_case_identity() -> None:
+    plain = response_suite({"200": Response(description="OK")})
+    linked = response_suite(
+        {"200": link_response({"Next": {"operationId": "getNext"}})}
+    )
+
+    assert [case.case_id for case in linked.cases] == [case.case_id for case in plain.cases]
+    assert [case.category for case in linked.cases] == [case.category for case in plain.cases]
+    assert linked.cases[0].request_body is None
+
+
+def test_header_and_link_data_is_isolated_between_cases_and_from_the_input() -> None:
+    query = Parameter(
+        name="q", location="query", required=True,
+        schema=Schema(raw={"type": "string"}), source_scope="operation",
+    )
+    result = make_result(
+        make_endpoint(
+            "/items",
+            parameters=(query,),
+            responses={
+                "200": Response(
+                    description="OK",
+                    headers={"X": {"schema": {"type": "object"}}},  # type: ignore[arg-type]
+                    links={"L": {"operationId": "x", "parameters": {"p": {"k": ["v"]}}}},  # type: ignore[arg-type]
+                )
+            },
+        )
+    )
+    before = result.model_dump_json()
+
+    suite = generate_test_suite(result)
+
+    first, second = (case.response_expectations[0] for case in suite.cases[:2])
+    first.headers[0].header_schema.raw["type"] = "string"  # type: ignore[union-attr, index]
+    first.links[0].parameters["p"]["k"].append("changed")  # type: ignore[index, union-attr]
+    assert second.headers[0].header_schema.raw["type"] == "object"  # type: ignore[union-attr, index]
+    assert second.links[0].parameters["p"]["k"] == ["v"]  # type: ignore[index]
+    assert result.model_dump_json() == before
+
+
+# Compatibility
+
+
+def test_response_expectation_new_fields_default_and_old_serialized_data_still_loads() -> None:
+    old_json = json.dumps(
+        {
+            "status_key": "200",
+            "media_types": [],
+            "schemas_by_media_type": {},
+            "response_reference_uri": None,
+        }
+    )
+
+    restored = ResponseExpectation.model_validate_json(old_json)
+
+    assert restored.resolved_schemas_by_media_type == {}
+    assert restored.headers == ()
+    assert restored.links == ()
+    assert restored == ResponseExpectation(
+        status_key="200", media_types=(), schemas_by_media_type={}, response_reference_uri=None
+    )
+
+
+def test_suite_with_resolved_schemas_headers_and_links_round_trips_through_json() -> None:
+    suite = response_suite(
+        {
+            "200": Response(
+                description="OK",
+                content={JSON_MEDIA: MediaType(schema=Schema(raw={"$ref": ITEM_URI}))},
+                headers={"X": {"description": "h", "schema": {"type": "integer"}}},  # type: ignore[arg-type]
+                links={
+                    "L": {
+                        "operationId": "x",
+                        "requestBody": None,
+                        "server": {"url": "https://example.com"},
+                    }
+                },  # type: ignore[arg-type]
+            )
+        },
+        components_with(schemas={"Item": {"type": "string"}}),
+    )
+
+    restored = GeneratedTestSuite.model_validate_json(suite.model_dump_json())
+
+    assert restored == suite
+    assert restored.cases[0].response_expectations[0].links[0].request_body == LinkRequestBody(
+        value=None
+    )
+
+
+@pytest.mark.parametrize("version", ["3.0.3", "3.1.1"])
+def test_normalized_document_resolves_response_schema_header_and_link_references(
+    version: str,
+) -> None:
+    document = {
+        "openapi": version,
+        "info": {"title": "T", "version": "1"},
+        "paths": {
+            "/items": {
+                "get": {
+                    "responses": {
+                        "200": {
+                            "description": "OK",
+                            "content": {JSON_MEDIA: {"schema": {"$ref": ITEM_URI}}},
+                            "headers": {
+                                "X-Rate": {"$ref": "#/components/headers/Rate"},
+                                "Content-Type": {"schema": {"type": "string"}},
+                            },
+                            "links": {"Next": {"$ref": "#/components/links/Next"}},
+                        }
+                    }
+                }
+            }
+        },
+        "components": {
+            "schemas": {"Item": {"type": "string"}},
+            "headers": {"Rate": {"schema": {"type": "integer"}}},
+            "links": {"Next": {"operationId": "getItems"}},
+        },
+    }
+
+    suite = generate_test_suite(normalize_openapi_document(document))
+
+    expectation = baseline_expectation(suite)
+    assert suite.diagnostics == ()
+    assert expectation.resolved_schemas_by_media_type[JSON_MEDIA].resolved == Schema(
+        raw={"type": "string"}
+    )
+    assert [header.name for header in expectation.headers] == ["X-Rate"]
+    assert expectation.headers[0].reference_chain == ("#/components/headers/Rate",)
+    assert [link.name for link in expectation.links] == ["Next"]
+    assert expectation.links[0].operation_id == "getItems"
+
+
+# --- Step 8.41.3: response metadata validation corrections ---
+
+HEADER_POINTER = f"{RESPONSES_POINTER}/200/headers/X-H"
+LINK_POINTER = f"{RESPONSES_POINTER}/200/links/L"
+
+
+def only_header_diagnostic(
+    definition: dict[str, object], other: dict[str, dict[str, object]] | None = None
+) -> GenerationDiagnostic:
+    suite = response_suite(
+        {"200": header_response({"X-H": definition, "X-Ok": {"schema": {}}})},
+        components_with(other=other),
+    )
+    assert [header.name for header in baseline_expectation(suite).headers] == ["X-Ok"]
+    assert [case.category for case in suite.cases] == ["positive"]
+    [diagnostic] = suite.diagnostics
+    assert diagnostic.code == "unsupported_response_header"
+    return diagnostic
+
+
+def only_link_diagnostic(
+    definition: dict[str, object], other: dict[str, dict[str, object]] | None = None
+) -> GenerationDiagnostic:
+    suite = response_suite(
+        {"200": link_response({"L": definition, "Ok": {"operationId": "ok"}})},
+        components_with(other=other),
+    )
+    assert [link.name for link in baseline_expectation(suite).links] == ["Ok"]
+    assert [case.category for case in suite.cases] == ["positive"]
+    [diagnostic] = suite.diagnostics
+    assert diagnostic.code == "unsupported_response_link"
+    return diagnostic
+
+
+@pytest.mark.parametrize(
+    ("definition", "expected_message"),
+    [
+        ({"description": "no target"}, "exactly one of operationId or operationRef"),
+        ({"operationId": "a", "operationRef": "#/paths/~1a/get"}, "mutually exclusive"),
+    ],
+)
+def test_link_without_or_with_both_operation_identifiers_is_diagnosed(
+    definition: dict[str, object], expected_message: str
+) -> None:
+    diagnostic = only_link_diagnostic(definition)
+
+    assert diagnostic.source_pointer == LINK_POINTER
+    assert expected_message in diagnostic.message
+
+
+@pytest.mark.parametrize(
+    "definition", [{"operationId": "getItems"}, {"operationRef": "#/paths/~1items/get"}]
+)
+def test_link_with_exactly_one_operation_identifier_is_kept(
+    definition: dict[str, object],
+) -> None:
+    suite = response_suite({"200": link_response({"L": definition})})
+
+    [link] = baseline_expectation(suite).links
+    assert (link.operation_id, link.operation_ref) == (
+        definition.get("operationId"),
+        definition.get("operationRef"),
+    )
+    assert suite.diagnostics == ()
+
+
+def test_link_target_operation_is_not_resolved_or_validated() -> None:
+    suite = response_suite({"200": link_response({"L": {"operationId": "doesNotExist"}})})
+
+    assert suite.diagnostics == ()
+    assert baseline_expectation(suite).links[0].operation_id == "doesNotExist"
+
+
+def test_link_extensions_are_preserved_and_unknown_fields_are_reported() -> None:
+    suite = response_suite(
+        {"200": link_response({"L": {"operationId": "a", "x-note": {"k": [1]}}})}
+    )
+    assert baseline_expectation(suite).links[0].extensions == {"x-note": {"k": [1]}}
+
+    diagnostic = only_link_diagnostic({"operationId": "a", "unknownField": 1})
+    assert diagnostic.source_pointer == f"{LINK_POINTER}/unknownField"
+
+
+@pytest.mark.parametrize(
+    ("variable", "pointer_suffix"),
+    [
+        ({}, "default"),
+        ({"default": 1}, "default"),
+        ({"default": "a", "enum": "a"}, "enum"),
+        ({"default": "a", "enum": ["a", 2]}, "enum"),
+        ({"default": "a", "description": 5}, "description"),
+        ({"default": "a", "unknown": 1}, "unknown"),
+        ({"default": "a", "x-note": 1, "other": 1}, "other"),
+    ],
+)
+def test_malformed_link_server_variables_are_diagnosed_with_a_precise_pointer(
+    variable: dict[str, object], pointer_suffix: str
+) -> None:
+    diagnostic = only_link_diagnostic(
+        {"operationId": "a", "server": {"url": "https://{env}.example.com", "variables": {"env": variable}}}
+    )
+
+    assert diagnostic.source_pointer == f"{LINK_POINTER}/server/variables/env/{pointer_suffix}"
+
+
+def test_valid_link_server_variables_are_kept_verbatim_with_extensions() -> None:
+    variable = {"default": "api", "enum": ["api", "dev"], "description": "d", "x-note": [1]}
+    suite = response_suite(
+        {
+            "200": link_response(
+                {
+                    "L": {
+                        "operationId": "a",
+                        "server": {"url": "https://{env}.example.com", "variables": {"env": variable}},
+                    }
+                }
+            )
+        }
+    )
+
+    server = baseline_expectation(suite).links[0].server
+    assert server is not None and server.variables == {"env": variable}
+    assert suite.diagnostics == ()
+
+
+def test_unknown_link_server_field_is_reported_and_extensions_are_kept() -> None:
+    diagnostic = only_link_diagnostic(
+        {"operationId": "a", "server": {"url": "u", "unknown": 1}}
+    )
+    assert diagnostic.source_pointer == f"{LINK_POINTER}/server/unknown"
+
+
+def test_server_model_validation_errors_become_link_diagnostics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The repository's Server model accepts any JSON object as a variable, so a
+    # stricter model is substituted to prove that its ValidationError is
+    # converted instead of escaping.
+    class StrictVariable(Model):
+        default: str
+        enum: list[str]
+
+    class StrictServer(Model):
+        url: str
+        description: str | None = None
+        variables: dict[str, StrictVariable] = Field(default_factory=dict)
+        extensions: dict[str, object] = Field(default_factory=dict)
+
+    monkeypatch.setattr(generator_module, "Server", StrictServer)
+
+    diagnostic = only_link_diagnostic(
+        {
+            "operationId": "a",
+            "server": {"url": "https://{env}.example.com", "variables": {"env": {"default": "api"}}},
+        }
+    )
+
+    assert diagnostic.source_pointer == f"{LINK_POINTER}/server/variables/env/enum"
+    assert diagnostic.message.startswith("Invalid link server:")
+
+
+def test_server_validation_error_for_an_extension_points_inside_the_server(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class StrictServer(Model):
+        url: str
+        description: str | None = None
+        variables: dict[str, dict[str, object]] = Field(default_factory=dict)
+        extensions: dict[str, int] = Field(default_factory=dict)
+
+    monkeypatch.setattr(generator_module, "Server", StrictServer)
+
+    diagnostic = only_link_diagnostic(
+        {"operationId": "a", "server": {"url": "u", "x-count": "not-an-int"}}
+    )
+
+    assert diagnostic.source_pointer == f"{LINK_POINTER}/server/x-count"
+
+
+# Header Object requirements
+
+
+def test_header_with_neither_schema_nor_content_is_diagnosed() -> None:
+    diagnostic = only_header_diagnostic({"description": "no schema"})
+
+    assert diagnostic.source_pointer == HEADER_POINTER
+    assert "exactly one of schema or content" in diagnostic.message
+
+
+def test_header_with_both_schema_and_content_is_diagnosed() -> None:
+    diagnostic = only_header_diagnostic(
+        {"schema": {}, "content": {JSON_MEDIA: {"schema": {}}}}
+    )
+
+    assert diagnostic.source_pointer == HEADER_POINTER
+    assert "both schema and content" in diagnostic.message
+
+
+def test_header_style_must_be_simple_when_present() -> None:
+    diagnostic = only_header_diagnostic({"schema": {}, "style": "form"})
+    assert diagnostic.source_pointer == f"{HEADER_POINTER}/style"
+    assert "'simple'" in diagnostic.message
+
+    suite = response_suite({"200": header_response({"X-H": {"schema": {}, "style": "simple"}})})
+    assert baseline_expectation(suite).headers[0].style == "simple"
+    assert suite.diagnostics == ()
+
+
+@pytest.mark.parametrize(
+    "field", ["allowEmptyValue", "allowReserved", "example", "examples", "unknownField"]
+)
+def test_unretained_header_fields_are_reported_not_silently_dropped(field: str) -> None:
+    diagnostic = only_header_diagnostic({"schema": {}, field: True})
+
+    assert diagnostic.source_pointer == f"{HEADER_POINTER}/{field}"
+    assert f"'{field}'" in diagnostic.message
+
+
+def test_header_extensions_are_preserved() -> None:
+    suite = response_suite(
+        {"200": header_response({"X-H": {"schema": {}, "x-b": 2, "x-a": {"k": [1]}}})}
+    )
+
+    [header] = baseline_expectation(suite).headers
+    assert header.extensions == {"x-a": {"k": [1]}, "x-b": 2}
+    assert suite.diagnostics == ()
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "message"),
+    [
+        ("example", {"a": 1}, "'example' is not supported"),
+        ("examples", {}, "'examples' is not supported"),
+        ("encoding", {}, "'encoding' is not supported"),
+        ("x-note", 1, "extension 'x-note' cannot be represented"),
+    ],
+)
+def test_unsupported_fields_inside_header_content_media_type_are_reported(
+    key: str, value: object, message: str
+) -> None:
+    diagnostic = only_header_diagnostic(
+        {"content": {JSON_MEDIA: {"schema": {}, key: value}}}
+    )
+
+    assert diagnostic.source_pointer == f"{HEADER_POINTER}/content/application~1json/{key}"
+    assert message in diagnostic.message
+
+
+def test_only_the_first_unsupported_header_field_in_key_order_is_reported() -> None:
+    diagnostic = only_header_diagnostic({"schema": {}, "z": 1, "example": 1})
+
+    assert diagnostic.source_pointer == f"{HEADER_POINTER}/example"
+
+
+# Reference Object description overrides
+
+
+@pytest.mark.parametrize(
+    ("version", "expected"),
+    [("3.1.1", "Override"), ("3.0.3", "Declared")],
+)
+def test_reference_description_overrides_a_header_only_in_openapi_3_1(
+    version: str, expected: str
+) -> None:
+    suite = response_suite(
+        {
+            "200": header_response(
+                {
+                    "X-H": LocalReference(
+                        uri="#/components/headers/H", summary="Ignored", description="Override"
+                    )
+                }
+            )
+        },
+        components_with(other={"headers": {"H": {"schema": {}, "description": "Declared"}}}),
+        version=version,
+    )
+
+    [header] = baseline_expectation(suite).headers
+    assert header.description == expected
+    assert suite.diagnostics == ()
+
+
+@pytest.mark.parametrize(
+    ("version", "expected"),
+    [("3.1.1", "Override"), ("3.0.3", "Declared")],
+)
+def test_reference_description_overrides_a_link_only_in_openapi_3_1(
+    version: str, expected: str
+) -> None:
+    suite = response_suite(
+        {
+            "200": link_response(
+                {"L": LocalReference(uri="#/components/links/L", description="Override")}
+            )
+        },
+        components_with(
+            other={"links": {"L": {"operationId": "a", "description": "Declared"}}}
+        ),
+        version=version,
+    )
+
+    assert baseline_expectation(suite).links[0].description == expected
+
+
+def test_outermost_reference_description_wins_in_an_alias_chain() -> None:
+    components = components_with(
+        other={
+            "headers": {
+                "A": LocalReference(uri="#/components/headers/B", description="Alias"),
+                "B": {"schema": {}, "description": "Declared"},
+            }
+        }
+    )
+
+    def description_for(entry: LocalReference) -> str | None:
+        suite = response_suite({"200": header_response({"X-H": entry})}, components)
+        return baseline_expectation(suite).headers[0].description
+
+    assert description_for(LocalReference(uri="#/components/headers/A")) == "Alias"
+    assert (
+        description_for(LocalReference(uri="#/components/headers/A", description="Outer"))
+        == "Outer"
+    )
+
+
+def test_reference_without_description_keeps_the_declared_description() -> None:
+    suite = response_suite(
+        {"200": header_response({"X-H": LocalReference(uri="#/components/headers/H")})},
+        components_with(other={"headers": {"H": {"schema": {}, "description": "Declared"}}}),
+    )
+
+    assert baseline_expectation(suite).headers[0].description == "Declared"
+
+
+# --- Step 8.41.4: version-aware server variable enum rules ---
+
+
+def enum_link(variable: dict[str, object]) -> Response:
+    return link_response(
+        {
+            "L": {
+                "operationId": "a",
+                "server": {"url": "https://{env}.example.com", "variables": {"env": variable}},
+            },
+            "Ok": {"operationId": "ok"},
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    ("variable", "pointer_suffix", "message"),
+    [
+        ({"default": "a", "enum": []}, "enum", "must not be empty"),
+        ({"default": "x", "enum": ["a", "b"]}, "default", "one of its 'enum' values"),
+    ],
+)
+def test_openapi_3_1_server_variable_enum_rules_are_enforced(
+    variable: dict[str, object], pointer_suffix: str, message: str
+) -> None:
+    suite = response_suite({"200": enum_link(variable)}, version="3.1.1")
+
+    [diagnostic] = suite.diagnostics
+    assert diagnostic.code == "unsupported_response_link"
+    assert diagnostic.source_pointer == f"{LINK_POINTER}/server/variables/env/{pointer_suffix}"
+    assert message in diagnostic.message
+    assert [link.name for link in baseline_expectation(suite).links] == ["Ok"]
+    assert [case.category for case in suite.cases] == ["positive"]
+
+
+def test_openapi_3_1_valid_enum_and_default_combination_is_kept() -> None:
+    variable = {"default": "api", "enum": ["api", "dev"]}
+    suite = response_suite({"200": enum_link(variable)}, version="3.1.1")
+
+    assert suite.diagnostics == ()
+    link = next(link for link in baseline_expectation(suite).links if link.name == "L")
+    assert link.server is not None and link.server.variables == {"env": variable}
+
+
+@pytest.mark.parametrize(
+    "variable",
+    [
+        {"default": "a", "enum": []},
+        {"default": "x", "enum": ["a", "b"]},
+    ],
+)
+def test_openapi_3_0_keeps_accepting_empty_enum_and_default_outside_enum(
+    variable: dict[str, object],
+) -> None:
+    suite = response_suite({"200": enum_link(variable)}, version="3.0.3")
+
+    assert suite.diagnostics == ()
+    link = next(link for link in baseline_expectation(suite).links if link.name == "L")
+    assert link.server is not None and link.server.variables == {"env": variable}
+
+
+@pytest.mark.parametrize("version", ["3.0.3", "3.1.1"])
+@pytest.mark.parametrize(
+    ("variable", "pointer_suffix"),
+    [
+        ({"default": "a", "enum": "a"}, "enum"),
+        ({"default": "a", "enum": ["a", 2]}, "enum"),
+        ({"enum": ["a"]}, "default"),
+        ({"default": 1}, "default"),
+    ],
+)
+def test_server_variable_type_and_required_checks_apply_to_both_versions(
+    version: str, variable: dict[str, object], pointer_suffix: str
+) -> None:
+    suite = response_suite({"200": enum_link(variable)}, version=version)
+
+    [diagnostic] = suite.diagnostics
+    assert diagnostic.source_pointer == f"{LINK_POINTER}/server/variables/env/{pointer_suffix}"
+    assert [link.name for link in baseline_expectation(suite).links] == ["Ok"]
+
+
+# --- Step 8.41.5: exact OpenAPI 3.1 detection ---
+
+ACTIVE_VERSIONS = ["3.1.0", "3.1.1"]
+INACTIVE_VERSIONS = ["3.0.0", "3.0.3", "3.10.0"]
+
+
+@pytest.mark.parametrize("version", ACTIVE_VERSIONS)
+def test_openapi_3_1_versions_are_detected(version: str) -> None:
+    assert generator_module._is_openapi_3_1(version) is True
+
+
+@pytest.mark.parametrize("version", [*INACTIVE_VERSIONS, "3.11.0", "30.1.0", "2.1.0", "3", ""])
+def test_other_versions_are_not_detected_as_openapi_3_1(version: str) -> None:
+    assert generator_module._is_openapi_3_1(version) is False
+
+
+def description_override_result(version: str) -> str | None:
+    suite = response_suite(
+        {
+            "200": header_response(
+                {"X-H": LocalReference(uri="#/components/headers/H", description="Override")}
+            )
+        },
+        components_with(other={"headers": {"H": {"schema": {}, "description": "Declared"}}}),
+        version=version,
+    )
+    return baseline_expectation(suite).headers[0].description
+
+
+@pytest.mark.parametrize("version", ACTIVE_VERSIONS)
+def test_reference_description_override_is_active_for_openapi_3_1_x(version: str) -> None:
+    assert description_override_result(version) == "Override"
+
+
+@pytest.mark.parametrize("version", INACTIVE_VERSIONS)
+def test_reference_description_override_is_inactive_outside_openapi_3_1_x(version: str) -> None:
+    assert description_override_result(version) == "Declared"
+
+
+@pytest.mark.parametrize("version", ACTIVE_VERSIONS)
+def test_server_variable_enum_rules_are_active_for_openapi_3_1_x(version: str) -> None:
+    suite = response_suite({"200": enum_link({"default": "a", "enum": []})}, version=version)
+
+    [diagnostic] = suite.diagnostics
+    assert diagnostic.source_pointer == f"{LINK_POINTER}/server/variables/env/enum"
+
+
+@pytest.mark.parametrize("version", INACTIVE_VERSIONS)
+def test_server_variable_enum_rules_are_inactive_outside_openapi_3_1_x(version: str) -> None:
+    for variable in ({"default": "a", "enum": []}, {"default": "x", "enum": ["a"]}):
+        suite = response_suite({"200": enum_link(variable)}, version=version)
+        assert suite.diagnostics == ()

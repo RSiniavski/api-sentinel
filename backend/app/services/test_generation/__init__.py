@@ -7,7 +7,11 @@ from app.services.test_generation.models import (
     GeneratedTestCase,
     GeneratedTestSuite,
     GenerationDiagnostic,
+    LinkRequestBody,
+    ResolvedResponseSchema,
     ResponseExpectation,
+    ResponseHeaderExpectation,
+    ResponseLinkExpectation,
 )
 
 __all__ = [
@@ -16,7 +20,11 @@ __all__ = [
     "GeneratedTestCase",
     "GeneratedTestSuite",
     "GenerationDiagnostic",
+    "LinkRequestBody",
+    "ResolvedResponseSchema",
     "ResponseExpectation",
+    "ResponseHeaderExpectation",
+    "ResponseLinkExpectation",
     "build_case_id",
     "generate_test_suite",
 ]

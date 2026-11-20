@@ -15,6 +15,8 @@ from types import MappingProxyType
 from typing import Any
 from urllib.parse import unquote
 
+from pydantic import ValidationError
+
 from app.services.openapi.models import (
     ApiModel,
     Endpoint,
@@ -28,6 +30,7 @@ from app.services.openapi.models import (
     Schema,
     SecurityRequirement,
     SecurityScheme,
+    Server,
 )
 from app.services.test_generation.models import (
     GeneratedBody,
@@ -35,7 +38,11 @@ from app.services.test_generation.models import (
     GeneratedTestCase,
     GeneratedTestSuite,
     GenerationDiagnostic,
+    LinkRequestBody,
+    ResolvedResponseSchema,
     ResponseExpectation,
+    ResponseHeaderExpectation,
+    ResponseLinkExpectation,
 )
 
 _PRIMITIVE_TYPES = {"string", "integer", "number", "boolean", "null"}
@@ -3216,7 +3223,8 @@ def _generate_endpoint(
         if _request_body_is_required(endpoint, api):
             raise
         parameter_diagnostics.append(_unsupported_diagnostic(issue, endpoint))
-    expectations = _response_expectations(endpoint, root, api)
+    expectations, response_diagnostics = _response_expectations(endpoint, root, api)
+    parameter_diagnostics.extend(response_diagnostics)
     security = endpoint.security if endpoint.security is not None else api.security
     _check_security_schemes(endpoint, api, root)
 
@@ -3403,17 +3411,502 @@ def _resolve_response(
     return current, tuple(followed)
 
 
+_RESPONSE_SCHEMA_CODE = "unsupported_response_schema_reference"
+_RESPONSE_HEADER_CODE = "unsupported_response_header"
+_RESPONSE_LINK_CODE = "unsupported_response_link"
+_HEADER_REFERENCE_PREFIX = "#/components/headers/"
+_LINK_REFERENCE_PREFIX = "#/components/links/"
+
+
+def _decode_reference_segment(segment: str) -> str:
+    return unquote(segment).replace("~1", "/").replace("~0", "~")
+
+
+def _response_declaration_pointer(pointer: str, followed: tuple[str, ...]) -> str:
+    """Pointer of the Response Object that was actually declared.
+
+    For a referenced response this is its component, not the operation entry.
+    """
+    if not followed:
+        return pointer
+    name = _decode_reference_segment(followed[-1][len(_RESPONSE_REFERENCE_PREFIX) :])
+    return _pointer("components", "responses", name)
+
+
+def _is_openapi_3_1(version: str) -> bool:
+    """True for OpenAPI 3.1.x; major and minor are compared exactly (not 3.10)."""
+    parts = version.split(".")
+    return len(parts) >= 2 and parts[0] == "3" and parts[1] == "1"
+
+
+def _resolve_metadata_entry(
+    entry: Any,
+    api: ApiModel,
+    pointer: str,
+    *,
+    category: str,
+    prefix: str,
+    code: str,
+    noun: str,
+) -> tuple[dict[str, Any], str, tuple[str, ...], str | None]:
+    """Follow local `#/components/<category>/` references to an object.
+
+    Headers and links are opaque components (`Components.other`), so this is a
+    separate adapter from the schema resolver. It returns the object, the
+    pointer of its declaration, the reference URIs followed in order, and the
+    description override. Every resolved hop is charged to the expansion budget.
+
+    A Reference Object `description` overrides the target's description only in
+    OpenAPI 3.1; OpenAPI 3.0 ignores Reference Object siblings. The outermost
+    reference that declares a description wins. A Reference Object `summary`
+    has no effect because Header and Link Objects have no summary.
+    """
+    overrides_apply = _is_openapi_3_1(api.openapi_version)
+    override: str | None = None
+    followed: list[str] = []
+    declaration = pointer
+    current = entry
+    while isinstance(current, LocalReference):
+        uri = current.uri
+        if uri in followed:
+            raise _UnsupportedOperation(code, f"{noun} reference cycle.", declaration, uri)
+        followed.append(uri)
+        segment = uri[len(prefix) :]
+        if not uri.startswith(prefix) or not segment or "/" in segment:
+            raise _UnsupportedOperation(
+                code,
+                f"Only {prefix}<name> references are supported.",
+                declaration,
+                uri,
+            )
+        name = _decode_reference_segment(segment)
+        target = api.components.other.get(category, {}).get(name)
+        if target is None:
+            raise _UnsupportedOperation(
+                code, f"{noun} reference target was not found.", declaration, uri
+            )
+        _charge_expansion(declaration, uri)
+        if overrides_apply and override is None and current.description is not None:
+            override = current.description
+        current = target
+        declaration = _pointer("components", category, name)
+    if not isinstance(current, dict):
+        raise _UnsupportedOperation(code, f"{noun} must be an object.", declaration)
+    return current, declaration, tuple(followed), override
+
+
+def _typed_field(
+    raw: dict[str, Any], key: str, kind: type, label: str, declaration: str, code: str
+) -> Any:
+    """Return an optional field of the exact JSON type, or None when absent."""
+    if key not in raw:
+        return None
+    value = raw[key]
+    if not isinstance(value, kind):
+        raise _UnsupportedOperation(
+            code, f"'{key}' must be {label}.", _child(declaration, key)
+        )
+    return value
+
+
+def _reject_unsupported_fields(
+    raw: dict[str, Any],
+    supported: frozenset[str],
+    declaration: str,
+    code: str,
+    noun: str,
+    *,
+    extensions_supported: bool,
+) -> None:
+    """Report the first (in key order) field the output model cannot retain."""
+    for key in sorted(raw):
+        if key in supported:
+            continue
+        if key.startswith("x-"):
+            if extensions_supported:
+                continue
+            message = f"{noun} extension '{key}' cannot be represented."
+        else:
+            message = f"{noun} field '{key}' is not supported."
+        raise _UnsupportedOperation(code, message, _child(declaration, key))
+
+
+def _extensions(raw: dict[str, Any]) -> dict[str, Any]:
+    return {key: deepcopy(raw[key]) for key in sorted(raw) if key.startswith("x-")}
+
+
+def _schema_value(value: Any, pointer: str, code: str) -> Schema:
+    if not isinstance(value, (dict, bool)):
+        raise _UnsupportedOperation(
+            code, "A schema must be an object or a boolean.", pointer
+        )
+    return Schema(raw=value)
+
+
+_HEADER_FIELDS = frozenset(
+    {"description", "required", "deprecated", "schema", "content", "style", "explode"}
+)
+_LINK_FIELDS = frozenset(
+    {"operationId", "operationRef", "parameters", "requestBody", "description", "server"}
+)
+
+
+def _parse_response_header(
+    name: str,
+    raw: dict[str, Any],
+    declaration: str,
+    chain: tuple[str, ...],
+    description_override: str | None,
+) -> ResponseHeaderExpectation:
+    code = _RESPONSE_HEADER_CODE
+    for forbidden in ("name", "in"):
+        if forbidden in raw:
+            raise _UnsupportedOperation(
+                code,
+                f"A Header Object must not define '{forbidden}'.",
+                _child(declaration, forbidden),
+            )
+    # Fields such as example, examples, allowEmptyValue and allowReserved are
+    # not part of the retained subset; they are reported, never dropped.
+    _reject_unsupported_fields(
+        raw, _HEADER_FIELDS, declaration, code, "Header", extensions_supported=True
+    )
+    if "schema" in raw and "content" in raw:
+        raise _UnsupportedOperation(
+            code, "A Header Object cannot define both schema and content.", declaration
+        )
+    if "schema" not in raw and "content" not in raw:
+        raise _UnsupportedOperation(
+            code, "A Header Object requires exactly one of schema or content.", declaration
+        )
+    header_schema: Schema | None = None
+    if "schema" in raw:
+        header_schema = _schema_value(raw["schema"], _child(declaration, "schema"), code)
+    content_schemas: dict[str, Schema | None] | None = None
+    if "content" in raw:
+        content = raw["content"]
+        content_pointer = _child(declaration, "content")
+        if not isinstance(content, dict) or len(content) != 1:
+            raise _UnsupportedOperation(
+                code,
+                "Header content must be an object with exactly one media type.",
+                content_pointer,
+            )
+        media_type, media = next(iter(content.items()))
+        media_pointer = _child(content_pointer, media_type)
+        if not isinstance(media, dict):
+            raise _UnsupportedOperation(
+                code, "A header media type must be an object.", media_pointer
+            )
+        _reject_unsupported_fields(
+            media,
+            frozenset({"schema"}),
+            media_pointer,
+            code,
+            "Header media type",
+            extensions_supported=False,
+        )
+        content_schemas = {
+            media_type: _schema_value(
+                media["schema"], _child(media_pointer, "schema"), code
+            )
+            if "schema" in media
+            else None
+        }
+    description = _typed_field(raw, "description", str, "a string", declaration, code)
+    required = _typed_field(raw, "required", bool, "a boolean", declaration, code)
+    deprecated = _typed_field(raw, "deprecated", bool, "a boolean", declaration, code)
+    style = _typed_field(raw, "style", str, "a string", declaration, code)
+    if style is not None and style != "simple":
+        raise _UnsupportedOperation(
+            code, "A header 'style' must be 'simple'.", _child(declaration, "style")
+        )
+    explode = _typed_field(raw, "explode", bool, "a boolean", declaration, code)
+    return ResponseHeaderExpectation(
+        name=name,
+        reference_chain=chain,
+        description=description_override if description_override is not None else description,
+        required=bool(required),
+        deprecated=bool(deprecated),
+        header_schema=header_schema,
+        content_schemas=content_schemas,
+        style=style,
+        explode=explode,
+        extensions=_extensions(raw),
+    )
+
+
+def _check_server_variable(value: Any, pointer: str, *, enforce_enum_rules: bool) -> None:
+    """Check a server variable's shape.
+
+    `enforce_enum_rules` is true for OpenAPI 3.1 only: there an `enum` must not
+    be empty and must contain `default`. OpenAPI 3.0 only recommends this
+    (SHOULD), so 3.0 documents keep being accepted.
+    """
+    code = _RESPONSE_LINK_CODE
+    if not isinstance(value, dict):
+        raise _UnsupportedOperation(code, "A server variable must be an object.", pointer)
+    _reject_unsupported_fields(
+        value,
+        frozenset({"enum", "default", "description"}),
+        pointer,
+        code,
+        "Server variable",
+        extensions_supported=True,
+    )
+    if "default" not in value:
+        raise _UnsupportedOperation(
+            code, "A server variable requires a 'default'.", _child(pointer, "default")
+        )
+    _typed_field(value, "default", str, "a string", pointer, code)
+    _typed_field(value, "description", str, "a string", pointer, code)
+    enum = _typed_field(value, "enum", list, "an array of strings", pointer, code)
+    if enum is not None and any(not isinstance(item, str) for item in enum):
+        raise _UnsupportedOperation(
+            code, "'enum' must be an array of strings.", _child(pointer, "enum")
+        )
+    if enum is not None and enforce_enum_rules:
+        if not enum:
+            raise _UnsupportedOperation(
+                code, "A server variable 'enum' must not be empty.", _child(pointer, "enum")
+            )
+        if value["default"] not in enum:
+            raise _UnsupportedOperation(
+                code,
+                "A server variable 'default' must be one of its 'enum' values.",
+                _child(pointer, "default"),
+            )
+
+
+def _server_validation_issue(error: ValidationError, pointer: str) -> _UnsupportedOperation:
+    """Map the first model validation error to a pointer inside the server."""
+    first = error.errors()[0]
+    location = [str(part) for part in first["loc"]]
+    if location and location[0] == "extensions":
+        location = location[1:]  # extensions sit directly in the server object
+    target = _child(pointer, *location) if location else pointer
+    return _UnsupportedOperation(
+        _RESPONSE_LINK_CODE, f"Invalid link server: {first['msg']}.", target
+    )
+
+
+def _parse_link_server(raw: Any, pointer: str, *, enforce_enum_rules: bool) -> Server:
+    code = _RESPONSE_LINK_CODE
+    if not isinstance(raw, dict):
+        raise _UnsupportedOperation(code, "A link server must be an object.", pointer)
+    _reject_unsupported_fields(
+        raw,
+        frozenset({"url", "description", "variables"}),
+        pointer,
+        code,
+        "Link server",
+        extensions_supported=True,
+    )
+    url = _typed_field(raw, "url", str, "a string", pointer, code)
+    if url is None:
+        raise _UnsupportedOperation(
+            code, "A link server requires a 'url'.", _child(pointer, "url")
+        )
+    description = _typed_field(raw, "description", str, "a string", pointer, code)
+    variables = raw.get("variables", {})
+    variables_pointer = _child(pointer, "variables")
+    if not isinstance(variables, dict):
+        raise _UnsupportedOperation(
+            code, "Server variables must be an object.", variables_pointer
+        )
+    for variable_name in sorted(variables):
+        _check_server_variable(
+            variables[variable_name],
+            _child(variables_pointer, variable_name),
+            enforce_enum_rules=enforce_enum_rules,
+        )
+    try:
+        return Server(
+            url=url,
+            description=description,
+            variables={key: deepcopy(variables[key]) for key in sorted(variables)},
+            extensions=_extensions(raw),
+        )
+    except ValidationError as error:
+        raise _server_validation_issue(error, pointer) from error
+
+
+def _parse_response_link(
+    name: str,
+    raw: dict[str, Any],
+    declaration: str,
+    chain: tuple[str, ...],
+    description_override: str | None,
+    *,
+    enforce_enum_rules: bool,
+) -> ResponseLinkExpectation:
+    code = _RESPONSE_LINK_CODE
+    _reject_unsupported_fields(
+        raw, _LINK_FIELDS, declaration, code, "Link", extensions_supported=True
+    )
+    operation_id = _typed_field(raw, "operationId", str, "a string", declaration, code)
+    operation_ref = _typed_field(raw, "operationRef", str, "a string", declaration, code)
+    if operation_id is not None and operation_ref is not None:
+        raise _UnsupportedOperation(
+            code, "operationRef and operationId are mutually exclusive.", declaration
+        )
+    if operation_id is None and operation_ref is None:
+        raise _UnsupportedOperation(
+            code, "A Link Object requires exactly one of operationId or operationRef.", declaration
+        )
+    description = _typed_field(raw, "description", str, "a string", declaration, code)
+    parameters = raw.get("parameters", {})
+    if not isinstance(parameters, dict):
+        raise _UnsupportedOperation(
+            code, "Link parameters must be an object.", _child(declaration, "parameters")
+        )
+    request_body = (
+        LinkRequestBody(value=deepcopy(raw["requestBody"])) if "requestBody" in raw else None
+    )
+    server = (
+        _parse_link_server(
+            raw["server"], _child(declaration, "server"), enforce_enum_rules=enforce_enum_rules
+        )
+        if "server" in raw
+        else None
+    )
+    return ResponseLinkExpectation(
+        name=name,
+        reference_chain=chain,
+        operation_id=operation_id,
+        operation_ref=operation_ref,
+        description=description_override if description_override is not None else description,
+        # Runtime expressions stay literal strings; nothing is evaluated.
+        parameters={key: deepcopy(parameters[key]) for key in sorted(parameters)},
+        request_body=request_body,
+        server=server,
+        extensions=_extensions(raw),
+    )
+
+
 def _response_expectations(
     endpoint: Endpoint, endpoint_pointer: str, api: ApiModel
-) -> tuple[ResponseExpectation, ...]:
+) -> tuple[tuple[ResponseExpectation, ...], list[GenerationDiagnostic]]:
+    """Build the response expectations and their non-fatal diagnostics.
+
+    A response that cannot be resolved still skips the endpoint. A schema
+    reference, header or link that cannot be used is reported and left out of
+    the resolved data; the response and the endpoint are kept. Only
+    _UnsupportedOperation is handled here, so an exhausted budget propagates.
+    """
     expectations: list[ResponseExpectation] = []
+    diagnostics: list[GenerationDiagnostic] = []
+    reported: set[tuple[str, str, str | None]] = set()
+
+    def report(code: str, issue: _UnsupportedOperation, message: str) -> None:
+        key = (code, issue.pointer, issue.reference_uri)
+        if key in reported:
+            return
+        reported.add(key)
+        diagnostics.append(
+            GenerationDiagnostic(
+                code=code,
+                message=message,
+                endpoint_path=endpoint.path,
+                endpoint_method=endpoint.method,
+                source_pointer=issue.pointer,
+                reference_uri=issue.reference_uri,
+            )
+        )
+
     for status in sorted(endpoint.responses):
         pointer = _child(endpoint_pointer, "responses", status)
         entry = endpoint.responses[status]
         if not isinstance(entry, (Response, LocalReference)):
             raise _UnsupportedOperation("unsupported_response", "Unsupported response entry.", pointer)
         response, followed = _resolve_response(entry, api, pointer)
+        declaration = _response_declaration_pointer(pointer, followed)
         media_types = tuple(sorted(response.content))
+
+        # Only a top-level reference is resolved. The same conservative
+        # `$ref` sibling policy applies to OpenAPI 3.0 and 3.1: annotation
+        # siblings are accepted, any other sibling is reported and no resolved
+        # snapshot is made (the declared schema is always kept unchanged).
+        resolved_schemas: dict[str, ResolvedResponseSchema] = {}
+        for media_type in media_types:
+            schema = response.content[media_type].schema
+            if schema is None or _reference_uri(schema.raw) is None:
+                continue
+            try:
+                raw, final_pointer, chain = _follow_schema_reference(
+                    schema.raw, _child(declaration, "content", media_type, "schema")
+                )
+            except _UnsupportedOperation as issue:
+                report(
+                    _RESPONSE_SCHEMA_CODE,
+                    issue,
+                    f"Response schema reference was not resolved ({issue.code}): {issue}",
+                )
+                continue
+            # Schema detaches a copy of the component data on construction.
+            resolved_schemas[media_type] = ResolvedResponseSchema(
+                reference_chain=chain, pointer=final_pointer, resolved=Schema(raw=raw)
+            )
+
+        headers: list[ResponseHeaderExpectation] = []
+        for name in sorted(response.headers):
+            if name.lower() == "content-type":
+                continue  # The specification says this response header is ignored.
+            try:
+                raw_header, header_declaration, chain, override = _resolve_metadata_entry(
+                    response.headers[name],
+                    api,
+                    _child(declaration, "headers", name),
+                    category="headers",
+                    prefix=_HEADER_REFERENCE_PREFIX,
+                    code=_RESPONSE_HEADER_CODE,
+                    noun="Response header",
+                )
+            except _UnsupportedOperation as issue:
+                report(_RESPONSE_HEADER_CODE, issue, str(issue))
+                continue
+            try:
+                headers.append(
+                    _parse_response_header(
+                        name, raw_header, header_declaration, chain, override
+                    )
+                )
+            except _UnsupportedOperation as issue:
+                if issue.reference_uri is None and chain:
+                    issue.reference_uri = chain[-1]  # the reference to the bad target
+                report(_RESPONSE_HEADER_CODE, issue, str(issue))
+
+        links: list[ResponseLinkExpectation] = []
+        for name in sorted(response.links):
+            try:
+                raw_link, link_declaration, chain, override = _resolve_metadata_entry(
+                    response.links[name],
+                    api,
+                    _child(declaration, "links", name),
+                    category="links",
+                    prefix=_LINK_REFERENCE_PREFIX,
+                    code=_RESPONSE_LINK_CODE,
+                    noun="Response link",
+                )
+            except _UnsupportedOperation as issue:
+                report(_RESPONSE_LINK_CODE, issue, str(issue))
+                continue
+            try:
+                links.append(
+                    _parse_response_link(
+                        name,
+                        raw_link,
+                        link_declaration,
+                        chain,
+                        override,
+                        enforce_enum_rules=_is_openapi_3_1(api.openapi_version),
+                    )
+                )
+            except _UnsupportedOperation as issue:
+                if issue.reference_uri is None and chain:
+                    issue.reference_uri = chain[-1]  # the reference to the bad target
+                report(_RESPONSE_LINK_CODE, issue, str(issue))
+
         expectations.append(
             ResponseExpectation(
                 status_key=status,
@@ -3423,9 +3916,12 @@ def _response_expectations(
                     for media_type in media_types
                 },
                 response_reference_uri=followed[0] if followed else None,
+                resolved_schemas_by_media_type=resolved_schemas,
+                headers=tuple(headers),
+                links=tuple(links),
             )
         )
-    return tuple(expectations)
+    return tuple(expectations), diagnostics
 
 
 _SECURITY_SCHEME_REFERENCE_PREFIX = "#/components/securitySchemes/"
