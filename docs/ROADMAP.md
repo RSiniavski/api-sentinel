@@ -92,7 +92,7 @@ Objectives:
 - Implement boundary test generation.
 - Implement required-field validation.
 - Implement data-type validation.
-- Introduce contract validation.
+- Retain declared response expectations in generated cases. Contract validation of responses belongs to Phase 5 (Test Execution Engine) and is not a Phase 4 implementation objective.
 
 Expected result:
 
@@ -101,14 +101,14 @@ API Sentinel can generate structured and reproducible API test definitions from 
 Implemented so far:
 
 - Internal test representation: strict, frozen output models (`GeneratedTestSuite`, `GeneratedTestCase`, `GenerationDiagnostic`).
-- Positive test generation: one baseline case per operation for the supported schema subset.
+- Positive test generation: one baseline case for each eligible operation whose positive inputs are supported (supported schema subset), plus one additional positive case without the body (`request-body-omitted`) for a supported optional request body; an unsupported optional body keeps the endpoint with a body-less baseline and the original diagnostic.
 - Negative test generation: required parameter, request body and property omission; wrong JSON type; enum/const violation.
 - Boundary test generation: string length bounds, numeric bounds (including properties reached through nested local `$ref`), array size bounds (`minItems`, `maxItems`) and `uniqueItems` duplicate cases for request body arrays (Array Bounds Generation, implemented): arrays present in the positive body, optional arrays absent from it, arrays below absent optional parent objects (created in the negative body only), arrays inside element 0 of a present array (objects and nested arrays), and arrays below the one element created in a present empty array (array-bound phase 4).
 - Local reference resolution for parameters, request bodies and schemas, with diagnostics for unsupported, missing, invalid and cyclic references and the `$ref` sibling policy (annotations only).
 - Deterministic resource budgets for reference expansions, generated cases and diagnostics, with stable budget diagnostics.
 - Referenced responses: local `#/components/responses/` references, including alias chains, resolved into `ResponseExpectation`.
 - Parser validation of Security Scheme Objects through `openapi-spec-validator`: type-specific required fields are enforced, and the supported types are accepted in OpenAPI 3.0.3 and 3.1.1 (`mutualTLS` only in 3.1). Covered by real-validator tests in `tests/test_openapi_parser.py`; the Generator does not repeat these checks.
-- Generator security scheme validation: schemes named by the effective security requirements are looked up, local `#/components/securitySchemes/` alias chains are resolved, and the scheme type is checked; all failures of an endpoint are reported together and the endpoint is skipped.
+- Generator security scheme validation: schemes named by the effective security requirements are looked up, local `#/components/securitySchemes/` alias chains are resolved, the scheme type is checked and, for `oauth2`, every requested scope must be declared in at least one flow of the resolved scheme (`unsupported_security_scope`); all failures of an endpoint are reported together and the endpoint is skipped.
 - Schema `format` support for a closed set (`int32`, `int64`, `float`, `double`, `date`, `date-time`, `uuid`, `email`): type compatibility rules, deterministic fixed values, restricted validation profiles for `date-time`, `uuid` and `email`, and implicit numeric ranges in numeric boundary generation. Wrong-format negative cases are not generated; other request media types and `style`/`explode` remain unsupported.
 - Failure isolation: an unsupported schema in one negative step does not stop the other negative steps of the endpoint.
 - Request schema `additionalProperties` (boolean or schema object): enforced when validating example, default, enum and const candidates, which may keep undeclared properties that satisfy it; synthesized values contain declared properties only (no invented map keys). An unsupported or unresolvable `additionalProperties` schema rejects only the candidate being validated. No negative cases target additional properties, and `patternProperties`, `minProperties` and `maxProperties` remain unsupported.
@@ -135,7 +135,6 @@ Still planned:
 
 - Support for further schema keywords (formats beyond the closed set, patterns beyond the bounded subset) and compositions.
 - Request media types other than `application/json`.
-- Contract validation of responses, together with the Test Execution Engine (Phase 5).
 
 ## 6. Phase 5 — Test Execution Engine
 
