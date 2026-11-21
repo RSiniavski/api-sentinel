@@ -11856,6 +11856,15 @@ ISOLATION_STEPS = {
 }
 
 
+def is_valid_edge_case(case: GeneratedTestCase) -> bool:
+    """Whether a case is a positive numeric valid-edge case (Step 8.42.1)."""
+    return any(entry.startswith("valid_boundary_edge:") for entry in case.provenance)
+
+
+def without_valid_edge_cases(suite: GeneratedTestSuite) -> list[GeneratedTestCase]:
+    return [case for case in suite.cases if not is_valid_edge_case(case)]
+
+
 def isolation_suite() -> GeneratedTestSuite:
     endpoint = Endpoint(
         path="/isolation",
@@ -11936,11 +11945,13 @@ ISOLATION_MUTATIONS = {
 def test_isolation_suite_covers_every_expected_negative_step() -> None:
     suite = isolation_suite()
     counts: dict[str, int] = {}
-    for case in suite.cases[1:]:
+    for case in without_valid_edge_cases(suite)[1:]:
         counts[case.violated_constraint] = counts.get(case.violated_constraint, 0) + 1
 
     assert suite.cases[0].category == "positive"
     assert counts == ISOLATION_STEPS
+    # The only valid-edge case is the maximum of "count" (the baseline holds the minimum).
+    assert [case.request_body.value["count"] for case in suite.cases if is_valid_edge_case(case)] == [9]  # type: ignore[union-attr, index]
     for case in suite.cases:
         assert case.security is not None and len(case.response_expectations) == 2
 
@@ -12098,6 +12109,8 @@ def test_items_reference_hop_is_charged_to_the_expansion_budget(
             post_endpoint(element_rows(schema_reference("Row"))), {"Row": ELEMENT_ITEM}
         )
 
+    # The valid-edge step runs after array_bounds; its hops are not part of this test.
+    monkeypatch.setattr(generator_module, "_numeric_valid_edge_cases", lambda *args: ((), ()))
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(generator_module, "_array_bound_negative_cases", lambda *args: ((), ()))
         hops_without_array_step = count_expansions(build())
@@ -13949,14 +13962,16 @@ def test_blocked_candidates_are_reported_once_each_and_retained_cases_keep_their
     plain = element_suite(empty_obj({"meta": meta_schema()}, ("meta",)))
     literal = element_suite(empty_obj({"meta": meta_schema(enum=[META_POSITIVE])}, ("meta",)))
 
-    plain_ids = {(c.violated_constraint, c.affected_property): c.case_id for c in plain.cases}
-    retained = [(c.violated_constraint, c.affected_property) for c in literal.cases]
+    plain_cases = without_valid_edge_cases(plain)
+    literal_cases = without_valid_edge_cases(literal)
+    plain_ids = {(c.violated_constraint, c.affected_property): c.case_id for c in plain_cases}
+    retained = [(c.violated_constraint, c.affected_property) for c in literal_cases]
     # Retained cases keep their ID and their relative order.
-    assert [c.case_id for c in literal.cases] == [plain_ids[key] for key in retained]
+    assert [c.case_id for c in literal_cases] == [plain_ids[key] for key in retained]
     assert retained == [key for key in plain_ids if key in set(retained)]
     # Every other candidate was reported exactly once.
     messages = [item.message for item in literal.diagnostics if item.code == CONFLICT_CODE]
-    assert len(messages) == len(set(messages)) == len(plain.cases) - len(literal.cases)
+    assert len(messages) == len(set(messages)) == len(plain_cases) - len(literal_cases)
 
 
 def test_a_literal_that_accepts_the_changed_body_keeps_the_case() -> None:
@@ -13974,7 +13989,9 @@ def test_schemas_without_ancestor_literals_report_nothing_and_are_unchanged() ->
     suite = element_suite(empty_obj({"meta": meta_schema()}, ("meta",)))
 
     assert [item for item in suite.diagnostics if item.code == CONFLICT_CODE] == []
-    assert len(suite.cases) == 17
+    # Seventeen baseline and negative cases; the two valid-edge cases are Step 8.42.1's.
+    assert len(without_valid_edge_cases(suite)) == 17
+    assert len(suite.cases) == 19
 
 
 def test_the_target_own_literal_is_excluded_for_wrong_type_and_enum() -> None:
@@ -14337,6 +14354,8 @@ def test_ancestor_literal_validation_leaves_the_expansion_budget_unchanged(
     # without a literal (it was 15 before the validation existed).
     body = empty_obj({"meta": schema_reference("Meta")}, ("meta",))
     schemas = {"Meta": meta_schema(**literal)}
+    # The valid-edge step runs last and follows its own references (Step 8.42.1).
+    monkeypatch.setattr(generator_module, "_numeric_valid_edge_cases", lambda *args: ((), ()))
 
     def budget_codes(limit: int) -> set[str]:
         monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_EXPANSIONS", limit)
@@ -16054,3 +16073,920 @@ def test_server_variable_enum_rules_are_inactive_outside_openapi_3_1_x(version: 
     for variable in ({"default": "a", "enum": []}, {"default": "x", "enum": ["a"]}):
         suite = response_suite({"200": enum_link(variable)}, version=version)
         assert suite.diagnostics == ()
+
+
+# --- Numeric valid boundary-edge cases (Step 8.42.1) -------------------------------------
+
+EDGE_CODE = "valid_boundary_no_safe_candidate"
+
+
+def edge_object(**schema: object) -> dict[str, object]:
+    return {"type": "object", "required": ["v"], "properties": {"v": schema}}
+
+
+def edge_suite(
+    body: object, *, version: str = "3.1.1", schemas: dict[str, object] | None = None
+) -> GeneratedTestSuite:
+    endpoint = post_endpoint(body)
+    if schemas:
+        components = Components(schemas={name: Schema(raw=raw) for name, raw in schemas.items()})  # type: ignore[arg-type]
+        return generate_test_suite(make_result(endpoint, version=version, components=components))
+    return generate_test_suite(make_result(endpoint, version=version))
+
+
+def edge_cases(suite: GeneratedTestSuite) -> list[GeneratedTestCase]:
+    return [case for case in suite.cases if is_valid_edge_case(case)]
+
+
+def edge_summary(suite: GeneratedTestSuite) -> list[tuple[str, object]]:
+    """(constraint:pointer, body) of each valid-edge case, in case order."""
+    return [
+        (case.provenance[-1].removeprefix("valid_boundary_edge:"), case.request_body.value)  # type: ignore[union-attr]
+        for case in edge_cases(suite)
+    ]
+
+
+def edge_diagnostics(suite: GeneratedTestSuite) -> list[GenerationDiagnostic]:
+    return [item for item in suite.diagnostics if item.code == EDGE_CODE]
+
+
+def suite_without_edge_step(
+    monkeypatch: pytest.MonkeyPatch, build: object
+) -> GeneratedTestSuite:
+    with monkeypatch.context() as patch:
+        patch.setattr(generator_module, "_numeric_valid_edge_cases", lambda *args: ((), ()))
+        return build()  # type: ignore[operator]
+
+
+@pytest.mark.parametrize(
+    ("schema", "expected"),
+    [
+        (
+            {"type": "integer", "minimum": -3, "maximum": 10},
+            [("minimum:/v", -3), ("maximum:/v", 10)],
+        ),
+        (
+            {"type": "integer", "exclusiveMinimum": -3, "exclusiveMaximum": 10},
+            [("exclusiveMinimum:/v", -2), ("exclusiveMaximum:/v", 9)],
+        ),
+        (
+            {"type": "number", "minimum": -2.5, "maximum": 10.5},
+            [("minimum:/v", -2.5), ("maximum:/v", 10.5)],
+        ),
+        (
+            {"type": "number", "exclusiveMinimum": -2.5, "exclusiveMaximum": 10.5},
+            [("exclusiveMinimum:/v", -2.4999999999999996), ("exclusiveMaximum:/v", 10.499999999999998)],
+        ),
+    ],
+)
+def test_each_numeric_bound_gets_an_edge_case_for_integer_and_number(
+    schema: dict[str, object], expected: list[tuple[str, object]]
+) -> None:
+    suite = edge_suite(edge_object(**schema))
+
+    assert suite.cases[0].request_body.value == {"v": 0}  # type: ignore[union-attr]
+    assert edge_summary(suite) == [(name, {"v": value}) for name, value in expected]
+    assert all(case.category == "positive" for case in edge_cases(suite))
+    assert all(case.violated_constraint is None for case in edge_cases(suite))
+    assert all(case.expected_outcome == "response_contract_unasserted" for case in edge_cases(suite))
+
+
+def test_openapi_3_0_boolean_exclusive_bounds_target_the_exclusive_value() -> None:
+    suite = edge_suite(
+        edge_object(
+            type="integer", minimum=-3, exclusiveMinimum=True, maximum=10, exclusiveMaximum=True
+        ),
+        version="3.0.3",
+    )
+
+    # The inclusive keywords are inactive; only the exclusive meaning is targeted.
+    assert edge_summary(suite) == [
+        ("exclusiveMinimum:/v", {"v": -2}),
+        ("exclusiveMaximum:/v", {"v": 9}),
+    ]
+
+
+def test_openapi_3_0_false_exclusive_flags_keep_the_inclusive_bounds() -> None:
+    suite = edge_suite(
+        edge_object(
+            type="integer", minimum=-3, exclusiveMinimum=False, maximum=10, exclusiveMaximum=False
+        ),
+        version="3.0.3",
+    )
+
+    assert edge_summary(suite) == [("minimum:/v", {"v": -3}), ("maximum:/v", {"v": 10})]
+
+
+def test_openapi_3_1_numeric_exclusive_bounds_and_false_flags() -> None:
+    numeric = edge_suite(edge_object(type="integer", exclusiveMinimum=-3, maximum=10))
+    assert edge_summary(numeric) == [
+        ("maximum:/v", {"v": 10}),
+        ("exclusiveMinimum:/v", {"v": -2}),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("schema", "expected"),
+    [
+        ({"type": "integer", "minimum": -3.5, "maximum": 10.5}, [-3, 10]),
+        ({"type": "integer", "exclusiveMinimum": -3.5, "exclusiveMaximum": 10.5}, [-3, 10]),
+        ({"type": "integer", "exclusiveMinimum": -3.0, "exclusiveMaximum": 10.0}, [-2, 9]),
+    ],
+)
+def test_integer_schemas_with_fractional_bounds_use_the_nearest_integer_inside(
+    schema: dict[str, object], expected: list[int]
+) -> None:
+    suite = edge_suite(edge_object(**schema))
+
+    assert [body["v"] for _, body in edge_summary(suite)] == expected  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    ("schema", "expected"),
+    [
+        ({"type": "integer", "multipleOf": 5, "minimum": -7, "maximum": 23}, [-5, 20]),
+        # The lower edge, 0, is the baseline value and adds no case.
+        ({"type": "integer", "multipleOf": 5, "exclusiveMinimum": -5, "exclusiveMaximum": 25}, [20]),
+        ({"type": "number", "multipleOf": 0.25, "minimum": -1.1, "maximum": 2.1}, [-1, 2]),
+        ({"type": "number", "multipleOf": 0.3, "minimum": -1, "maximum": 2}, [-0.9, 1.8]),
+    ],
+)
+def test_multiple_of_gives_the_nearest_multiple_inside_each_bound(
+    schema: dict[str, object], expected: list[object]
+) -> None:
+    suite = edge_suite(edge_object(**schema))
+
+    assert [body["v"] for _, body in edge_summary(suite)] == expected  # type: ignore[index]
+
+
+def test_nested_property_edges_keep_the_rest_of_the_baseline_body() -> None:
+    nested = {
+        "type": "object",
+        "required": ["a", "tag"],
+        "properties": {
+            "tag": {"type": "string", "example": "t"},
+            "a": {
+                "type": "object",
+                "required": ["n"],
+                "properties": {"n": {"type": "integer", "minimum": -3, "maximum": 10}},
+            },
+        },
+    }
+
+    suite = edge_suite(nested)
+
+    assert suite.cases[0].request_body.value == {"tag": "t", "a": {"n": 0}}  # type: ignore[union-attr]
+    assert edge_summary(suite) == [
+        ("minimum:/a/n", {"tag": "t", "a": {"n": -3}}),
+        ("maximum:/a/n", {"tag": "t", "a": {"n": 10}}),
+    ]
+
+
+def test_only_the_first_array_element_is_targeted() -> None:
+    body = {
+        "type": "array",
+        "minItems": 2,
+        "items": {
+            "type": "object",
+            "required": ["n"],
+            "properties": {"n": {"type": "integer", "minimum": -3, "maximum": 10}},
+        },
+    }
+
+    suite = edge_suite(body)
+
+    assert suite.cases[0].request_body.value == [{"n": 0}, {"n": 0}]  # type: ignore[union-attr]
+    assert edge_summary(suite) == [
+        ("minimum:/0/n", [{"n": -3}, {"n": 0}]),
+        ("maximum:/0/n", [{"n": 10}, {"n": 0}]),
+    ]
+
+
+def test_edges_follow_property_reference_chains() -> None:
+    schemas = {
+        "Outer": {"$ref": "#/components/schemas/Inner"},
+        "Inner": {"type": "integer", "minimum": -3, "maximum": 10},
+    }
+    suite = edge_suite(edge_object(**schema_reference("Outer")), schemas=schemas)
+
+    assert edge_summary(suite) == [("minimum:/v", {"v": -3}), ("maximum:/v", {"v": 10})]
+    first = edge_cases(suite)[0]
+    assert "/components/schemas/Inner" in first.provenance
+    assert "/components/schemas/Inner/minimum" in first.provenance
+
+
+def test_a_numeric_root_body_is_targeted() -> None:
+    suite = edge_suite({"type": "integer", "minimum": -3, "maximum": 10})
+
+    assert edge_summary(suite) == [("minimum:", -3), ("maximum:", 10)]
+
+
+def test_optional_absent_properties_are_not_materialized() -> None:
+    suite = edge_suite(
+        {
+            "type": "object",
+            "required": ["v"],
+            "properties": {
+                "v": {"type": "integer", "minimum": 5},
+                "opt": {"type": "integer", "minimum": -3, "maximum": 10},
+            },
+        }
+    )
+
+    assert suite.cases[0].request_body.value == {"v": 5}  # type: ignore[union-attr]
+    assert edge_summary(suite) == []
+
+
+def test_edge_equal_to_the_baseline_adds_no_case() -> None:
+    both = edge_suite(edge_object(type="integer", minimum=5, maximum=10))
+    only_minimum = edge_suite(edge_object(type="integer", minimum=5))
+
+    assert both.cases[0].request_body.value == {"v": 5}  # type: ignore[union-attr]
+    assert edge_summary(both) == [("maximum:/v", {"v": 10})]
+    assert edge_summary(only_minimum) == []
+
+
+def test_equal_bounds_and_equivalent_edges_give_one_case() -> None:
+    equal = edge_suite(edge_object(type="integer", minimum=7, maximum=7, default=7))
+    assert edge_summary(equal) == []
+
+    # minimum -3 and exclusiveMinimum -4 both mean -3: one case, named after the first.
+    twin = edge_suite(edge_object(type="integer", minimum=-3, exclusiveMinimum=-4))
+    assert edge_summary(twin) == [("minimum:/v", {"v": -3})]
+    assert edge_diagnostics(twin) == []
+
+
+@pytest.mark.parametrize(
+    "literal", [{"const": 5}, {"enum": [3, 5, 9]}, {"enum": [4, 9]}]
+)
+def test_const_and_enum_schemas_get_no_edge_case(literal: dict[str, object]) -> None:
+    suite = edge_suite(edge_object(type="integer", minimum=4, maximum=9, **literal))
+
+    assert edge_summary(suite) == []
+    assert edge_diagnostics(suite) == []
+
+
+def test_contradictory_bounds_have_no_candidate() -> None:
+    candidate = generator_module._numeric_edge_candidate
+    assert candidate({"type": "integer", "minimum": 10, "maximum": 5}, "minimum", "3.1.1") is None
+    assert candidate({"type": "integer", "minimum": 10, "maximum": 5}, "maximum", "3.1.1") is None
+    assert (
+        candidate({"type": "integer", "exclusiveMinimum": 5, "exclusiveMaximum": 6}, "exclusiveMinimum", "3.1.1")
+        is None
+    )
+    assert candidate({"type": "integer", "minimum": 1, "multipleOf": 0}, "minimum", "3.1.1") is None
+    assert candidate({"type": "integer", "minimum": 1}, "maximum", "3.1.1") is None
+    # An implicit format range is a validity limit, never a target.
+    assert (
+        candidate({"type": "integer", "format": "int32", "minimum": 2**40}, "minimum", "3.1.1")
+        is None
+    )
+
+
+NEAREST_FLOAT_CASES = [
+    # The decimal step 0.1 would give 0.2; the nearest float inside the bound wins.
+    ({"type": "number", "exclusiveMinimum": 0.1, "maximum": 1.0}, "exclusiveMinimum", 0.10000000000000002),
+    ({"type": "number", "exclusiveMinimum": 0.1, "maximum": 0.15}, "exclusiveMinimum", 0.10000000000000002),
+    ({"type": "number", "minimum": 0.05, "exclusiveMaximum": 0.1}, "exclusiveMaximum", 0.09999999999999999),
+    ({"type": "number", "minimum": 0.1, "exclusiveMaximum": 0.15}, "exclusiveMaximum", 0.14999999999999997),
+    # High precision bounds.
+    ({"type": "number", "exclusiveMinimum": 0.13436424411240122}, "exclusiveMinimum", 0.13436424411240125),
+    ({"type": "number", "exclusiveMaximum": 0.13436424411240122}, "exclusiveMaximum", 0.1343642441124012),
+    # Another active constraint moves the valid interval inward.
+    ({"type": "number", "exclusiveMinimum": 0.1, "minimum": 0.5, "maximum": 1.0}, "exclusiveMinimum", 0.5),
+    ({"type": "number", "exclusiveMaximum": 1.0, "minimum": 0.1, "maximum": 0.5}, "exclusiveMaximum", 0.5),
+    ({"type": "number", "exclusiveMinimum": 0.1, "exclusiveMaximum": 3.0, "minimum": 2.5}, "exclusiveMinimum", 2.5),
+    # Inclusive bounds stay on the bound.
+    ({"type": "number", "minimum": 0.1, "maximum": 0.15}, "minimum", 0.1),
+    ({"type": "number", "minimum": 0.1, "maximum": 0.15}, "maximum", 0.15),
+]
+
+
+@pytest.mark.parametrize(("schema", "constraint", "expected"), NEAREST_FLOAT_CASES)
+def test_number_edge_is_the_nearest_representable_value_inside_the_bounds(
+    schema: dict[str, object], constraint: str, expected: float
+) -> None:
+    candidate = generator_module._numeric_edge_candidate(schema, constraint, "3.1.1")
+
+    assert candidate is not None and candidate[0] == expected
+    # Checked in Decimal arithmetic against every supported constraint.
+    assert generator_module._numeric_schema_constraints_match(
+        schema, generator_module._as_decimal(expected), "3.1.1", ""  # type: ignore[arg-type]
+    )
+
+
+@pytest.mark.parametrize(
+    ("schema", "constraint", "expected"),
+    [
+        ({"type": "number", "exclusiveMinimum": 0.1, "maximum": 1.0}, "exclusiveMinimum", 0.10000000000000002),
+        ({"type": "number", "minimum": 0.05, "exclusiveMaximum": 0.1}, "exclusiveMaximum", 0.09999999999999999),
+        ({"type": "number", "minimum": 0.1, "exclusiveMaximum": 0.15}, "exclusiveMaximum", 0.14999999999999997),
+    ],
+)
+def test_number_edge_cases_use_the_nearest_value(
+    schema: dict[str, object], constraint: str, expected: float
+) -> None:
+    suite = edge_suite(edge_object(**schema))
+
+    assert (f"{constraint}:/v", {"v": expected}) in edge_summary(suite)
+    assert edge_diagnostics(suite) == []
+
+
+def test_a_rounded_float_that_is_already_inside_the_bound_is_checked_first() -> None:
+    from decimal import Decimal
+
+    candidate = generator_module._numeric_edge_candidate
+    # float(bound) is 0.1; its JSON text 0.1 is already inside both bounds.
+    lower = {"type": "number", "exclusiveMinimum": Decimal("0.099999999999999999")}
+    upper = {"type": "number", "exclusiveMaximum": Decimal("0.100000000000000001")}
+    assert candidate(lower, "exclusiveMinimum", "3.1.1") == (0.1, "0.1")
+    assert candidate(upper, "exclusiveMaximum", "3.1.1") == (0.1, "0.1")
+    # A nearer float than the rounded one is used when it is still inside the bound.
+    inclusive = {"type": "number", "minimum": Decimal("0.100000000000000001")}
+    assert candidate(inclusive, "minimum", "3.1.1") == (0.10000000000000002, "0.10000000000000002")
+    below = {"type": "number", "maximum": Decimal("0.099999999999999999")}
+    assert candidate(below, "maximum", "3.1.1") == (0.09999999999999999, "0.09999999999999999")
+
+
+def test_number_edges_respect_both_bounds_and_narrow_intervals() -> None:
+    candidate = generator_module._numeric_edge_candidate
+    both = {"type": "number", "exclusiveMinimum": 0.1, "exclusiveMaximum": 0.15}
+    lower = candidate(both, "exclusiveMinimum", "3.1.1")
+    upper = candidate(both, "exclusiveMaximum", "3.1.1")
+    assert lower == (0.10000000000000002, "0.10000000000000002")
+    assert upper == (0.14999999999999997, "0.14999999999999997")
+
+    narrow = {"type": "number", "exclusiveMinimum": 0.1, "maximum": 0.10000000000000002}
+    assert candidate(narrow, "exclusiveMinimum", "3.1.1") == (0.10000000000000002, "0.10000000000000002")
+    assert candidate(narrow, "maximum", "3.1.1") == (0.10000000000000002, "0.10000000000000002")
+
+
+def test_a_genuinely_impossible_float_interval_has_no_candidate() -> None:
+    candidate = generator_module._numeric_edge_candidate
+    # No float lies strictly between 0.1 and its successor.
+    empty = {"type": "number", "exclusiveMinimum": 0.1, "exclusiveMaximum": 0.10000000000000002}
+    assert candidate(empty, "exclusiveMinimum", "3.1.1") is None
+    assert candidate(empty, "exclusiveMaximum", "3.1.1") is None
+    assert candidate(
+        {"type": "number", "exclusiveMinimum": 5, "exclusiveMaximum": 5}, "exclusiveMinimum", "3.1.1"
+    ) is None
+    # Another constraint pushes the nearest value past the other bound.
+    assert candidate(
+        {"type": "number", "exclusiveMinimum": 0.1, "minimum": 2.0, "maximum": 1.0}, "exclusiveMinimum", "3.1.1"
+    ) is None
+    # Nothing is generated for such a body: the baseline has no value either.
+    assert edge_cases(edge_suite(edge_object(**empty))) == []
+
+
+FLOAT_MAX = 1.7976931348623157e308
+FLOAT_MAX_TEXT = "1.7976931348623157E+308"
+
+
+def decimal_of(text: str):  # type: ignore[no-untyped-def]
+    from decimal import Decimal
+
+    return Decimal(text)
+
+
+def extreme_candidate(schema: dict[str, object], constraint: str) -> tuple[object, object] | None:
+    return generator_module._numeric_edge_candidate(schema, constraint, "3.1.1")
+
+
+@pytest.mark.parametrize("constraint", ["minimum", "exclusiveMinimum"])
+def test_a_lower_bound_below_the_finite_range_uses_the_smallest_finite_float(
+    constraint: str,
+) -> None:
+    schema = {"type": "number", constraint: decimal_of("-1e400")}
+
+    candidate = extreme_candidate(schema, constraint)
+
+    assert candidate is not None
+    assert decimal_of(str(candidate[0])) == decimal_of("-" + FLOAT_MAX_TEXT)
+    assert candidate[1] == generator_module._decimal_key(decimal_of("-" + FLOAT_MAX_TEXT))
+
+
+@pytest.mark.parametrize("constraint", ["minimum", "exclusiveMinimum"])
+def test_a_lower_bound_above_the_finite_range_has_no_finite_candidate(constraint: str) -> None:
+    assert extreme_candidate({"type": "number", constraint: decimal_of("1e400")}, constraint) is None
+
+
+@pytest.mark.parametrize("constraint", ["maximum", "exclusiveMaximum"])
+def test_an_upper_bound_above_the_finite_range_uses_the_largest_finite_float(
+    constraint: str,
+) -> None:
+    schema = {"type": "number", constraint: decimal_of("1e400")}
+
+    candidate = extreme_candidate(schema, constraint)
+
+    assert candidate is not None
+    assert decimal_of(str(candidate[0])) == decimal_of(FLOAT_MAX_TEXT)
+    assert candidate[1] == generator_module._decimal_key(decimal_of(FLOAT_MAX_TEXT))
+
+
+@pytest.mark.parametrize("constraint", ["maximum", "exclusiveMaximum"])
+def test_an_upper_bound_below_the_finite_range_has_no_finite_candidate(constraint: str) -> None:
+    assert extreme_candidate({"type": "number", constraint: decimal_of("-1e400")}, constraint) is None
+
+
+def test_a_bound_at_the_edge_of_the_finite_range_keeps_strict_and_inclusive_semantics() -> None:
+    top = decimal_of(FLOAT_MAX_TEXT)
+    # Inclusive: the largest finite float itself. Exclusive: nothing lies above it.
+    assert extreme_candidate({"type": "number", "minimum": top}, "minimum") is not None
+    assert extreme_candidate({"type": "number", "exclusiveMinimum": top}, "exclusiveMinimum") is None
+    assert extreme_candidate({"type": "number", "maximum": -top}, "maximum") is not None
+    assert extreme_candidate({"type": "number", "exclusiveMaximum": -top}, "exclusiveMaximum") is None
+    # Just inside the range, the next finite float below is used.
+    assert extreme_candidate({"type": "number", "exclusiveMaximum": top}, "exclusiveMaximum") is not None
+
+
+def test_an_extreme_float_candidate_is_validated_against_the_other_constraints() -> None:
+    # The smallest finite float is not below this maximum, so no candidate is returned.
+    schema = {
+        "type": "number",
+        "minimum": decimal_of("-1e400"),
+        "maximum": decimal_of("-1e309"),
+    }
+    assert extreme_candidate(schema, "minimum") is None
+    # With a satisfiable maximum the extreme float is accepted.
+    schema = {"type": "number", "minimum": decimal_of("-1e400"), "maximum": 0}
+    candidate = extreme_candidate(schema, "minimum")
+    assert candidate is not None and decimal_of(str(candidate[0])) < 0
+    # A stricter finite bound on the same side moves the nearest valid value inward.
+    schema = {"type": "number", "minimum": decimal_of("-1e400"), "exclusiveMinimum": 5}
+    assert extreme_candidate(schema, "exclusiveMinimum") == (5.000000000000001, "5.000000000000001")
+
+
+def test_the_float_range_behavior_is_deterministic() -> None:
+    schema = {"type": "number", "minimum": decimal_of("-1e400"), "maximum": decimal_of("1e400")}
+
+    assert extreme_candidate(schema, "minimum") == extreme_candidate(deepcopy(schema), "minimum")
+    assert extreme_candidate(schema, "maximum") == extreme_candidate(deepcopy(schema), "maximum")
+
+
+def test_integer_and_multiple_of_candidates_never_use_the_float_search(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def forbidden(*args: object) -> None:
+        raise AssertionError("the float search was used")
+
+    monkeypatch.setattr(generator_module, "_nearest_float_edge_candidate", forbidden)
+    candidate = generator_module._numeric_edge_candidate
+
+    assert candidate({"type": "integer", "exclusiveMinimum": 5, "maximum": 6}, "exclusiveMinimum", "3.1.1") == (6, "6")
+    assert candidate(
+        {"type": "number", "multipleOf": 0.25, "exclusiveMinimum": 0.1, "maximum": 1}, "exclusiveMinimum", "3.1.1"
+    ) == (0.25, "0.25")
+    # A multipleOf schema with no multiple inside the interval has no candidate.
+    assert candidate(
+        {"type": "number", "multipleOf": 0.3, "exclusiveMinimum": 0.3, "maximum": 0.5},
+        "exclusiveMinimum",
+        "3.1.1",
+    ) is None
+    assert candidate({"type": "integer", "exclusiveMinimum": 5, "exclusiveMaximum": 6}, "exclusiveMinimum", "3.1.1") is None
+
+
+def test_float_search_output_is_deterministic() -> None:
+    body = edge_object(type="number", exclusiveMinimum=0.1, maximum=1.0)
+
+    first = edge_suite(body)
+    assert first.model_dump_json() == edge_suite(deepcopy(body)).model_dump_json()
+    assert edge_summary(first) == [("exclusiveMinimum:/v", {"v": 0.10000000000000002})]
+
+
+def test_implicit_format_limits_are_not_targets() -> None:
+    suite = edge_suite(edge_object(type="integer", format="int32"))
+
+    assert edge_summary(suite) == []
+    assert edge_diagnostics(suite) == []
+
+
+def test_ancestor_constraint_that_rejects_the_changed_body_blocks_the_case() -> None:
+    body = {
+        "type": "object",
+        "required": ["a"],
+        "properties": {
+            "a": {
+                "type": "object",
+                "const": {"n": 7},
+                "required": ["n"],
+                "properties": {"n": {"type": "integer", "minimum": 5, "maximum": 9}},
+            }
+        },
+    }
+
+    suite = edge_suite(body)
+
+    assert suite.cases[0].request_body.value == {"a": {"n": 7}}  # type: ignore[union-attr]
+    assert edge_summary(suite) == []
+    assert [item.source_pointer.rsplit("/", 1)[1] for item in edge_diagnostics(suite)] == [  # type: ignore[union-attr]
+        "minimum",
+        "maximum",
+    ]
+
+
+def test_edge_cases_are_deterministic_last_and_use_stable_ids() -> None:
+    body = edge_object(type="integer", minimum=-3, maximum=10)
+    first = edge_suite(body)
+    second = edge_suite(deepcopy(body))
+
+    assert first.model_dump_json() == second.model_dump_json()
+    ids = [case.case_id for case in first.cases]
+    assert len(ids) == len(set(ids))
+    # Every negative case comes before every valid-edge case.
+    kinds = [is_valid_edge_case(case) for case in first.cases]
+    assert kinds == sorted(kinds)
+    assert [case.case_id for case in edge_cases(first)] == [
+        build_case_id("positive", "/items", "post", "numeric-valid-edge:/v:minimum:-3"),
+        build_case_id("positive", "/items", "post", "numeric-valid-edge:/v:maximum:10"),
+    ]
+
+
+def test_existing_baselines_and_negative_cases_are_unchanged_by_the_edge_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = {
+        "type": "object",
+        "required": ["v", "w"],
+        "properties": {
+            "v": {"type": "integer", "minimum": -3, "maximum": 10},
+            "w": {"type": "number", "exclusiveMinimum": -2.5},
+        },
+    }
+
+    def build() -> GeneratedTestSuite:
+        return edge_suite(body)
+
+    with_step = build()
+    without_step = suite_without_edge_step(monkeypatch, build)
+
+    assert edge_cases(with_step)
+    kept = without_valid_edge_cases(with_step)
+    assert [case.model_dump_json() for case in kept] == [
+        case.model_dump_json() for case in without_step.cases
+    ]
+    assert with_step.diagnostics[: len(without_step.diagnostics)] == without_step.diagnostics
+
+
+def test_edge_cases_share_no_state_with_other_cases() -> None:
+    suite = isolation_suite()
+    source = next(case for case in suite.cases if is_valid_edge_case(case))
+    for mutate in ISOLATION_MUTATIONS.values():
+        before = [case.model_dump(mode="json") for case in suite.cases]
+        mutate(source)
+        after = [case.model_dump(mode="json") for case in suite.cases]
+        index = suite.cases.index(source)
+        assert after[index] != before[index]
+        assert [item for i, item in enumerate(after) if i != index] == [
+            item for i, item in enumerate(before) if i != index
+        ]
+
+    # The body is an independent copy of the baseline body.
+    nested = edge_suite(
+        {
+            "type": "object",
+            "required": ["a"],
+            "properties": {
+                "a": {
+                    "type": "object",
+                    "required": ["n", "m"],
+                    "properties": {
+                        "n": {"type": "integer", "minimum": -3},
+                        "m": {"type": "object", "example": {"k": [1]}},
+                    },
+                }
+            },
+        }
+    )
+    [edge] = edge_cases(nested)
+    baseline_before = nested.cases[0].model_dump(mode="json")
+    edge.request_body.value["a"]["m"]["k"].append(2)  # type: ignore[union-attr, index]
+    edge.request_body.value["a"]["n"] = 99  # type: ignore[union-attr, index]
+    assert nested.cases[0].model_dump(mode="json") == baseline_before
+
+
+def test_the_edge_step_does_not_mutate_its_input() -> None:
+    body = edge_object(type="integer", minimum=-3, maximum=10)
+    result = make_result(post_endpoint(body))
+    before = result.model_dump_json()
+
+    generate_test_suite(result)
+
+    assert result.model_dump_json() == before
+
+
+def edge_endpoint_suite() -> GeneratedTestSuite:
+    return edge_suite(edge_object(type="integer", minimum=-3, maximum=10))
+
+
+def test_endpoint_case_limit_keeps_every_negative_case_and_drops_only_the_edge_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    full = edge_endpoint_suite()
+    retained = len(without_valid_edge_cases(full))
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_CASES", retained)
+
+    suite = edge_endpoint_suite()
+
+    assert [case.case_id for case in suite.cases] == [
+        case.case_id for case in without_valid_edge_cases(full)
+    ]
+    [budget] = [item for item in suite.diagnostics if item.code == "generation_case_budget_exceeded"]
+    assert "'numeric_valid_edge'" in budget.message
+    assert edge_diagnostics(suite) == []
+
+
+def test_suite_case_limit_keeps_every_negative_case_and_drops_only_the_edge_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    retained = len(without_valid_edge_cases(edge_endpoint_suite()))
+    monkeypatch.setattr(generator_module, "_MAX_SUITE_CASES", retained)
+
+    suite = edge_endpoint_suite()
+
+    assert edge_cases(suite) == []
+    assert len(suite.cases) == retained
+    assert "generation_case_budget_exceeded" in {item.code for item in suite.diagnostics}
+
+
+def test_the_edge_step_is_all_or_nothing_under_the_case_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    retained = len(without_valid_edge_cases(edge_endpoint_suite()))
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_CASES", retained + 1)  # room for one of two
+
+    suite = edge_endpoint_suite()
+
+    assert edge_cases(suite) == []
+    assert len(suite.cases) == retained
+
+
+def test_expansion_budget_exhaustion_in_the_edge_step_is_a_budget_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    schemas = {"Num": {"type": "integer", "minimum": -3, "maximum": 10}}
+    body = edge_object(**schema_reference("Num"))
+
+    def build() -> GeneratedTestSuite:
+        return edge_suite(body, schemas=schemas)
+
+    without_step = suite_without_edge_step(monkeypatch, build)
+    with monkeypatch.context() as patch:
+        patch.setattr(generator_module, "_numeric_valid_edge_cases", lambda *args: ((), ()))
+        needed = count_expansions(
+            make_result(
+                post_endpoint(body),
+                components=Components(schemas={"Num": Schema(raw=schemas["Num"])}),  # type: ignore[arg-type]
+            )
+        )
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_EXPANSIONS", needed)
+
+    suite = build()
+
+    assert [case.case_id for case in suite.cases] == [case.case_id for case in without_step.cases]
+    [budget] = [item for item in suite.diagnostics if item.code == "generation_expansion_budget_exceeded"]
+    assert "'numeric_valid_edge'" in budget.message
+    assert edge_diagnostics(suite) == []
+    assert not any(item.code == "unsupported_schema_reference" for item in suite.diagnostics)
+
+
+def test_pattern_budget_exhaustion_in_the_edge_step_is_a_budget_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = {
+        "type": "object",
+        "required": ["v", "s"],
+        "properties": {
+            "v": {"type": "integer", "minimum": -3, "maximum": 10},
+            "s": {"type": "string", "pattern": "^[a-z]+$"},
+        },
+    }
+    without_step = suite_without_edge_step(monkeypatch, lambda: edge_suite(body))
+    original = generator_module._matches
+
+    def exhausted_on_edge_bodies(schema: object, value: object, *args: object) -> bool:
+        # Only the valid-edge step validates a whole body whose "v" is an edge value.
+        if isinstance(value, dict) and value.get("v") in (-3, 10):
+            raise generator_module._BudgetExhausted(
+                generator_module._PATTERN_BUDGET_CODE, "endpoint", 1, "/pattern", None
+            )
+        return original(schema, value, *args)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(generator_module, "_matches", exhausted_on_edge_bodies)
+
+    suite = edge_suite(body)
+
+    assert [case.case_id for case in suite.cases] == [case.case_id for case in without_step.cases]
+    [budget] = [item for item in suite.diagnostics if item.code == "generation_pattern_budget_exceeded"]
+    assert "'numeric_valid_edge'" in budget.message
+    assert edge_diagnostics(suite) == []
+
+
+def test_an_edge_body_does_not_recharge_a_pattern_evaluated_by_the_baseline() -> None:
+    body = {
+        "type": "object",
+        "required": ["v", "s"],
+        "properties": {
+            "v": {"type": "integer", "minimum": -3, "maximum": 10},
+            "s": {"type": "string", "pattern": "^[a-z]+$"},
+        },
+    }
+    charges: list[int] = []
+    original = generator_module._GenerationBudget.charge_pattern_evaluation
+
+    def counting(self: object, pointer: object, work: int) -> None:
+        charges.append(work)
+        original(self, pointer, work)  # type: ignore[arg-type]
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(generator_module._GenerationBudget, "charge_pattern_evaluation", counting)
+        with_step = edge_suite(body)
+        with_step_charges = len(charges)
+        charges.clear()
+        patch.setattr(generator_module, "_numeric_valid_edge_cases", lambda *args: ((), ()))
+        edge_suite(body)
+
+    assert len(edge_cases(with_step)) == 2
+    assert with_step_charges == len(charges)
+
+
+def test_unsupported_schema_diagnostics_are_not_duplicated_by_the_edge_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = {
+        "type": "object",
+        "required": ["v"],
+        "properties": {
+            "v": {"type": "integer", "minimum": -3, "maximum": 10},
+            "gone": {"$ref": "#/components/schemas/Missing"},
+        },
+    }
+
+    def build() -> GeneratedTestSuite:
+        return edge_suite(body)
+
+    without_step = suite_without_edge_step(monkeypatch, build)
+    with_step = build()
+
+    assert [item.code for item in without_step.diagnostics].count("unsupported_schema_reference") >= 1
+    assert with_step.diagnostics == without_step.diagnostics
+    assert len(edge_cases(with_step)) == 2
+
+
+def test_edge_cases_carry_the_step_8_41_response_expectations() -> None:
+    endpoint = make_endpoint(
+        "/items",
+        "post",
+        request_body=body_with_schema(edge_object(type="integer", minimum=-3, maximum=10)),
+        responses={
+            "200": Response(
+                description="OK",
+                content={
+                    "application/json": MediaType(schema=Schema(raw=schema_reference("Problem")))
+                },
+            ),
+            "400": Response(description="Invalid request"),
+        },
+    )
+    suite = generate_test_suite(
+        make_result_with_schemas(endpoint, {"Problem": {"type": "object"}})
+    )
+
+    baseline = suite.cases[0]
+    resolved = baseline.response_expectations[0].resolved_schemas_by_media_type
+    assert resolved["application/json"].reference_chain == ("#/components/schemas/Problem",)
+    for case in edge_cases(suite):
+        assert case.response_expectations == baseline.response_expectations
+        assert case.response_expectations is not baseline.response_expectations
+        edge_resolved = case.response_expectations[0].resolved_schemas_by_media_type
+        assert edge_resolved["application/json"].resolved is not resolved["application/json"].resolved
+    assert len(edge_cases(suite)) == 2
+
+
+# --- Effective-bound ownership of valid-edge cases (Step 8.42.1) -------------------------
+
+
+def edge_identities(suite: GeneratedTestSuite) -> list[tuple[str, str, object, bool]]:
+    """(constraint, keyword pointer tail, value, ID matches the expected ID) per edge case."""
+    found = []
+    for case in edge_cases(suite):
+        constraint = case.provenance[-1].split(":")[1]
+        value = case.request_body.value["v"]  # type: ignore[union-attr, index]
+        key = generator_module._decimal_key(generator_module._as_decimal(value))  # type: ignore[arg-type]
+        expected = build_case_id(
+            "positive", "/items", "post", f"numeric-valid-edge:/v:{constraint}:{key}"
+        )
+        assert case.provenance[-1] == f"valid_boundary_edge:{constraint}:/v"
+        assert case.provenance[-2].endswith(f"/properties/v/{constraint}")
+        assert case.provenance[-3].endswith("/properties/v")
+        found.append((constraint, case.provenance[-2].rsplit("/", 1)[1], value, case.case_id == expected))
+    return found
+
+
+@pytest.mark.parametrize(
+    ("schema", "owner", "value", "weaker"),
+    [
+        # exclusiveMinimum 6 is stricter than minimum 5.
+        ({"minimum": 5, "exclusiveMinimum": 6, "maximum": 10}, "exclusiveMinimum", 6.000000000000001, "minimum"),
+        # minimum 6 is stricter than exclusiveMinimum 5; the default keeps 6 off the baseline.
+        ({"minimum": 6, "exclusiveMinimum": 5, "default": 7}, "minimum", 6, "exclusiveMinimum"),
+        # exclusiveMaximum 9 is stricter than maximum 10.
+        ({"minimum": 1, "maximum": 10, "exclusiveMaximum": 9}, "exclusiveMaximum", 8.999999999999998, "maximum"),
+        # maximum 9 is stricter than exclusiveMaximum 10.
+        ({"minimum": 1, "maximum": 9, "exclusiveMaximum": 10}, "maximum", 9, "exclusiveMaximum"),
+    ],
+)
+def test_only_the_stricter_same_side_constraint_owns_the_edge(
+    schema: dict[str, object], owner: str, value: float, weaker: str
+) -> None:
+    suite = edge_suite(edge_object(type="number", **schema))
+
+    same_side = [item for item in edge_identities(suite) if item[0] in (owner, weaker)]
+    assert same_side == [(owner, owner, value, True)]
+    assert edge_diagnostics(suite) == []
+
+
+def test_a_weaker_integer_bound_no_longer_reports_a_false_diagnostic() -> None:
+    suite = edge_suite(edge_object(type="integer", minimum=5, exclusiveMinimum=6, maximum=20))
+
+    # The baseline holds 20 (the maximum); the weaker minimum 5 is invalid anyway.
+    assert suite.cases[0].request_body.value == {"v": 20}  # type: ignore[union-attr]
+    assert edge_identities(suite) == [("exclusiveMinimum", "exclusiveMinimum", 7, True)]
+    assert edge_diagnostics(suite) == []
+
+
+@pytest.mark.parametrize(
+    ("schema", "owner", "value"),
+    [
+        ({"minimum": 5, "exclusiveMinimum": 5, "maximum": 10}, "exclusiveMinimum", 5.000000000000001),
+        ({"minimum": 1, "maximum": 9, "exclusiveMaximum": 9}, "exclusiveMaximum", 8.999999999999998),
+    ],
+)
+def test_the_exclusive_constraint_owns_an_equal_bound(
+    schema: dict[str, object], owner: str, value: float
+) -> None:
+    suite = edge_suite(edge_object(type="number", **schema))
+
+    inclusive = "minimum" if owner == "exclusiveMinimum" else "maximum"
+    assert [item for item in edge_identities(suite) if item[0] in (owner, inclusive)] == [
+        (owner, owner, value, True)
+    ]
+
+
+def test_equivalent_effective_bounds_keep_one_deterministic_case() -> None:
+    # minimum -3 and exclusiveMinimum -4 both admit -3 first; minimum is stricter.
+    body = edge_object(type="integer", minimum=-3, exclusiveMinimum=-4, maximum=10)
+    first = edge_suite(body)
+    second = edge_suite(deepcopy(body))
+
+    assert edge_identities(first) == [
+        ("minimum", "minimum", -3, True),
+        ("maximum", "maximum", 10, True),
+    ]
+    assert [case.case_id for case in edge_cases(first)] == [
+        build_case_id("positive", "/items", "post", "numeric-valid-edge:/v:minimum:-3"),
+        build_case_id("positive", "/items", "post", "numeric-valid-edge:/v:maximum:10"),
+    ]
+    assert first.model_dump_json() == second.model_dump_json()
+
+
+def test_openapi_3_0_boolean_modifiers_keep_their_ownership() -> None:
+    flagged = edge_suite(
+        edge_object(type="number", minimum=5, exclusiveMinimum=True, maximum=10, exclusiveMaximum=True),
+        version="3.0.3",
+    )
+    plain = edge_suite(
+        edge_object(type="number", minimum=-3, exclusiveMinimum=False, maximum=10),
+        version="3.0.3",
+    )
+
+    assert [item[:3] for item in edge_identities(flagged)] == [
+        ("exclusiveMinimum", "exclusiveMinimum", 5.000000000000001),
+        ("exclusiveMaximum", "exclusiveMaximum", 9.999999999999998),
+    ]
+    assert all(item[3] for item in edge_identities(flagged))
+    assert [item[:3] for item in edge_identities(plain)] == [
+        ("minimum", "minimum", -3),
+        ("maximum", "maximum", 10),
+    ]
+
+
+def test_edge_bound_owners_per_side_and_dialect() -> None:
+    owners = generator_module._edge_bound_owners
+    assert owners({"minimum": 5, "exclusiveMinimum": 6, "maximum": 10}, "3.1.1") == {
+        "exclusiveMinimum",
+        "maximum",
+    }
+    assert owners({"minimum": 6, "exclusiveMinimum": 5}, "3.1.1") == {"minimum"}
+    assert owners({"maximum": 10, "exclusiveMaximum": 9}, "3.1.1") == {"exclusiveMaximum"}
+    assert owners({"maximum": 9, "exclusiveMaximum": 10}, "3.1.1") == {"maximum"}
+    assert owners({"minimum": 5, "exclusiveMinimum": 5}, "3.1.1") == {"exclusiveMinimum"}
+    assert owners({"minimum": 5, "exclusiveMinimum": True}, "3.0.3") == {"exclusiveMinimum"}
+    assert owners({"minimum": 5, "exclusiveMinimum": False}, "3.0.3") == {"minimum"}
+    # An implicit format range stricter than the declared bound is owned by no keyword.
+    assert owners({"format": "int32", "minimum": -(2**40), "maximum": 5}, "3.1.1") == {"maximum"}
+
+
+def test_ownership_output_is_repeatable() -> None:
+    body = edge_object(type="number", minimum=5, exclusiveMinimum=6, maximum=10)
+
+    assert edge_suite(body).model_dump_json() == edge_suite(deepcopy(body)).model_dump_json()

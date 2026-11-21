@@ -131,6 +131,8 @@ _CASE_BUDGET_CODE = "generation_case_budget_exceeded"
 _DIAGNOSTIC_BUDGET_CODE = "generation_diagnostic_budget_exceeded"
 _PATTERN_BUDGET_CODE = "generation_pattern_budget_exceeded"
 _ANCESTOR_LITERAL_CODE = "negative_case_ancestor_literal_conflict"
+_VALID_EDGE_CODE = "valid_boundary_no_safe_candidate"
+_NUMERIC_EDGE_CONSTRAINTS = ("minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum")
 
 
 class _GenerationBudget:
@@ -369,6 +371,9 @@ def _negative_steps(
         ("required_request_body", required_request_body),
         ("enum_const", lambda: _enum_const_negative_cases(endpoint, positive, api)),
         ("array_bounds", lambda: _array_bound_negative_cases(endpoint, positive, api)),
+        # Positive valid-edge cases come last, so every negative case keeps its
+        # priority under the case limits.
+        ("numeric_valid_edge", lambda: _numeric_valid_edge_cases(endpoint, positive, api)),
     )
 
 
@@ -2769,6 +2774,337 @@ def _float_boundary_fallback(
             continue
         return candidate, _decimal_key(exact_value)
     return None
+
+
+def _collect_valid_edge_targets(
+    schema: Any,
+    value: Any,
+    path: tuple[str, ...],
+    pointer: str,
+    targets: list[tuple[tuple[str, ...], dict[str, Any], str, str]],
+) -> None:
+    """Collect numeric schemas that have a value in the baseline body.
+
+    The walk follows the baseline value, so only properties and array elements
+    that the baseline already holds are targeted. Of an array, only the first
+    element is targeted. Unusable references are skipped without a diagnostic:
+    the baseline and the negative steps already report them.
+    """
+    followed = _follow_property_schema(schema, pointer, _skip_issue)
+    if followed is None:
+        return
+    schema, pointer = followed
+    if not isinstance(schema, dict) or schema.get("readOnly") is True:
+        return
+    kind = schema.get("type")
+    if kind in ("integer", "number"):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return
+        targets.extend(
+            (path, schema, pointer, constraint) for constraint in _NUMERIC_EDGE_CONSTRAINTS
+        )
+    elif kind in (None, "object") and isinstance(value, dict):
+        properties = schema.get("properties")
+        if not isinstance(properties, dict):
+            return
+        for name in sorted(properties):
+            if name in value:
+                _collect_valid_edge_targets(
+                    properties[name],
+                    value[name],
+                    (*path, name),
+                    _child(pointer, "properties", name),
+                    targets,
+                )
+    elif kind == "array" and isinstance(value, list) and value and "items" in schema:
+        _collect_valid_edge_targets(
+            schema["items"], value[0], (*path, "0"), _child(pointer, "items"), targets
+        )
+
+
+def _numeric_edge_candidate(
+    schema: dict[str, Any], constraint: str, version: str
+) -> tuple[int | float, str] | None:
+    """The nearest valid lattice value at or just inside one declared bound.
+
+    An inclusive bound gives the bound itself when it is a valid value. Otherwise
+    the nearest value of the schema's lattice (``multipleOf``, whole numbers for
+    integers, or the bound's own decimal precision) inside the bound is used. The
+    value must satisfy every supported numeric constraint. All arithmetic is
+    Decimal arithmetic. None means that no safe value exists.
+    """
+    try:
+        kind = schema.get("type")
+        boundary = _active_numeric_bound(schema, constraint, version)
+        if boundary is None:
+            return None
+        multiple = _as_decimal(schema.get("multipleOf"))
+        if "multipleOf" in schema and (multiple is None or multiple <= 0):
+            return None
+        if kind == "number" and multiple is None:
+            return _nearest_float_edge_candidate(schema, constraint, version)
+        if multiple is None:
+            step = (
+                Decimal(1)
+                if kind == "integer"
+                else Decimal(1).scaleb(-_decimal_places(boundary))
+            )
+        elif kind == "integer":
+            # Integer multiples of p/q (in lowest terms) are spaced by p.
+            step = Decimal(abs(multiple.as_integer_ratio()[0]))
+        else:
+            step = multiple
+
+        if constraint in ("minimum", "exclusiveMinimum"):
+            units = _decimal_ceil_units(boundary, step)
+            if constraint == "exclusiveMinimum" and _decimal_product(units, step) == boundary:
+                units += 1
+        else:
+            units = _decimal_floor_units(boundary, step)
+            if constraint == "exclusiveMaximum" and _decimal_product(units, step) == boundary:
+                units -= 1
+        value = _decimal_product(units, step)
+        if not _numeric_schema_constraints_match(schema, value, version, ""):
+            return None
+        converted = _decimal_to_json_number(value, kind)
+        if converted is None:
+            return None
+        return converted, _decimal_key(value)
+    except (InvalidOperation, OverflowError, ValueError):
+        return None
+
+
+def _nearest_float_edge_candidate(
+    schema: dict[str, Any], constraint: str, version: str
+) -> tuple[int | float, str] | None:
+    """The nearest JSON number inside the targeted side of a ``number`` schema.
+
+    The side's effective bound is the strictest of every active bound on that
+    side (and the format range). The result is the smallest (lower side) or
+    largest (upper side) float whose JSON text satisfies it. No valid value
+    lies nearer, so if that value breaks another constraint, none exists.
+    Floats only locate candidates; every comparison uses Decimal values.
+    """
+    lower: tuple[Decimal, bool] | None = None
+    upper: tuple[Decimal, bool] | None = None
+    for key, side, strict in _effective_numeric_bounds(schema, version):
+        bound = _numeric_bound_value(schema, key, version)
+        if bound is None:
+            continue
+        if side == "lower":
+            if lower is None or bound > lower[0] or (bound == lower[0] and strict):
+                lower = (bound, strict)
+        elif upper is None or bound < upper[0] or (bound == upper[0] and strict):
+            upper = (bound, strict)
+    format_range = _FORMAT_RANGES.get(schema.get("format"))
+    if format_range is not None:
+        if lower is None or format_range[0] > lower[0]:
+            lower = (format_range[0], False)
+        if upper is None or format_range[1] < upper[0]:
+            upper = (format_range[1], False)
+
+    is_lower = constraint in ("minimum", "exclusiveMinimum")
+    side_bound = lower if is_lower else upper
+    if side_bound is None:
+        return None
+    bound, strict = side_bound
+    toward = math.inf if is_lower else -math.inf
+
+    def valid(candidate: float) -> bool:
+        if not math.isfinite(candidate):
+            return False
+        value = Decimal(str(candidate))
+        if is_lower:
+            return value > bound or (value == bound and not strict)
+        return value < bound or (value == bound and not strict)
+
+    start = float(bound)
+    if math.isinf(start):
+        # Outside the finite float range: a bound on the far side of the range
+        # admits no finite value; on the near side the extreme finite float is
+        # the nearest one, and the checks below still apply to it.
+        if (start > 0) == is_lower:
+            return None
+        start = math.nextafter(start, 0.0)
+    current = start
+    if valid(current):
+        # The rounded float may sit past the bound; a nearer valid float may exist.
+        while valid(previous := math.nextafter(current, -toward)):
+            current = previous
+    else:
+        while not valid(current):
+            current = math.nextafter(current, toward)
+            if not math.isfinite(current):
+                return None
+    value = Decimal(str(current))
+    if not _numeric_schema_constraints_match(schema, value, version, ""):
+        return None
+    converted = _decimal_to_json_number(value, "number")
+    if converted is None:
+        return None
+    return converted, _decimal_key(value)
+
+
+def _edge_bound_owners(schema: dict[str, Any], version: str) -> frozenset[str]:
+    """The keywords that define the effective lower and upper numeric boundaries.
+
+    On each side the strictest bound owns the boundary. Of equal bounds the
+    exclusive one owns it, and a tie of equal strictness goes to the keyword
+    that comes first. An implicit format range stricter than every declared
+    bound is owned by no keyword.
+    """
+    best: dict[str, tuple[Decimal, bool, str | None]] = {}
+    for key, side, strict in _effective_numeric_bounds(schema, version):
+        bound = _numeric_bound_value(schema, key, version)
+        if bound is None:
+            continue
+        current = best.get(side)
+        if (
+            current is None
+            or (bound > current[0] if side == "lower" else bound < current[0])
+            or (bound == current[0] and strict and not current[1])
+        ):
+            best[side] = (bound, strict, key)
+    format_range = _FORMAT_RANGES.get(schema.get("format"))
+    if format_range is not None:
+        for side, limit in (("lower", format_range[0]), ("upper", format_range[1])):
+            current = best.get(side)
+            if current is not None and (
+                limit > current[0] if side == "lower" else limit < current[0]
+            ):
+                best[side] = (limit, False, None)
+    return frozenset(owner for _, _, owner in best.values() if owner is not None)
+
+
+def _numeric_valid_edge_cases(
+    endpoint: Endpoint, positive: GeneratedTestCase, api: ApiModel
+) -> tuple[tuple[GeneratedTestCase, ...], tuple[GenerationDiagnostic, ...]]:
+    """Generate one positive body per distinct valid numeric boundary value.
+
+    Each case is the baseline body with one numeric property replaced by the
+    value at or just inside one of its declared bounds. The whole body must
+    still satisfy the request body schema.
+    """
+    version = api.openapi_version
+    resolved = _resolved_request_body(endpoint, api)
+    if resolved is None or positive.request_body is None:
+        return (), ()
+    request_body, body_pointer = resolved
+    if set(request_body.content) != {"application/json"}:
+        return (), ()
+    media = request_body.content["application/json"]
+    if media.schema is None or not isinstance(media.schema.raw, (dict, bool)):
+        return (), ()
+
+    root_pointer = _child(body_pointer, "content", "application/json", "schema")
+    baseline_value = positive.request_body.value
+    targets: list[tuple[tuple[str, ...], dict[str, Any], str, str]] = []
+    _collect_valid_edge_targets(media.schema.raw, baseline_value, (), root_pointer, targets)
+    if not targets:
+        return (), ()
+    try:
+        root, root_schema_pointer, _ = _follow_schema_reference(media.schema.raw, root_pointer)
+        root_checked = _check_schema(root, version, root_schema_pointer, "request", 0)
+    except _UnsupportedOperation:
+        # The baseline and the negative steps already report an unusable schema.
+        return (), ()
+    if not isinstance(root_checked, dict):
+        return (), ()
+
+    def diagnostic(message: str, pointer: str) -> GenerationDiagnostic:
+        return GenerationDiagnostic(
+            code=_VALID_EDGE_CODE,
+            message=message,
+            endpoint_path=endpoint.path,
+            endpoint_method=endpoint.method,
+            source_pointer=pointer,
+            reference_uri=None,
+        )
+
+    cases: list[GeneratedTestCase] = []
+    diagnostics: list[GenerationDiagnostic] = []
+    seen: set[tuple[str, str]] = set()
+    for path, target_schema, schema_pointer, constraint in targets:
+        # A baseline value is already a valid value of a const or enum schema.
+        if "const" in target_schema or "enum" in target_schema:
+            continue
+        if _active_numeric_bound(target_schema, constraint, version) is None:
+            continue
+        # A weaker bound on the same side defines no edge of its own.
+        if constraint not in _edge_bound_owners(target_schema, version):
+            continue
+        keyword_pointer = _child(schema_pointer, constraint)
+        property_pointer = _json_pointer(path) if path else ""
+        candidate = _numeric_edge_candidate(target_schema, constraint, version)
+        if candidate is None:
+            diagnostics.append(
+                diagnostic(
+                    f"No deterministic numeric value at or just inside '{constraint}' "
+                    "satisfies the other supported constraints; no valid boundary "
+                    "case was generated.",
+                    keyword_pointer,
+                )
+            )
+            continue
+        value, candidate_key = candidate
+        if _equal(value, _value_at(baseline_value, path)):
+            continue
+        if (property_pointer, candidate_key) in seen:
+            continue
+
+        generated_value = deepcopy(baseline_value)
+        if path:
+            parent = _value_at(generated_value, path[:-1])
+            if isinstance(parent, list):
+                parent[int(path[-1])] = value
+            else:
+                parent[path[-1]] = value
+        else:
+            generated_value = value
+        try:
+            body_valid = _matches(
+                root_checked, generated_value, version, "request", 0, root_schema_pointer
+            )
+        except _UnsupportedOperation:
+            continue
+        if not body_valid:
+            diagnostics.append(
+                diagnostic(
+                    f"The valid boundary case for '{constraint}' at "
+                    f"'{property_pointer}' was not generated: the changed body "
+                    "does not satisfy the request body schema.",
+                    keyword_pointer,
+                )
+            )
+            continue
+
+        seen.add((property_pointer, candidate_key))
+        cases.append(
+            _counted_case(
+                case_id=build_case_id(
+                    "positive",
+                    endpoint.path,
+                    endpoint.method,
+                    f"numeric-valid-edge:{property_pointer}:{constraint}:{candidate_key}",
+                ),
+                category="positive",
+                path=positive.path,
+                method=positive.method,
+                parameters=tuple(deepcopy(item) for item in positive.parameters),
+                request_body=GeneratedBody(
+                    media_type="application/json", value=generated_value
+                ),
+                security=deepcopy(positive.security),
+                response_expectations=deepcopy(positive.response_expectations),
+                provenance=(
+                    *positive.provenance,
+                    schema_pointer,
+                    keyword_pointer,
+                    f"valid_boundary_edge:{constraint}:{property_pointer}",
+                ),
+            )
+        )
+    return tuple(cases), tuple(diagnostics)
 
 
 def _active_numeric_bound(
