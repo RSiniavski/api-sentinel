@@ -1206,12 +1206,17 @@ def test_generates_required_json_object_properties_and_omits_optional_and_read_o
 
     suite = generate_test_suite(make_result(endpoint))
 
-    assert sum(case.category == "positive" for case in suite.cases) == 1
+    # One baseline plus the string valid-edge case for minLength 2 (Step 8.42.2.1).
+    assert sum(case.category == "positive" for case in suite.cases) == 2
     positive = suite.cases[0]
     body = positive.request_body
     assert body == GeneratedBody(
         media_type="application/json",
         value={"name": "sentinel", "secret": "sentinel"},
+    )
+    [edge] = [case for case in suite.cases if is_valid_edge_case(case)]
+    assert edge.request_body == GeneratedBody(
+        media_type="application/json", value={"name": "xx", "secret": "sentinel"}
     )
     negatives = [case for case in suite.cases if case.violated_constraint == "required_property"]
     assert len(negatives) == 2
@@ -5531,6 +5536,8 @@ def test_array_step_expansion_budget_drops_only_the_array_step(
             {"Item": ITEM_SCHEMA},
         )
 
+    # The valid-edge steps run after array_bounds; their hops are not part of this test.
+    monkeypatch.setattr(generator_module, "_string_valid_edge_cases", lambda *args: ((), ()))
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(generator_module, "_array_bound_negative_cases", lambda *args: ((), ()))
         hops_without_array_step = count_expansions(build())
@@ -8533,6 +8540,8 @@ def test_root_array_expansion_budget_drops_only_the_array_step(
             {"Item": ITEM_SCHEMA},
         )
 
+    # The valid-edge steps run after array_bounds; their hops are not part of this test.
+    monkeypatch.setattr(generator_module, "_string_valid_edge_cases", lambda *args: ((), ()))
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(generator_module, "_array_bound_negative_cases", lambda *args: ((), ()))
         hops_without_array_step = count_expansions(build())
@@ -11950,8 +11959,16 @@ def test_isolation_suite_covers_every_expected_negative_step() -> None:
 
     assert suite.cases[0].category == "positive"
     assert counts == ISOLATION_STEPS
-    # The only valid-edge case is the maximum of "count" (the baseline holds the minimum).
-    assert [case.request_body.value["count"] for case in suite.cases if is_valid_edge_case(case)] == [9]  # type: ignore[union-attr, index]
+    # Valid-edge cases: the maximum of "count" (the baseline holds the minimum) and the
+    # minLength of "name" (the baseline "senti" holds the maximum length).
+    assert [
+        (case.provenance[-1], case.request_body.value["count"], case.request_body.value["name"])  # type: ignore[union-attr, index]
+        for case in suite.cases
+        if is_valid_edge_case(case)
+    ] == [
+        ("valid_boundary_edge:maximum:/count", 9, "senti"),
+        ("valid_boundary_edge:minLength:/name", 1, "xx"),
+    ]
     for case in suite.cases:
         assert case.security is not None and len(case.response_expectations) == 2
 
@@ -12111,6 +12128,7 @@ def test_items_reference_hop_is_charged_to_the_expansion_budget(
 
     # The valid-edge step runs after array_bounds; its hops are not part of this test.
     monkeypatch.setattr(generator_module, "_numeric_valid_edge_cases", lambda *args: ((), ()))
+    monkeypatch.setattr(generator_module, "_string_valid_edge_cases", lambda *args: ((), ()))
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(generator_module, "_array_bound_negative_cases", lambda *args: ((), ()))
         hops_without_array_step = count_expansions(build())
@@ -14356,6 +14374,7 @@ def test_ancestor_literal_validation_leaves_the_expansion_budget_unchanged(
     schemas = {"Meta": meta_schema(**literal)}
     # The valid-edge step runs last and follows its own references (Step 8.42.1).
     monkeypatch.setattr(generator_module, "_numeric_valid_edge_cases", lambda *args: ((), ()))
+    monkeypatch.setattr(generator_module, "_string_valid_edge_cases", lambda *args: ((), ()))
 
     def budget_codes(limit: int) -> set[str]:
         monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_EXPANSIONS", limit)
@@ -16990,3 +17009,493 @@ def test_ownership_output_is_repeatable() -> None:
     body = edge_object(type="number", minimum=5, exclusiveMinimum=6, maximum=10)
 
     assert edge_suite(body).model_dump_json() == edge_suite(deepcopy(body)).model_dump_json()
+
+
+# --- String valid boundary-edge cases (Step 8.42.2.1) ------------------------------------
+
+
+def string_edge_cases(suite: GeneratedTestSuite) -> list[GeneratedTestCase]:
+    return [
+        case
+        for case in suite.cases
+        if is_valid_edge_case(case)
+        and case.provenance[-1].split(":")[1] in ("minLength", "maxLength")
+    ]
+
+
+def string_edges(suite: GeneratedTestSuite) -> list[tuple[str, object]]:
+    """(constraint:pointer, body) of each string valid-edge case, in case order.
+
+    Also asserts the provenance shape and the exact ID of every case.
+    """
+    found = []
+    for case in string_edge_cases(suite):
+        label = case.provenance[-1].removeprefix("valid_boundary_edge:")
+        constraint, pointer = label.split(":", 1)
+        assert case.category == "positive"
+        assert case.violated_constraint is None and case.affected_property is None
+        assert case.provenance[-2].endswith(f"/{constraint}")
+        assert case.provenance[-3] == case.provenance[-2].rsplit("/", 1)[0]
+        length = len(_string_at(case.request_body.value, pointer))  # type: ignore[union-attr]
+        assert case.case_id == build_case_id(
+            "positive", "/items", "post", f"string-valid-edge:{pointer}:{constraint}:{length}"
+        )
+        found.append((label, case.request_body.value))  # type: ignore[union-attr]
+    return found
+
+
+def _string_at(body: object, pointer: str) -> str:
+    value = body
+    for part in [item for item in pointer.split("/") if item]:
+        value = value[int(part)] if isinstance(value, list) else value[part]  # type: ignore[index]
+    assert isinstance(value, str)
+    return value
+
+
+def string_object(**schema: object) -> dict[str, object]:
+    return {"type": "object", "required": ["v"], "properties": {"v": {"type": "string", **schema}}}
+
+
+@pytest.mark.parametrize("version", ["3.0.3", "3.1.1"])
+def test_min_length_only_gets_a_minimum_edge(version: str) -> None:
+    suite = edge_suite(string_object(minLength=3), version=version)
+
+    assert suite.cases[0].request_body.value == {"v": "sentinel"}  # type: ignore[union-attr]
+    assert string_edges(suite) == [("minLength:/v", {"v": "xxx"})]
+
+
+@pytest.mark.parametrize("version", ["3.0.3", "3.1.1"])
+def test_max_length_only_gets_a_maximum_edge(version: str) -> None:
+    suite = edge_suite(string_object(maxLength=20), version=version)
+
+    assert string_edges(suite) == [("maxLength:/v", {"v": "x" * 20})]
+
+
+def test_both_constraints_give_two_cases_in_keyword_order() -> None:
+    suite = edge_suite(string_object(minLength=2, maxLength=20))
+
+    assert string_edges(suite) == [
+        ("minLength:/v", {"v": "xx"}),
+        ("maxLength:/v", {"v": "x" * 20}),
+    ]
+
+
+@pytest.mark.parametrize("bounds", [{"minLength": 3, "maxLength": 3}, {"minLength": 12, "maxLength": 12}])
+def test_equal_bounds_are_covered_by_the_baseline_length(bounds: dict[str, int]) -> None:
+    suite = edge_suite(string_object(**bounds))
+
+    assert len(suite.cases[0].request_body.value["v"]) == bounds["minLength"]  # type: ignore[union-attr, index]
+    assert string_edges(suite) == []
+
+
+def test_a_baseline_at_the_minimum_length_skips_the_minimum_edge() -> None:
+    suite = edge_suite(string_object(minLength=5, maxLength=20, example="hello"))
+
+    assert suite.cases[0].request_body.value == {"v": "hello"}  # type: ignore[union-attr]
+    # Deduplication is by length: "hello" has the minimum length, "xxxxx" would repeat it.
+    assert string_edges(suite) == [("maxLength:/v", {"v": "x" * 20})]
+
+
+def test_a_baseline_at_the_maximum_length_skips_the_maximum_edge() -> None:
+    suite = edge_suite(string_object(minLength=1, maxLength=3))
+
+    assert suite.cases[0].request_body.value == {"v": "sen"}  # type: ignore[union-attr]
+    assert string_edges(suite) == [("minLength:/v", {"v": "x"})]
+
+
+def test_min_length_zero_gives_the_empty_string() -> None:
+    suite = edge_suite(string_object(minLength=0))
+
+    assert suite.cases[0].request_body.value == {"v": "sentinel"}  # type: ignore[union-attr]
+    assert string_edges(suite) == [("minLength:/v", {"v": ""})]
+    assert edge_suite(string_object(minLength=0, example="")).cases[0].request_body.value == {"v": ""}  # type: ignore[union-attr]
+    assert string_edges(edge_suite(string_object(minLength=0, example=""))) == []
+
+
+def test_max_length_zero_is_covered_by_the_empty_baseline() -> None:
+    for bounds in ({"maxLength": 0}, {"minLength": 0, "maxLength": 0}):
+        suite = edge_suite(string_object(**bounds))
+
+        assert suite.cases[0].request_body.value == {"v": ""}  # type: ignore[union-attr]
+        assert string_edges(suite) == []
+
+
+def test_type_arrays_containing_string_are_targeted() -> None:
+    schema = {
+        "type": "object",
+        "required": ["v"],
+        "properties": {"v": {"type": ["string", "null"], "minLength": 2, "maxLength": 20}},
+    }
+
+    suite = edge_suite(schema)
+
+    assert string_edges(suite) == [("minLength:/v", {"v": "xx"}), ("maxLength:/v", {"v": "x" * 20})]
+
+
+def test_nullable_schemas_and_null_baselines_get_no_edge() -> None:
+    nullable_30 = edge_suite(string_object(nullable=True, minLength=2, maxLength=20), version="3.0.3")
+    assert string_edges(nullable_30) == [
+        ("minLength:/v", {"v": "xx"}),
+        ("maxLength:/v", {"v": "x" * 20}),
+    ]
+
+    null_31 = {
+        "type": "object",
+        "required": ["v"],
+        "properties": {"v": {"type": ["string", "null"], "minLength": 2, "default": None}},
+    }
+    suite = edge_suite(null_31)
+    assert suite.cases[0].request_body.value == {"v": None}  # type: ignore[union-attr]
+    assert string_edges(suite) == []
+
+
+def test_a_schema_without_a_declared_string_type_is_not_targeted() -> None:
+    suite = edge_suite({"type": "object", "required": ["v"], "properties": {"v": {"minLength": 3}}})
+
+    assert string_edges(suite) == []
+
+
+def test_nested_object_properties_keep_the_rest_of_the_baseline() -> None:
+    body = {
+        "type": "object",
+        "required": ["a", "tag"],
+        "properties": {
+            "tag": {"type": "string", "example": "t"},
+            "a": {
+                "type": "object",
+                "required": ["s"],
+                "properties": {"s": {"type": "string", "minLength": 2, "maxLength": 20}},
+            },
+        },
+    }
+
+    suite = edge_suite(body)
+
+    assert suite.cases[0].request_body.value == {"tag": "t", "a": {"s": "sentinel"}}  # type: ignore[union-attr]
+    assert string_edges(suite) == [
+        ("minLength:/a/s", {"tag": "t", "a": {"s": "xx"}}),
+        ("maxLength:/a/s", {"tag": "t", "a": {"s": "x" * 20}}),
+    ]
+
+
+def test_only_the_first_array_element_is_targeted_for_strings() -> None:
+    body = {"type": "array", "minItems": 2, "items": {"type": "string", "minLength": 3, "maxLength": 20}}
+
+    suite = edge_suite(body)
+
+    assert suite.cases[0].request_body.value == ["sentinel", "sentinel"]  # type: ignore[union-attr]
+    assert string_edges(suite) == [
+        ("minLength:/0", ["xxx", "sentinel"]),
+        ("maxLength:/0", ["x" * 20, "sentinel"]),
+    ]
+
+
+def test_string_edges_follow_property_reference_chains() -> None:
+    schemas = {
+        "Outer": {"$ref": "#/components/schemas/Inner"},
+        "Inner": {"type": "string", "minLength": 3, "maxLength": 20},
+    }
+    suite = edge_suite(
+        {"type": "object", "required": ["v"], "properties": {"v": schema_reference("Outer")}},
+        schemas=schemas,
+    )
+
+    assert string_edges(suite) == [("minLength:/v", {"v": "xxx"}), ("maxLength:/v", {"v": "x" * 20})]
+    first = string_edge_cases(suite)[0]
+    assert "/components/schemas/Inner" in first.provenance
+    assert "/components/schemas/Inner/minLength" in first.provenance
+
+
+def test_a_root_string_body_is_targeted() -> None:
+    suite = edge_suite({"type": "string", "minLength": 3, "maxLength": 20})
+
+    assert string_edges(suite) == [("minLength:", "xxx"), ("maxLength:", "x" * 20)]
+
+
+def test_optional_absent_and_read_only_properties_are_not_materialized() -> None:
+    suite = edge_suite(
+        {
+            "type": "object",
+            "required": ["v", "ro"],
+            "properties": {
+                "v": {"type": "string", "example": "abc"},
+                "ro": {"type": "string", "readOnly": True, "minLength": 3, "maxLength": 9},
+                "opt": {"type": "string", "minLength": 3, "maxLength": 9},
+            },
+        }
+    )
+
+    assert suite.cases[0].request_body.value == {"v": "abc"}  # type: ignore[union-attr]
+    assert string_edges(suite) == []
+
+
+def test_pattern_candidates_are_only_validated_never_synthesized() -> None:
+    accepted = edge_suite(string_object(minLength=3, maxLength=20, pattern="^[a-z]+$"))
+    assert string_edges(accepted) == [
+        ("minLength:/v", {"v": "xxx"}),
+        ("maxLength:/v", {"v": "x" * 20}),
+    ]
+
+    for pattern in ("^a[a-z]+$", "^[a-z]{2}$"):
+        rejected = edge_suite(string_object(minLength=2, maxLength=20, pattern=pattern, example="ab"))
+        assert rejected.cases[0].request_body.value == {"v": "ab"}  # type: ignore[union-attr]
+        assert string_edges(rejected) == []
+        assert edge_diagnostics(rejected) == []
+
+
+def test_format_constrained_strings_are_skipped() -> None:
+    for format_name, kwargs in (
+        ("email", {"maxLength": 20}),
+        ("date", {"minLength": 5, "maxLength": 10}),
+        ("uuid", {"minLength": 5, "maxLength": 40}),
+    ):
+        assert string_edges(edge_suite(string_object(format=format_name, **kwargs))) == []
+
+
+@pytest.mark.parametrize("literal", [{"const": "abcd"}, {"enum": ["abcd", "abcde"]}])
+def test_const_and_enum_strings_are_skipped(literal: dict[str, object]) -> None:
+    assert string_edges(edge_suite(string_object(minLength=2, maxLength=20, **literal))) == []
+
+
+def test_ancestor_constraints_that_reject_the_changed_body_skip_the_case(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = {
+        "type": "object",
+        "required": ["a"],
+        "properties": {
+            "a": {
+                "type": "object",
+                "const": {"s": "abcdef"},
+                "required": ["s"],
+                "properties": {"s": {"type": "string", "minLength": 2, "maxLength": 10}},
+            }
+        },
+    }
+
+    suite = edge_suite(body)
+    without_step = suite_without_edge_step(monkeypatch, lambda: edge_suite(body))
+
+    assert suite.cases[0].request_body.value == {"a": {"s": "abcdef"}}  # type: ignore[union-attr]
+    assert string_edges(suite) == []
+    assert suite.diagnostics == without_step.diagnostics
+
+
+def test_the_candidate_length_limit_is_one_hundred() -> None:
+    at_limit = edge_suite(string_object(minLength=2, maxLength=100))
+    above = edge_suite(string_object(minLength=2, maxLength=101))
+
+    assert string_edges(at_limit) == [
+        ("minLength:/v", {"v": "xx"}),
+        ("maxLength:/v", {"v": "x" * 100}),
+    ]
+    assert string_edges(above) == [("minLength:/v", {"v": "xx"})]
+    assert edge_diagnostics(above) == []
+
+
+def test_edge_order_is_traversal_then_min_then_max_with_stable_ids() -> None:
+    body = {
+        "type": "object",
+        "required": ["b", "a"],
+        "properties": {
+            "b": {"type": "string", "minLength": 2, "maxLength": 20},
+            "a": {"type": "string", "minLength": 3, "maxLength": 30},
+        },
+    }
+    first = edge_suite(body)
+    second = edge_suite(deepcopy(body))
+
+    assert [label for label, _ in string_edges(first)] == [
+        "minLength:/a",
+        "maxLength:/a",
+        "minLength:/b",
+        "maxLength:/b",
+    ]
+    assert first.model_dump_json() == second.model_dump_json()
+    ids = [case.case_id for case in first.cases]
+    assert len(ids) == len(set(ids))
+    kinds = [is_valid_edge_case(case) for case in first.cases]
+    assert kinds == sorted(kinds)  # every negative case comes before every valid-edge case
+    assert string_edge_cases(first)[0].provenance[-3:] == (
+        "/paths/~1items/post/requestBody/content/application~1json/schema/properties/a",
+        "/paths/~1items/post/requestBody/content/application~1json/schema/properties/a/minLength",
+        "valid_boundary_edge:minLength:/a",
+    )
+
+
+def test_string_edge_cases_share_no_state_and_do_not_mutate_the_input() -> None:
+    suite = isolation_suite()
+    source = next(
+        case for case in suite.cases if case.provenance[-1] == "valid_boundary_edge:minLength:/name"
+    )
+    for mutate in ISOLATION_MUTATIONS.values():
+        before = [case.model_dump(mode="json") for case in suite.cases]
+        mutate(source)
+        after = [case.model_dump(mode="json") for case in suite.cases]
+        index = suite.cases.index(source)
+        assert after[index] != before[index]
+        assert [item for i, item in enumerate(after) if i != index] == [
+            item for i, item in enumerate(before) if i != index
+        ]
+
+    body = {
+        "type": "object",
+        "required": ["a"],
+        "properties": {
+            "a": {
+                "type": "object",
+                "required": ["s", "m"],
+                "properties": {
+                    "s": {"type": "string", "minLength": 2},
+                    "m": {"type": "object", "example": {"k": [1]}},
+                },
+            }
+        },
+    }
+    result = make_result(post_endpoint(body))
+    before_input = result.model_dump_json()
+    nested = generate_test_suite(result)
+    assert result.model_dump_json() == before_input
+    [edge] = string_edge_cases(nested)
+    baseline_before = nested.cases[0].model_dump(mode="json")
+    edge.request_body.value["a"]["m"]["k"].append(2)  # type: ignore[union-attr, index]
+    edge.request_body.value["a"]["s"] = "changed"  # type: ignore[union-attr, index]
+    assert nested.cases[0].model_dump(mode="json") == baseline_before
+
+
+def mixed_edge_body() -> dict[str, object]:
+    return {
+        "type": "object",
+        "required": ["n", "s"],
+        "properties": {
+            "n": {"type": "integer", "minimum": -3, "maximum": 10},
+            "s": {"type": "string", "minLength": 2, "maxLength": 20},
+        },
+    }
+
+
+def test_numeric_valid_edge_cases_are_unchanged_by_the_string_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with_step = edge_suite(mixed_edge_body())
+    with monkeypatch.context() as patch:
+        patch.setattr(generator_module, "_string_valid_edge_cases", lambda *args: ((), ()))
+        without_step = edge_suite(mixed_edge_body())
+
+    assert [case.model_dump_json() for case in with_step.cases[: len(without_step.cases)]] == [
+        case.model_dump_json() for case in without_step.cases
+    ]
+    assert with_step.diagnostics == without_step.diagnostics
+    assert [case.provenance[-1] for case in with_step.cases[len(without_step.cases) :]] == [
+        "valid_boundary_edge:minLength:/s",
+        "valid_boundary_edge:maxLength:/s",
+    ]
+    assert [case.provenance[-1] for case in edge_cases(without_step)] == [
+        "valid_boundary_edge:minimum:/n",
+        "valid_boundary_edge:maximum:/n",
+    ]
+
+
+def test_endpoint_case_limit_drops_only_the_string_step(monkeypatch: pytest.MonkeyPatch) -> None:
+    full = edge_suite(mixed_edge_body())
+    retained = len(full.cases) - 2
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_CASES", retained)
+
+    suite = edge_suite(mixed_edge_body())
+
+    assert [case.case_id for case in suite.cases] == [case.case_id for case in full.cases[:retained]]
+    assert len(edge_cases(suite)) == 2  # the numeric edges are kept
+    [budget] = [item for item in suite.diagnostics if item.code == "generation_case_budget_exceeded"]
+    assert "'string_valid_edge'" in budget.message
+    assert edge_diagnostics(suite) == []
+
+
+def test_suite_case_limit_drops_only_the_string_step(monkeypatch: pytest.MonkeyPatch) -> None:
+    full = edge_suite(mixed_edge_body())
+    monkeypatch.setattr(generator_module, "_MAX_SUITE_CASES", len(full.cases) - 2)
+
+    suite = edge_suite(mixed_edge_body())
+
+    assert string_edge_cases(suite) == []
+    assert len(edge_cases(suite)) == 2
+    assert "generation_case_budget_exceeded" in {item.code for item in suite.diagnostics}
+
+
+def test_the_string_step_is_all_or_nothing_under_the_case_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    full = edge_suite(mixed_edge_body())
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_CASES", len(full.cases) - 1)  # room for one of two
+
+    suite = edge_suite(mixed_edge_body())
+
+    assert string_edge_cases(suite) == []
+    assert len(suite.cases) == len(full.cases) - 2
+
+
+def test_expansion_exhaustion_in_the_string_step_keeps_the_numeric_edge_cases(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    schemas = {
+        "Num": {"type": "integer", "minimum": -3, "maximum": 10},
+        "Str": {"type": "string", "minLength": 2, "maxLength": 20},
+    }
+    body = {
+        "type": "object",
+        "required": ["n", "s"],
+        "properties": {"n": schema_reference("Num"), "s": schema_reference("Str")},
+    }
+
+    def build() -> GeneratedTestSuite:
+        return edge_suite(body, schemas=schemas)
+
+    components = Components(schemas={name: Schema(raw=raw) for name, raw in schemas.items()})  # type: ignore[arg-type]
+    with monkeypatch.context() as patch:
+        patch.setattr(generator_module, "_string_valid_edge_cases", lambda *args: ((), ()))
+        without_string = build()
+        needed = count_expansions(make_result(post_endpoint(body), components=components))
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_EXPANSIONS", needed)
+
+    suite = build()
+
+    assert [case.case_id for case in suite.cases] == [case.case_id for case in without_string.cases]
+    assert len(edge_cases(suite)) == 2  # numeric edges survive
+    assert string_edge_cases(suite) == []
+    [budget] = [item for item in suite.diagnostics if item.code == "generation_expansion_budget_exceeded"]
+    assert "'string_valid_edge'" in budget.message
+    assert edge_diagnostics(suite) == []
+
+
+def test_pattern_exhaustion_in_the_string_step_propagates_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = {
+        "type": "object",
+        "required": ["n", "s"],
+        "properties": {
+            "n": {"type": "integer", "minimum": -3, "maximum": 10},
+            "s": {"type": "string", "minLength": 2, "maxLength": 20, "pattern": "^[a-z]+$"},
+        },
+    }
+    with monkeypatch.context() as patch:
+        patch.setattr(generator_module, "_string_valid_edge_cases", lambda *args: ((), ()))
+        without_step = edge_suite(body)
+    original = generator_module._matches
+
+    def exhausted_on_edge_candidates(schema: object, value: object, *args: object) -> bool:
+        # Only the string step validates exactly these strings.
+        if value in ("xx", "x" * 20):
+            raise generator_module._BudgetExhausted(
+                generator_module._PATTERN_BUDGET_CODE, "endpoint", 1, "/pattern", None
+            )
+        return original(schema, value, *args)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(generator_module, "_matches", exhausted_on_edge_candidates)
+
+    suite = edge_suite(body)
+
+    assert string_edge_cases(suite) == []
+    assert [case.case_id for case in suite.cases] == [case.case_id for case in without_step.cases]
+    [budget] = [item for item in suite.diagnostics if item.code == "generation_pattern_budget_exceeded"]
+    assert "'string_valid_edge'" in budget.message
+    assert edge_diagnostics(suite) == []

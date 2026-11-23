@@ -132,6 +132,7 @@ _DIAGNOSTIC_BUDGET_CODE = "generation_diagnostic_budget_exceeded"
 _PATTERN_BUDGET_CODE = "generation_pattern_budget_exceeded"
 _ANCESTOR_LITERAL_CODE = "negative_case_ancestor_literal_conflict"
 _VALID_EDGE_CODE = "valid_boundary_no_safe_candidate"
+_STRING_EDGE_CONSTRAINTS = ("minLength", "maxLength")
 _NUMERIC_EDGE_CONSTRAINTS = ("minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum")
 
 
@@ -374,6 +375,7 @@ def _negative_steps(
         # Positive valid-edge cases come last, so every negative case keeps its
         # priority under the case limits.
         ("numeric_valid_edge", lambda: _numeric_valid_edge_cases(endpoint, positive, api)),
+        ("string_valid_edge", lambda: _string_valid_edge_cases(endpoint, positive, api)),
     )
 
 
@@ -3105,6 +3107,153 @@ def _numeric_valid_edge_cases(
             )
         )
     return tuple(cases), tuple(diagnostics)
+
+
+def _collect_string_edge_targets(
+    schema: Any,
+    value: Any,
+    path: tuple[str, ...],
+    pointer: str,
+    targets: list[tuple[tuple[str, ...], dict[str, Any], str, str]],
+) -> None:
+    """Collect string schemas with declared length bounds that the baseline holds.
+
+    The walk follows the baseline value, like the numeric collector: present
+    object properties in sorted order, the first array element, references,
+    and no ``readOnly`` schema. Unusable references are skipped without a
+    diagnostic because the baseline and the negative steps already report them.
+    """
+    followed = _follow_property_schema(schema, pointer, _skip_issue)
+    if followed is None:
+        return
+    schema, pointer = followed
+    if not isinstance(schema, dict) or schema.get("readOnly") is True:
+        return
+    kind = schema.get("type")
+    if isinstance(value, str):
+        if kind == "string" or (isinstance(kind, list) and "string" in kind):
+            targets.extend(
+                (path, schema, pointer, constraint)
+                for constraint in _STRING_EDGE_CONSTRAINTS
+                if constraint in schema
+            )
+    elif kind in (None, "object") and isinstance(value, dict):
+        properties = schema.get("properties")
+        if not isinstance(properties, dict):
+            return
+        for name in sorted(properties):
+            if name in value:
+                _collect_string_edge_targets(
+                    properties[name],
+                    value[name],
+                    (*path, name),
+                    _child(pointer, "properties", name),
+                    targets,
+                )
+    elif kind == "array" and isinstance(value, list) and value and "items" in schema:
+        _collect_string_edge_targets(
+            schema["items"], value[0], (*path, "0"), _child(pointer, "items"), targets
+        )
+
+
+def _string_valid_edge_cases(
+    endpoint: Endpoint, positive: GeneratedTestCase, api: ApiModel
+) -> tuple[tuple[GeneratedTestCase, ...], tuple[GenerationDiagnostic, ...]]:
+    """Generate one positive body per distinct valid string length boundary.
+
+    Each case is the baseline body with one string property replaced by
+    ``"x" * n``, where ``n`` is a declared ``minLength`` or ``maxLength``. A
+    target is skipped, without a diagnostic, when the baseline already has that
+    length or when the value does not satisfy its schema and the whole body.
+    """
+    version = api.openapi_version
+    resolved = _resolved_request_body(endpoint, api)
+    if resolved is None or positive.request_body is None:
+        return (), ()
+    request_body, body_pointer = resolved
+    if set(request_body.content) != {"application/json"}:
+        return (), ()
+    media = request_body.content["application/json"]
+    if media.schema is None or not isinstance(media.schema.raw, (dict, bool)):
+        return (), ()
+
+    root_pointer = _child(body_pointer, "content", "application/json", "schema")
+    baseline_value = positive.request_body.value
+    targets: list[tuple[tuple[str, ...], dict[str, Any], str, str]] = []
+    _collect_string_edge_targets(media.schema.raw, baseline_value, (), root_pointer, targets)
+    if not targets:
+        return (), ()
+    try:
+        root, root_schema_pointer, _ = _follow_schema_reference(media.schema.raw, root_pointer)
+        root_checked = _check_schema(root, version, root_schema_pointer, "request", 0)
+    except _UnsupportedOperation:
+        # The baseline and the negative steps already report an unusable schema.
+        return (), ()
+    if not isinstance(root_checked, dict):
+        return (), ()
+
+    cases: list[GeneratedTestCase] = []
+    seen: set[tuple[str, int]] = set()
+    for path, target_schema, schema_pointer, constraint in targets:
+        # A baseline value is already a valid value of a const or enum schema.
+        if "const" in target_schema or "enum" in target_schema:
+            continue
+        length = target_schema[constraint]
+        if not _bounded_int(length) or length > _MAX_COLLECTION_SIZE:
+            continue
+        property_pointer = _json_pointer(path) if path else ""
+        if len(_value_at(baseline_value, path)) == length:
+            continue
+        if (property_pointer, length) in seen:
+            continue
+        candidate = "x" * length
+        try:
+            target_checked = _check_schema(target_schema, version, schema_pointer, "request", 0)
+            if not _matches(target_checked, candidate, version, "request", 0, schema_pointer):
+                continue
+            generated_value = deepcopy(baseline_value)
+            if path:
+                parent = _value_at(generated_value, path[:-1])
+                if isinstance(parent, list):
+                    parent[int(path[-1])] = candidate
+                else:
+                    parent[path[-1]] = candidate
+            else:
+                generated_value = candidate
+            if not _matches(
+                root_checked, generated_value, version, "request", 0, root_schema_pointer
+            ):
+                continue
+        except _UnsupportedOperation:
+            continue
+
+        seen.add((property_pointer, length))
+        cases.append(
+            _counted_case(
+                case_id=build_case_id(
+                    "positive",
+                    endpoint.path,
+                    endpoint.method,
+                    f"string-valid-edge:{property_pointer}:{constraint}:{length}",
+                ),
+                category="positive",
+                path=positive.path,
+                method=positive.method,
+                parameters=tuple(deepcopy(item) for item in positive.parameters),
+                request_body=GeneratedBody(
+                    media_type="application/json", value=generated_value
+                ),
+                security=deepcopy(positive.security),
+                response_expectations=deepcopy(positive.response_expectations),
+                provenance=(
+                    *positive.provenance,
+                    schema_pointer,
+                    _child(schema_pointer, constraint),
+                    f"valid_boundary_edge:{constraint}:{property_pointer}",
+                ),
+            )
+        )
+    return tuple(cases), ()
 
 
 def _active_numeric_bound(
