@@ -17499,3 +17499,492 @@ def test_pattern_exhaustion_in_the_string_step_propagates_unchanged(
     [budget] = [item for item in suite.diagnostics if item.code == "generation_pattern_budget_exceeded"]
     assert "'string_valid_edge'" in budget.message
     assert edge_diagnostics(suite) == []
+
+
+# --- Bounded validation work for valid boundary edges (Step 8.43.1) ----------------------
+
+VALIDATION_CODE = "generation_validation_budget_exceeded"
+NUMERIC_BODY = edge_object(type="integer", minimum=1, maximum=5)
+STRING_BODY = string_object(minLength=2, maxLength=5)
+TWO_NUMBERS_BODY = {
+    "type": "object",
+    "required": ["a", "b"],
+    "properties": {
+        "a": {"type": "integer", "minimum": 1, "maximum": 5},
+        "b": {"type": "integer", "minimum": 1, "maximum": 5},
+    },
+}
+NUMBER_AND_STRING_BODY = {
+    "type": "object",
+    "required": ["n", "s"],
+    "properties": {
+        "n": {"type": "integer", "minimum": 1, "maximum": 5},
+        "s": {"type": "string", "minLength": 2, "maxLength": 5},
+    },
+}
+
+
+def validation_run(
+    monkeypatch: pytest.MonkeyPatch,
+    *bodies: object,
+    endpoint_limit: int | None = None,
+    suite_limit: int | None = None,
+) -> tuple[GeneratedTestSuite, "generator_module._GenerationBudget"]:
+    """Generate one endpoint per body and return the suite and its budget."""
+    created: list[generator_module._GenerationBudget] = []
+
+    class RecordingBudget(generator_module._GenerationBudget):
+        def __init__(self) -> None:
+            super().__init__()
+            created.append(self)
+
+    monkeypatch.setattr(generator_module, "_GenerationBudget", RecordingBudget)
+    if endpoint_limit is not None:
+        monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_VALIDATION_UNITS", endpoint_limit)
+    if suite_limit is not None:
+        monkeypatch.setattr(generator_module, "_MAX_SUITE_VALIDATION_UNITS", suite_limit)
+    endpoints = [post_endpoint(body, f"/items{index}") for index, body in enumerate(bodies)]
+    suite = generate_test_suite(make_result(*endpoints))
+    [budget] = created
+    return suite, budget
+
+
+def validation_diagnostics(suite: GeneratedTestSuite) -> list[GenerationDiagnostic]:
+    return [item for item in suite.diagnostics if item.code == VALIDATION_CODE]
+
+
+def case_keys(cases: object) -> list[tuple[str, object]]:
+    return [(case.case_id, case.request_body) for case in cases]  # type: ignore[attr-defined]
+
+
+def valid_edge_cases(suite: GeneratedTestSuite) -> list[GeneratedTestCase]:
+    return [case for case in suite.cases if is_valid_edge_case(case)]
+
+
+def wide_array_body(items: int, props: int, kind: str = "integer") -> dict[str, object]:
+    leaf = {
+        "integer": {"type": "integer", "minimum": 0, "maximum": 9},
+        "string": {"type": "string", "minLength": 1, "maxLength": 5},
+    }[kind]
+    return {
+        "type": "array",
+        "minItems": items,
+        "items": {
+            "type": "object",
+            "required": [f"p{i}" for i in range(props)],
+            "properties": {f"p{i}": dict(leaf) for i in range(props)},
+        },
+    }
+
+
+def wide_array_units(items: int, props: int, edges: int) -> int:
+    """Units of the valid-edge step for wide_array_body, counted by hand.
+
+    The root check enters the array schema, its items schema and each required
+    property. A candidate body enters the array and every item object once, and
+    for every property of every item both its schema check and its value.
+    """
+    root_check = 1 + (1 + props)
+    per_candidate = 1 + items * (1 + props) + (1 + props) + items * props
+    return root_check + edges * per_candidate
+
+
+def node_count(value: object) -> int:
+    if isinstance(value, list):
+        return 1 + sum(node_count(item) for item in value)
+    if isinstance(value, dict):
+        return 1 + sum(node_count(item) for item in value.values())
+    return 1
+
+
+def nested_body(depth: int, width: int) -> dict[str, object]:
+    schema: dict[str, object] = {"type": "integer", "minimum": 0, "maximum": 9}
+    for _ in range(depth):
+        properties = {f"p{i}": {"type": "integer", "minimum": 0, "maximum": 9} for i in range(width)}
+        schema = {
+            "type": "object",
+            "required": [*properties, "n"],
+            "properties": {**properties, "n": schema},
+        }
+    return schema
+
+
+def test_validation_budget_constants_and_code() -> None:
+    assert generator_module._VALIDATION_BUDGET_CODE == VALIDATION_CODE
+    assert generator_module._VALIDATION_UNIT == "validation work units"
+    assert generator_module._MAX_ENDPOINT_VALIDATION_UNITS == 600_000
+    assert generator_module._MAX_SUITE_VALIDATION_UNITS == 4_800_000
+    assert (
+        generator_module._MAX_SUITE_VALIDATION_UNITS
+        == 8 * generator_module._MAX_ENDPOINT_VALIDATION_UNITS
+    )
+
+
+def test_one_unit_is_one_entry_into_matches_or_check_schema_with_a_meter() -> None:
+    token, budget = with_budget()
+    try:
+        meter = generator_module._validation_meter("/p")
+        schema = {"type": "object", "required": ["a"], "properties": {"a": {"type": "integer"}}}
+
+        # The object schema and its required property.
+        generator_module._check_schema(schema, "3.1.1", "/p", "request", 0, meter)
+        assert budget.suite_validation_units == 2
+
+        # The object value, then the property's schema check and the property value.
+        assert generator_module._matches(schema, {"a": 1}, "3.1.1", "request", 0, "/p", meter)
+        assert budget.suite_validation_units == 2 + 3
+        assert budget.endpoint_validation_units == 5
+    finally:
+        generator_module._BUDGET.reset(token)  # type: ignore[arg-type]
+
+
+def test_calls_without_a_meter_are_neither_charged_nor_limited(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_VALIDATION_UNITS", 1)
+    monkeypatch.setattr(generator_module, "_MAX_SUITE_VALIDATION_UNITS", 1)
+    token, budget = with_budget()
+    try:
+        schema = {"type": "object", "required": ["a"], "properties": {"a": {"type": "integer"}}}
+
+        for _ in range(10):
+            generator_module._check_schema(schema, "3.1.1", "/p", "request", 0)
+            assert generator_module._matches(schema, {"a": 1}, "3.1.1", "request", 0, "/p")
+
+        assert budget.suite_validation_units == 0
+        assert budget.endpoint_validation_units == 0
+    finally:
+        generator_module._BUDGET.reset(token)  # type: ignore[arg-type]
+
+
+def test_no_meter_exists_outside_a_generation_call() -> None:
+    assert generator_module._validation_meter("/p") is None
+
+
+def test_other_steps_validate_candidates_without_validation_charges(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # No length or numeric bound, so no valid-edge candidate is ever validated. The
+    # enum, wrong-type and required steps still call _matches.
+    body = {
+        "type": "object",
+        "required": ["v", "w"],
+        "properties": {
+            "v": {"type": "string", "pattern": "^[a-z]+$", "enum": ["abc", "def"]},
+            "w": {"type": "integer", "enum": [1, 2, 3]},
+        },
+    }
+    calls = {"matches": 0}
+    original = generator_module._matches
+
+    def counting(*args: object) -> bool:
+        calls["matches"] += 1
+        return original(*args)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(generator_module, "_matches", counting)
+
+    suite, budget = validation_run(monkeypatch, body)
+
+    assert calls["matches"] > 0
+    assert len(suite.cases) > 3
+    assert valid_edge_cases(suite) == []
+    # The only validation work is the root schema check of the valid-edge steps:
+    # the object and its two required properties. The other steps' calls are free.
+    assert budget.suite_validation_units == 3
+    assert validation_diagnostics(suite) == []
+
+
+def test_numeric_valid_edge_validation_work_is_charged(monkeypatch: pytest.MonkeyPatch) -> None:
+    suite, budget = validation_run(monkeypatch, NUMERIC_BODY)
+
+    assert len(valid_edge_cases(suite)) == 1
+    # Root check: the object schema and its required property (2). The one
+    # candidate body: the object (1), then the property's schema check and value (2).
+    assert budget.suite_validation_units == 2 + 3
+    assert budget.endpoint_validation_units == 5
+    # Validation never charges the other budgets.
+    assert budget.suite_expansions == 0
+    assert budget.suite_pattern_evaluations == 0
+    assert budget.suite_cases == len(suite.cases)
+
+
+def test_string_valid_edge_validation_work_is_charged(monkeypatch: pytest.MonkeyPatch) -> None:
+    suite, budget = validation_run(monkeypatch, STRING_BODY)
+
+    assert len(valid_edge_cases(suite)) == 1
+    # Root check (2). The target string: its schema check and value (2). The
+    # candidate body: the object, then the property's schema check and value (3).
+    assert budget.suite_validation_units == 2 + 2 + 3
+    assert budget.suite_expansions == 0
+    assert budget.suite_pattern_evaluations == 0
+    assert budget.suite_cases == len(suite.cases)
+
+
+@pytest.mark.parametrize(
+    ("body", "step", "units"),
+    [(NUMERIC_BODY, "numeric_valid_edge", 5), (STRING_BODY, "string_valid_edge", 7)],
+)
+@pytest.mark.parametrize("scope", ["endpoint", "suite"])
+def test_validation_limit_is_exact(
+    monkeypatch: pytest.MonkeyPatch, body: object, step: str, units: int, scope: str
+) -> None:
+    limits = lambda value: {f"{scope}_limit": value}  # noqa: E731
+    with monkeypatch.context() as patch:
+        enough, _ = validation_run(patch, body, **limits(units))
+    with monkeypatch.context() as patch:
+        short, budget = validation_run(patch, body, **limits(units - 1))
+
+    assert len(valid_edge_cases(enough)) == 1
+    assert validation_diagnostics(enough) == []
+
+    assert valid_edge_cases(short) == []
+    [diagnostic] = validation_diagnostics(short)
+    assert f"The per-{scope} limit of {units - 1} validation work units" in diagnostic.message
+    assert f"'{step}'" in diagnostic.message
+    assert diagnostic.endpoint_path == "/items0"
+    assert diagnostic.source_pointer.endswith("/requestBody/content/application~1json/schema")  # type: ignore[union-attr]
+    # The unit that crossed the limit is counted, as for the other work budgets.
+    assert budget.suite_validation_units == units
+    assert case_keys(short.cases) == case_keys(without_valid_edge_cases(enough))
+
+
+def test_exhaustion_discards_every_case_of_the_step_even_after_valid_candidates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with monkeypatch.context() as patch:
+        full, budget = validation_run(patch, TWO_NUMBERS_BODY)
+    units = budget.suite_validation_units
+    assert len(valid_edge_cases(full)) == 2
+
+    with monkeypatch.context() as patch:
+        # The first candidate is fully validated; the second runs out of work.
+        short, _ = validation_run(patch, TWO_NUMBERS_BODY, endpoint_limit=units - 1)
+
+    assert valid_edge_cases(short) == []
+    assert len(validation_diagnostics(short)) == 1
+
+
+def test_baseline_negative_and_earlier_step_cases_survive_exhaustion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with monkeypatch.context() as patch:
+        full, _ = validation_run(patch, NUMBER_AND_STRING_BODY)
+    assert [c.violated_constraint for c in full.cases if c.category == "negative"]
+    assert len(valid_edge_cases(full)) == 2
+
+    with monkeypatch.context() as patch:
+        # The first valid-edge step cannot even check its root schema.
+        short, _ = validation_run(patch, NUMBER_AND_STRING_BODY, endpoint_limit=1)
+
+    assert full.cases[0].category == "positive" and short.cases[0] == full.cases[0]
+    assert valid_edge_cases(short) == []
+    assert case_keys(short.cases) == case_keys(without_valid_edge_cases(full))
+    assert [c.category for c in short.cases].count("negative") > 0
+
+
+def test_a_later_step_exhaustion_keeps_the_earlier_valid_edge_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    numeric_end: list[int] = []
+    original = generator_module._numeric_valid_edge_cases
+
+    def record_numeric_end(*args: object) -> object:
+        result = original(*args)  # type: ignore[arg-type]
+        numeric_end.append(generator_module._BUDGET.get().endpoint_validation_units)  # type: ignore[union-attr]
+        return result
+
+    with monkeypatch.context() as patch:
+        patch.setattr(generator_module, "_numeric_valid_edge_cases", record_numeric_end)
+        full, budget = validation_run(patch, NUMBER_AND_STRING_BODY)
+    [numeric_units] = numeric_end
+    assert numeric_units < budget.suite_validation_units
+    numeric_edges = [c for c in valid_edge_cases(full) if "minimum" in c.provenance[-1] or "maximum" in c.provenance[-1]]
+    assert len(numeric_edges) == 1 and len(valid_edge_cases(full)) == 2
+
+    # Enough work for the numeric step, none left for the string step.
+    with monkeypatch.context() as patch:
+        short, _ = validation_run(patch, NUMBER_AND_STRING_BODY, endpoint_limit=numeric_units)
+    assert case_keys(valid_edge_cases(short)) == case_keys(numeric_edges)
+    [diagnostic] = validation_diagnostics(short)
+    assert "'string_valid_edge'" in diagnostic.message
+    assert case_keys(without_valid_edge_cases(short)) == case_keys(without_valid_edge_cases(full))
+
+    # One unit less and the numeric step fails; the string step after it is skipped
+    # by the existing policy for an exhausted endpoint.
+    with monkeypatch.context() as patch:
+        none, _ = validation_run(patch, NUMBER_AND_STRING_BODY, endpoint_limit=numeric_units - 1)
+    assert valid_edge_cases(none) == []
+    [diagnostic] = validation_diagnostics(none)
+    assert "'numeric_valid_edge'" in diagnostic.message
+
+
+def test_endpoint_limit_exhaustion_does_not_affect_the_next_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    heavy = wide_array_body(6, 4)
+
+    suite, budget = validation_run(monkeypatch, heavy, NUMERIC_BODY, endpoint_limit=5)
+
+    [diagnostic] = validation_diagnostics(suite)
+    assert diagnostic.endpoint_path == "/items0"
+    assert "The per-endpoint limit of 5 validation work units" in diagnostic.message
+    assert [c.path for c in valid_edge_cases(suite)] == ["/items1"]
+    # The heavy endpoint kept its baseline and the next endpoint was generated whole.
+    assert {c.path for c in suite.cases} == {"/items0", "/items1"}
+    assert budget.endpoint_validation_units == 5
+    assert budget.suite_validation_units > 5 + 5
+
+
+def test_suite_limit_exhaustion_keeps_earlier_endpoints_and_stops_later_ones(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with monkeypatch.context() as patch:
+        full, _ = validation_run(patch, NUMERIC_BODY, NUMERIC_BODY, NUMERIC_BODY)
+
+    # One endpoint needs 5 units, so the second runs out of suite work.
+    suite, budget = validation_run(
+        monkeypatch, NUMERIC_BODY, NUMERIC_BODY, NUMERIC_BODY, suite_limit=7
+    )
+
+    [diagnostic] = validation_diagnostics(suite)
+    assert diagnostic.endpoint_path == "/items1"
+    assert "The per-suite limit of 7 validation work units" in diagnostic.message
+    assert "1 following endpoint(s) were not generated" in diagnostic.message
+    first = [c for c in full.cases if c.path == "/items0"]
+    second = [c for c in full.cases if c.path == "/items1"]
+    assert case_keys([c for c in suite.cases if c.path == "/items0"]) == case_keys(first)
+    assert case_keys([c for c in suite.cases if c.path == "/items1"]) == case_keys(
+        without_valid_edge_cases_of(second)
+    )
+    assert [c for c in suite.cases if c.path == "/items2"] == []
+    assert budget.suite_validation_units == 8
+
+
+def without_valid_edge_cases_of(cases: list[GeneratedTestCase]) -> list[GeneratedTestCase]:
+    return [case for case in cases if not is_valid_edge_case(case)]
+
+
+@pytest.mark.parametrize("limit", [None, 12, 4])
+def test_identical_runs_produce_identical_cases_diagnostics_and_work(
+    monkeypatch: pytest.MonkeyPatch, limit: int | None
+) -> None:
+    runs = []
+    for _ in range(3):
+        with monkeypatch.context() as patch:
+            suite, budget = validation_run(
+                patch, NUMBER_AND_STRING_BODY, TWO_NUMBERS_BODY, endpoint_limit=limit
+            )
+        runs.append((suite.model_dump(mode="json"), budget.suite_validation_units))
+
+    assert runs[0] == runs[1] == runs[2]
+    if limit is not None:
+        assert any(item["code"] == VALIDATION_CODE for item in runs[0][0]["diagnostics"])
+
+
+@pytest.mark.parametrize(("items", "props"), [(3, 2), (6, 5), (12, 5)])
+def test_wide_array_work_follows_body_size_and_not_the_case_count(
+    monkeypatch: pytest.MonkeyPatch, items: int, props: int
+) -> None:
+    suite, budget = validation_run(monkeypatch, wide_array_body(items, props))
+
+    edges = valid_edge_cases(suite)
+    assert len(edges) == props
+    assert budget.suite_validation_units == wide_array_units(items, props, props)
+    assert budget.suite_expansions == 0
+    assert budget.suite_cases == len(suite.cases)
+
+
+def test_more_items_cost_more_validation_work_for_the_same_number_of_cases(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with monkeypatch.context() as patch:
+        small, small_budget = validation_run(patch, wide_array_body(6, 5))
+    with monkeypatch.context() as patch:
+        large, large_budget = validation_run(patch, wide_array_body(12, 5))
+
+    assert len(valid_edge_cases(small)) == len(valid_edge_cases(large)) == 5
+    assert large_budget.suite_validation_units > 1.5 * small_budget.suite_validation_units
+
+
+def test_100_items_of_50_constrained_properties_fit_the_default_validation_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    suite, budget = validation_run(monkeypatch, wide_array_body(100, 50))
+
+    assert len(suite.cases[0].request_body.value) == 100  # type: ignore[union-attr,arg-type]
+    assert len(valid_edge_cases(suite)) == 50
+    assert validation_diagnostics(suite) == []
+    # Counted work, not time: the step needs exactly this many units.
+    assert budget.suite_validation_units == wide_array_units(100, 50, 50) == 507_652
+    assert budget.endpoint_validation_units < generator_module._MAX_ENDPOINT_VALIDATION_UNITS
+    assert budget.suite_validation_units < generator_module._MAX_SUITE_VALIDATION_UNITS
+
+
+@pytest.mark.parametrize("kind", ["integer", "string"])
+def test_large_array_of_constrained_objects_stops_at_the_limit_without_running_on(
+    monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    # The scenario of the Final Audit: 100 items of 100 constrained properties.
+    # Unbounded, the step makes about two million validation entries.
+    body = wide_array_body(100, 100, kind)
+    unbounded = wide_array_units(100, 100, 100)
+    assert unbounded > 2_000_000
+
+    suite, budget = validation_run(monkeypatch, body, endpoint_limit=50_000)
+
+    assert len(suite.cases[0].request_body.value) == 100  # type: ignore[union-attr,arg-type]
+    assert valid_edge_cases(suite) == []
+    [diagnostic] = validation_diagnostics(suite)
+    assert "limit of 50000 validation work units" in diagnostic.message
+    # The work stopped on the first unit over the limit, not after the whole step.
+    assert budget.suite_validation_units == 50_001
+
+
+@pytest.mark.parametrize("depth", [4, 8, 15])
+def test_validation_units_equal_the_traversal_actually_performed_in_nested_schemas(
+    monkeypatch: pytest.MonkeyPatch, depth: int
+) -> None:
+    metered = {"matches": 0, "checks": 0}
+    original_matches = generator_module._matches
+    original_check = generator_module._check_schema
+
+    def counting_matches(*args: object) -> bool:
+        metered["matches"] += len(args) > 6 and args[6] is not None
+        return original_matches(*args)  # type: ignore[arg-type]
+
+    def counting_check(*args: object) -> object:
+        metered["checks"] += len(args) > 5 and args[5] is not None
+        return original_check(*args)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(generator_module, "_matches", counting_matches)
+    monkeypatch.setattr(generator_module, "_check_schema", counting_check)
+
+    suite, budget = validation_run(monkeypatch, nested_body(depth, 5))
+
+    edges = valid_edge_cases(suite)
+    nodes = node_count(suite.cases[0].request_body.value)  # type: ignore[union-attr]
+    assert edges
+    assert budget.suite_validation_units == metered["matches"] + metered["checks"]
+    # One entry per value node and candidate, plus the schema checks. A count that
+    # ignored the schema traversal would be len(edges) * nodes.
+    assert metered["matches"] == len(edges) * nodes
+    assert metered["checks"] > 2 * len(edges) * nodes if depth >= 8 else metered["checks"] > 0
+
+
+def test_nested_schemas_cost_more_than_their_body_size_alone_suggests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with monkeypatch.context() as patch:
+        shallow, shallow_budget = validation_run(patch, nested_body(4, 5))
+    with monkeypatch.context() as patch:
+        deep, deep_budget = validation_run(patch, nested_body(8, 5))
+
+    shallow_nodes = node_count(shallow.cases[0].request_body.value)  # type: ignore[union-attr]
+    deep_nodes = node_count(deep.cases[0].request_body.value)  # type: ignore[union-attr]
+    shallow_edges = len(valid_edge_cases(shallow))
+    deep_edges = len(valid_edge_cases(deep))
+    shallow_per = shallow_budget.suite_validation_units / (shallow_edges * shallow_nodes)
+    deep_per = deep_budget.suite_validation_units / (deep_edges * deep_nodes)
+
+    # Units per candidate value node grow with the nesting depth.
+    assert deep_per > shallow_per

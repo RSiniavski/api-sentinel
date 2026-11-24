@@ -126,10 +126,23 @@ _MAX_SUITE_PATTERN_EVALUATIONS = 20_000
 _MAX_ENDPOINT_PATTERN_WORK = 500_000
 _MAX_SUITE_PATTERN_WORK = 4_000_000
 _PATTERN_WORK_UNIT = "pattern work units"
+# Validation work is the schema traversal that the valid-edge steps do to prove a
+# candidate body is valid. One unit is one entry into _matches (one value node
+# checked) or one entry into _check_schema (one schema node checked) made on
+# behalf of such a step; see _ValidationMeter. The limits are enforced only on
+# these deterministic counts, never on time. The limits were chosen from one
+# measurement in one environment (CPython 3.13, one machine, roughly 5
+# microseconds per unit). That figure is not a runtime guarantee or a
+# performance SLA. The suite limit is eight times the endpoint limit, the same
+# ratio as the pattern work limits.
+_MAX_ENDPOINT_VALIDATION_UNITS = 600_000
+_MAX_SUITE_VALIDATION_UNITS = 4_800_000
+_VALIDATION_UNIT = "validation work units"
 _EXPANSION_BUDGET_CODE = "generation_expansion_budget_exceeded"
 _CASE_BUDGET_CODE = "generation_case_budget_exceeded"
 _DIAGNOSTIC_BUDGET_CODE = "generation_diagnostic_budget_exceeded"
 _PATTERN_BUDGET_CODE = "generation_pattern_budget_exceeded"
+_VALIDATION_BUDGET_CODE = "generation_validation_budget_exceeded"
 _ANCESTOR_LITERAL_CODE = "negative_case_ancestor_literal_conflict"
 _VALID_EDGE_CODE = "valid_boundary_no_safe_candidate"
 _STRING_EDGE_CONSTRAINTS = ("minLength", "maxLength")
@@ -146,6 +159,7 @@ class _GenerationBudget:
         self.suite_suppressed = 0
         self.suite_pattern_evaluations = 0
         self.suite_pattern_work = 0
+        self.suite_validation_units = 0
         # Results of the (pattern, candidate) pairs already evaluated in this
         # run. It lives on the budget, never at module level, so charges cannot
         # depend on an earlier generation call.
@@ -159,6 +173,22 @@ class _GenerationBudget:
         self.endpoint_suppressed = 0
         self.endpoint_pattern_evaluations = 0
         self.endpoint_pattern_work = 0
+        self.endpoint_validation_units = 0
+
+    def charge_validation(self, pointer: str | None) -> None:
+        """Charge one validation work unit; only a _ValidationMeter calls this."""
+        self.endpoint_validation_units += 1
+        self.suite_validation_units += 1
+        if self.endpoint_validation_units > _MAX_ENDPOINT_VALIDATION_UNITS:
+            raise _BudgetExhausted(
+                _VALIDATION_BUDGET_CODE, "endpoint", _MAX_ENDPOINT_VALIDATION_UNITS,
+                pointer, None, _VALIDATION_UNIT,
+            )
+        if self.suite_validation_units > _MAX_SUITE_VALIDATION_UNITS:
+            raise _BudgetExhausted(
+                _VALIDATION_BUDGET_CODE, "suite", _MAX_SUITE_VALIDATION_UNITS,
+                pointer, None, _VALIDATION_UNIT,
+            )
 
     def charge_expansion(self, pointer: str, reference_uri: str) -> None:
         self.endpoint_expansions += 1
@@ -272,6 +302,31 @@ def _counted_case(**fields: Any) -> GeneratedTestCase:
     if budget is not None:
         budget.charge_case()
     return GeneratedTestCase(**fields)
+
+
+class _ValidationMeter:
+    """Counts the validation work of one valid-edge step against the budget.
+
+    A meter is created by a step and passed explicitly, as the last argument, to
+    the _matches and _check_schema calls that step makes. Each entry into one of
+    them calls tick(), which charges one validation work unit. Callers that pass
+    no meter (every other step) are not metered and not limited.
+    """
+
+    __slots__ = ("_budget", "_pointer")
+
+    def __init__(self, budget: _GenerationBudget, pointer: str) -> None:
+        self._budget = budget
+        self._pointer = pointer
+
+    def tick(self) -> None:
+        self._budget.charge_validation(self._pointer)
+
+
+def _validation_meter(pointer: str) -> _ValidationMeter | None:
+    """A meter for the generation call in progress, or None outside one."""
+    budget = _BUDGET.get()
+    return _ValidationMeter(budget, pointer) if budget is not None else None
 
 
 class _UnsupportedOperation(Exception):
@@ -3004,9 +3059,11 @@ def _numeric_valid_edge_cases(
     _collect_valid_edge_targets(media.schema.raw, baseline_value, (), root_pointer, targets)
     if not targets:
         return (), ()
+    # Every schema check and candidate validation of this step is metered.
+    meter = _validation_meter(root_pointer)
     try:
         root, root_schema_pointer, _ = _follow_schema_reference(media.schema.raw, root_pointer)
-        root_checked = _check_schema(root, version, root_schema_pointer, "request", 0)
+        root_checked = _check_schema(root, version, root_schema_pointer, "request", 0, meter)
     except _UnsupportedOperation:
         # The baseline and the negative steps already report an unusable schema.
         return (), ()
@@ -3065,7 +3122,7 @@ def _numeric_valid_edge_cases(
             generated_value = value
         try:
             body_valid = _matches(
-                root_checked, generated_value, version, "request", 0, root_schema_pointer
+                root_checked, generated_value, version, "request", 0, root_schema_pointer, meter
             )
         except _UnsupportedOperation:
             continue
@@ -3183,9 +3240,11 @@ def _string_valid_edge_cases(
     _collect_string_edge_targets(media.schema.raw, baseline_value, (), root_pointer, targets)
     if not targets:
         return (), ()
+    # Every schema check and candidate validation of this step is metered.
+    meter = _validation_meter(root_pointer)
     try:
         root, root_schema_pointer, _ = _follow_schema_reference(media.schema.raw, root_pointer)
-        root_checked = _check_schema(root, version, root_schema_pointer, "request", 0)
+        root_checked = _check_schema(root, version, root_schema_pointer, "request", 0, meter)
     except _UnsupportedOperation:
         # The baseline and the negative steps already report an unusable schema.
         return (), ()
@@ -3208,8 +3267,12 @@ def _string_valid_edge_cases(
             continue
         candidate = "x" * length
         try:
-            target_checked = _check_schema(target_schema, version, schema_pointer, "request", 0)
-            if not _matches(target_checked, candidate, version, "request", 0, schema_pointer):
+            target_checked = _check_schema(
+                target_schema, version, schema_pointer, "request", 0, meter
+            )
+            if not _matches(
+                target_checked, candidate, version, "request", 0, schema_pointer, meter
+            ):
                 continue
             generated_value = deepcopy(baseline_value)
             if path:
@@ -3221,7 +3284,7 @@ def _string_valid_edge_cases(
             else:
                 generated_value = candidate
             if not _matches(
-                root_checked, generated_value, version, "request", 0, root_schema_pointer
+                root_checked, generated_value, version, "request", 0, root_schema_pointer, meter
             ):
                 continue
         except _UnsupportedOperation:
@@ -4839,8 +4902,15 @@ def _distinct_item_values(
 
 
 def _check_schema(
-    raw: Any, version: str, pointer: str, direction: str, depth: int
+    raw: Any,
+    version: str,
+    pointer: str,
+    direction: str,
+    depth: int,
+    meter: _ValidationMeter | None = None,
 ) -> bool | dict[str, Any]:
+    if meter is not None:
+        meter.tick()
     if depth > _MAX_DEPTH:
         raise _UnsupportedOperation("schema_depth_limit", "Schema nesting is too deep.", pointer)
     if isinstance(raw, bool):
@@ -4853,7 +4923,7 @@ def _check_schema(
         raise _UnsupportedOperation("unsupported_schema_form", "Schema must be an object or boolean.", pointer)
     if _reference_uri(raw):
         target, target_pointer, _ = _follow_schema_reference(raw, pointer)
-        return _check_schema(target, version, target_pointer, direction, depth + 1)
+        return _check_schema(target, version, target_pointer, direction, depth + 1, meter)
     composition = _COMPOSITIONS.intersection(raw)
     if composition:
         key = sorted(composition)[0]
@@ -4938,9 +5008,9 @@ def _check_schema(
         child = properties[name]
         if _is_request_read_only(child, direction, _child(pointer, "properties", name)):
             continue
-        _check_schema(child, version, _child(pointer, "properties", name), direction, depth + 1)
+        _check_schema(child, version, _child(pointer, "properties", name), direction, depth + 1, meter)
     if "items" in raw and raw.get("minItems", 0) > 0:
-        _check_schema(raw["items"], version, _child(pointer, "items"), direction, depth + 1)
+        _check_schema(raw["items"], version, _child(pointer, "items"), direction, depth + 1, meter)
     return raw
 
 
@@ -4997,8 +5067,17 @@ def _is_primitive_schema(raw: Any, version: str, pointer: str) -> bool:
 
 
 def _matches(
-    schema: dict[str, Any], value: Any, version: str, direction: str, depth: int, pointer: str = ""
+    schema: dict[str, Any],
+    value: Any,
+    version: str,
+    direction: str,
+    depth: int,
+    pointer: str = "",
+    meter: _ValidationMeter | None = None,
 ) -> bool:
+    # The meter is always passed on positionally, as the last argument.
+    if meter is not None:
+        meter.tick()
     if depth > _MAX_DEPTH:
         return False
     if isinstance(value, float) and not math.isfinite(value):
@@ -5039,9 +5118,9 @@ def _matches(
         # An empty array has no item to check, so an unsupported `items` schema
         # must not reject it (_check_schema also skips `items` when minItems is 0).
         if "items" in schema and value:
-            item_schema = _check_schema(schema["items"], version, "/items", direction, depth + 1)
+            item_schema = _check_schema(schema["items"], version, "/items", direction, depth + 1, meter)
             for item in value:
-                if item_schema is False or (isinstance(item_schema, dict) and not _matches(item_schema, item, version, direction, depth + 1, _child(pointer, "items"))):
+                if item_schema is False or (isinstance(item_schema, dict) and not _matches(item_schema, item, version, direction, depth + 1, _child(pointer, "items"), meter)):
                     return False
     if isinstance(value, dict):
         properties = schema.get("properties", {})
@@ -5062,13 +5141,13 @@ def _matches(
                     additional_pointer = _child(pointer, "additionalProperties")
                     try:
                         additional_schema = _check_schema(
-                            additional, version, additional_pointer, direction, depth + 1
+                            additional, version, additional_pointer, direction, depth + 1, meter
                         )
                         if additional_schema is False or (
                             isinstance(additional_schema, dict)
                             and not _matches(
                                 additional_schema, child_value, version, direction,
-                                depth + 1, additional_pointer,
+                                depth + 1, additional_pointer, meter,
                             )
                         ):
                             return False
@@ -5083,8 +5162,8 @@ def _matches(
                 continue
             if _is_request_read_only(child, direction, f"/properties/{name}"):
                 return False
-            child_schema = _check_schema(child, version, f"/properties/{name}", direction, depth + 1)
-            if child_schema is False or (isinstance(child_schema, dict) and not _matches(child_schema, child_value, version, direction, depth + 1, _child(pointer, "properties", name))):
+            child_schema = _check_schema(child, version, f"/properties/{name}", direction, depth + 1, meter)
+            if child_schema is False or (isinstance(child_schema, dict) and not _matches(child_schema, child_value, version, direction, depth + 1, _child(pointer, "properties", name), meter)):
                 return False
     return True
 
