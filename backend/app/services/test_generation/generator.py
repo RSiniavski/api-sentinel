@@ -17,6 +17,7 @@ from urllib.parse import unquote
 
 from pydantic import ValidationError
 
+from app.services.openapi.uri_references import _is_valid_absolute_uri, _is_valid_uri_reference
 from app.services.openapi.models import (
     ApiModel,
     Endpoint,
@@ -53,6 +54,22 @@ _SCHEMA_KEYS = {
     "minLength", "maxLength", "minItems", "maxItems", "uniqueItems",
     "properties", "required", "items", "readOnly", "writeOnly", "title",
     "description", "deprecated", "format", "additionalProperties", "pattern",
+    "xml", "externalDocs",
+}
+# Annotation-only Schema Object fields (OpenAPI 3.0 and 3.1). They are checked
+# for form and never affect a generated value, case ID, order or provenance. Each
+# maps the allowed field names to their JSON type; `x-` extensions are allowed.
+_XML_FIELDS = {
+    "name": str, "namespace": str, "prefix": str, "attribute": bool, "wrapped": bool,
+}
+_EXTERNAL_DOCS_FIELDS = {"url": str, "description": str}
+# Fields that must also be URIs: the XML namespace is an absolute URI, and the
+# documentation URL is a URL or a relative reference (the OpenAPI meta-schemas use
+# `format: uri` and `format: uri-reference`). The OpenAPI validator does not enforce
+# either format, so the generator checks the syntax itself.
+_XML_URI_FIELDS = {"namespace": (_is_valid_absolute_uri, "an absolute URI")}
+_EXTERNAL_DOCS_URI_FIELDS = {
+    "url": (_is_valid_uri_reference, "a URL or a relative URL reference")
 }
 _COMPOSITIONS = {"allOf", "oneOf", "anyOf", "not"}
 
@@ -68,6 +85,9 @@ _FORMAT_TYPES = {
     "uuid": "string",
     "email": "string",
 }
+# `password` is a UI hint in both supported OpenAPI versions, not a constraint.
+# It is accepted on string schemas only and does not restrict or change a value.
+_ANNOTATION_FORMATS = {"password": "string"}
 _FLOAT_MAX = 3.4028234663852886e38
 # Inclusive implicit numeric ranges. `double` only requires a finite value.
 _FORMAT_RANGES = {
@@ -4950,6 +4970,22 @@ def _check_schema(
             raise _UnsupportedOperation(
                 "unsupported_schema_form", f"Schema {key} must be boolean.", _child(pointer, key)
             )
+    if "xml" in raw:
+        _check_annotation_object(raw, "xml", _XML_FIELDS, (), _XML_URI_FIELDS, pointer)
+        if "wrapped" in raw["xml"]:
+            # `wrapped` takes effect only next to `type: array`; on any other schema,
+            # including the schema of an array's items, it is not array-wrapper metadata.
+            declared = _types(raw["type"], version, _child(pointer, "type")) if "type" in raw else ()
+            if "array" not in declared:
+                raise _UnsupportedOperation(
+                    "unsupported_schema_form",
+                    "Schema xml.wrapped applies only to an array schema.",
+                    _child(pointer, "xml", "wrapped"),
+                )
+    if "externalDocs" in raw:
+        _check_annotation_object(
+            raw, "externalDocs", _EXTERNAL_DOCS_FIELDS, ("url",), _EXTERNAL_DOCS_URI_FIELDS, pointer
+        )
     for key in ("minimum", "maximum", "multipleOf"):
         value = raw.get(key)
         if key in raw and (not isinstance(value, (int, float)) or isinstance(value, bool)):
@@ -5014,6 +5050,56 @@ def _check_schema(
     return raw
 
 
+def _check_annotation_object(
+    raw: dict[str, Any],
+    key: str,
+    fields: dict[str, type],
+    required: tuple[str, ...],
+    uri_fields: dict[str, tuple[Callable[[str], bool], str]],
+    pointer: str,
+) -> None:
+    """Validate the form of an annotation-only Schema Object field.
+
+    The value must be an object whose fields are the known ones with the right
+    JSON type, plus `x-` extensions, and it must carry every required field. A field
+    named in `uri_fields` must also pass its URI syntax check.
+    """
+    key_pointer = _child(pointer, key)
+    value = raw[key]
+    if not isinstance(value, dict):
+        raise _UnsupportedOperation(
+            "unsupported_schema_form", f"Schema {key} must be an object.", key_pointer
+        )
+    for name in sorted(value):
+        if name.startswith("x-"):
+            continue
+        field_pointer = _child(key_pointer, name)
+        expected = fields.get(name)
+        if expected is None:
+            raise _UnsupportedOperation(
+                "unsupported_schema_form",
+                f"Schema {key} has the unsupported field '{name}'.",
+                field_pointer,
+            )
+        if not isinstance(value[name], expected):
+            kind = "boolean" if expected is bool else "string"
+            raise _UnsupportedOperation(
+                "unsupported_schema_form", f"Schema {key}.{name} must be a {kind}.", field_pointer
+            )
+        uri_rule = uri_fields.get(name)
+        if uri_rule is not None and not uri_rule[0](value[name]):
+            raise _UnsupportedOperation(
+                "unsupported_schema_form",
+                f"Schema {key}.{name} must be {uri_rule[1]}.",
+                field_pointer,
+            )
+    for name in required:
+        if name not in value:
+            raise _UnsupportedOperation(
+                "unsupported_schema_form", f"Schema {key} requires '{name}'.", key_pointer
+            )
+
+
 def _check_format(raw: dict[str, Any], version: str, pointer: str) -> None:
     """Validate a `format` keyword: a supported string format on its own type."""
     format_pointer = _child(pointer, "format")
@@ -5022,7 +5108,7 @@ def _check_format(raw: dict[str, Any], version: str, pointer: str) -> None:
         raise _UnsupportedOperation(
             "unsupported_schema_form", "Schema format must be a string.", format_pointer
         )
-    expected = _FORMAT_TYPES.get(name)
+    expected = _FORMAT_TYPES.get(name) or _ANNOTATION_FORMATS.get(name)
     if expected is None:
         raise _UnsupportedOperation(
             "unsupported_schema_keyword",

@@ -17988,3 +17988,930 @@ def test_nested_schemas_cost_more_than_their_body_size_alone_suggests(
 
     # Units per candidate value node grow with the nesting depth.
     assert deep_per > shallow_per
+
+
+# --- Annotation metadata: xml, externalDocs and format password (Step 8.43.2) ------------
+
+ANNOTATION_VERSIONS = ["3.0.3", "3.1.1"]
+XML_ANNOTATION: dict[str, object] = {
+    "name": "v",
+    "namespace": "https://example.com/schema",
+    "prefix": "ex",
+    "attribute": False,
+    "x-note": 1,
+}
+EXTERNAL_DOCS_ANNOTATION: dict[str, object] = {
+    "url": "https://example.com/docs",
+    "description": "More detail",
+    "x-note": 1,
+}
+ANNOTATIONS: dict[str, object] = {
+    "xml": XML_ANNOTATION,
+    "externalDocs": EXTERNAL_DOCS_ANNOTATION,
+}
+ANNOTATION_BASE_SCHEMAS: list[dict[str, object]] = [
+    {"type": "string", "minLength": 2, "maxLength": 6},
+    {"type": "integer", "minimum": 1, "maximum": 9},
+    {"type": "object", "required": ["a"], "properties": {"a": {"type": "string", "minLength": 1}}},
+]
+
+
+def dump_suite(suite: GeneratedTestSuite) -> dict[str, object]:
+    return suite.model_dump(mode="json")
+
+
+def assert_unsupported_codes_absent(suite: GeneratedTestSuite) -> None:
+    assert not [d for d in suite.diagnostics if d.code.startswith("unsupported_")], suite.diagnostics
+
+
+def only_diagnostic(suite: GeneratedTestSuite) -> GenerationDiagnostic:
+    assert suite.cases == ()
+    [diagnostic] = suite.diagnostics
+    return diagnostic
+
+
+@pytest.mark.parametrize("version", ANNOTATION_VERSIONS)
+@pytest.mark.parametrize("keyword", sorted(ANNOTATIONS))
+@pytest.mark.parametrize("base", ANNOTATION_BASE_SCHEMAS)
+def test_xml_and_external_docs_on_a_property_schema_change_nothing(
+    keyword: str, base: dict[str, object], version: str
+) -> None:
+    plain = format_suite(base, version)
+    annotated = format_suite({**base, keyword: ANNOTATIONS[keyword]}, version)
+
+    assert len(plain.cases) > 2
+    assert_unsupported_codes_absent(annotated)
+    assert dump_suite(annotated) == dump_suite(plain)
+    assert [(c.case_id, c.provenance) for c in annotated.cases] == [
+        (c.case_id, c.provenance) for c in plain.cases
+    ]
+
+
+@pytest.mark.parametrize("version", ANNOTATION_VERSIONS)
+@pytest.mark.parametrize("base", ANNOTATION_BASE_SCHEMAS)
+def test_format_password_on_a_string_schema_is_accepted_and_changes_nothing(
+    base: dict[str, object], version: str
+) -> None:
+    string_base = {"type": "string", "minLength": 2, "maxLength": 6}
+    for schema in (string_base, {"type": "string"}):
+        plain = format_suite(schema, version)
+        annotated = format_suite({**schema, "format": "password"}, version)
+
+        assert len(plain.cases) > 2
+        assert_unsupported_codes_absent(annotated)
+        assert dump_suite(annotated) == dump_suite(plain)
+
+
+def test_format_password_accepts_a_nullable_string_in_each_version() -> None:
+    for version, schema in (
+        ("3.0.3", {"type": "string", "nullable": True, "minLength": 2}),
+        ("3.1.1", {"type": ["string", "null"], "minLength": 2}),
+    ):
+        plain = format_suite(schema, version)
+        annotated = format_suite({**schema, "format": "password"}, version)
+
+        assert_unsupported_codes_absent(annotated)
+        assert dump_suite(annotated) == dump_suite(plain)
+
+
+def test_format_password_keeps_the_string_edge_and_boundary_cases() -> None:
+    suite = format_suite({"type": "string", "format": "password", "minLength": 3, "maxLength": 8})
+
+    lengths = sorted(
+        len(case.request_body.value["v"])
+        for case in suite.cases
+        if case.request_body and isinstance(case.request_body.value.get("v"), str)
+    )
+    assert 3 in lengths and 8 in lengths
+    assert any(is_valid_edge_case(case) for case in suite.cases)
+
+
+@pytest.mark.parametrize("version", ANNOTATION_VERSIONS)
+@pytest.mark.parametrize("keyword", sorted(ANNOTATIONS))
+@pytest.mark.parametrize("place", ["root", "items", "reference_target"])
+def test_annotations_are_accepted_in_every_schema_object_position_without_effect(
+    place: str, keyword: str, version: str
+) -> None:
+    value = ANNOTATIONS[keyword]
+    leaf = {"type": "string", "minLength": 2, "maxLength": 6}
+
+    def build(annotated: bool) -> GeneratedTestSuite:
+        extra = {keyword: value} if annotated else {}
+        components = None
+        if place == "root":
+            raw: dict[str, object] = {
+                "type": "object", "required": ["v"], "properties": {"v": leaf}, **extra,
+            }
+        elif place == "items":
+            raw = {
+                "type": "object", "required": ["v"],
+                "properties": {"v": {"type": "array", "minItems": 2, "items": {**leaf, **extra}}},
+            }
+        else:
+            raw = {
+                "type": "object", "required": ["v"],
+                "properties": {"v": {"$ref": "#/components/schemas/Leaf"}},
+            }
+            components = Components(schemas={"Leaf": Schema(raw={**leaf, **extra})})
+        endpoint = make_endpoint(
+            "/items", "post", request_body=body_with_schema(raw), responses=BAD_REQUEST
+        )
+        return generate_test_suite(make_result(endpoint, version=version, components=components))
+
+    plain = build(False)
+
+    assert len(plain.cases) > 2
+    assert_unsupported_codes_absent(build(True))
+    assert dump_suite(build(True)) == dump_suite(plain)
+
+
+def test_xml_and_external_docs_are_only_keywords_inside_a_schema_not_property_names() -> None:
+    raw = {
+        "type": "object",
+        "required": ["xml", "externalDocs", "format"],
+        "properties": {
+            "xml": {"type": "string", "minLength": 2},
+            "externalDocs": {"type": "integer", "minimum": 1},
+            "format": {"type": "string", "minLength": 3},
+        },
+    }
+    endpoint = make_endpoint("/items", "post", request_body=body_with_schema(raw), responses=BAD_REQUEST)
+
+    suite = generate_test_suite(make_result(endpoint))
+
+    assert_unsupported_codes_absent(suite)
+    assert set(suite.cases[0].request_body.value) == {"xml", "externalDocs", "format"}
+
+
+MALFORMED_ANNOTATIONS: list[tuple[str, object, str, str]] = [
+    ("xml", "x", "/xml", "xml must be an object"),
+    ("xml", [], "/xml", "xml must be an object"),
+    ("xml", None, "/xml", "xml must be an object"),
+    ("xml", 5, "/xml", "xml must be an object"),
+    ("xml", {"foo": 1}, "/xml/foo", "xml has the unsupported field 'foo'"),
+    ("xml", {"name": 5}, "/xml/name", "xml.name must be a string"),
+    ("xml", {"namespace": True}, "/xml/namespace", "xml.namespace must be a string"),
+    ("xml", {"prefix": None}, "/xml/prefix", "xml.prefix must be a string"),
+    ("xml", {"attribute": "true"}, "/xml/attribute", "xml.attribute must be a boolean"),
+    ("xml", {"wrapped": 1}, "/xml/wrapped", "xml.wrapped must be a boolean"),
+    ("externalDocs", "x", "/externalDocs", "externalDocs must be an object"),
+    ("externalDocs", None, "/externalDocs", "externalDocs must be an object"),
+    ("externalDocs", {}, "/externalDocs", "externalDocs requires 'url'"),
+    ("externalDocs", {"description": "d"}, "/externalDocs", "externalDocs requires 'url'"),
+    ("externalDocs", {"url": 5}, "/externalDocs/url", "externalDocs.url must be a string"),
+    (
+        "externalDocs", {"url": "https://e.test", "description": 3},
+        "/externalDocs/description", "externalDocs.description must be a string",
+    ),
+    (
+        "externalDocs", {"url": "https://e.test", "foo": 1},
+        "/externalDocs/foo", "externalDocs has the unsupported field 'foo'",
+    ),
+]
+
+
+@pytest.mark.parametrize("version", ANNOTATION_VERSIONS)
+@pytest.mark.parametrize(("keyword", "value", "suffix", "message"), MALFORMED_ANNOTATIONS)
+def test_malformed_annotation_values_are_rejected_with_a_form_diagnostic(
+    keyword: str, value: object, suffix: str, message: str, version: str
+) -> None:
+    suite = format_suite({"type": "string", keyword: value}, version)
+
+    diagnostic = only_diagnostic(suite)
+    assert diagnostic.code == "unsupported_schema_form"
+    assert diagnostic.source_pointer is not None
+    assert diagnostic.source_pointer.endswith("/properties/v" + suffix)
+    assert message in diagnostic.message
+
+
+@pytest.mark.parametrize("version", ANNOTATION_VERSIONS)
+@pytest.mark.parametrize(
+    "schema",
+    [
+        {"format": "password"},
+        {"type": "integer", "format": "password"},
+        {"type": "number", "format": "password"},
+        {"type": "boolean", "format": "password"},
+        {"type": "array", "items": {"type": "string"}, "format": "password"},
+        {"type": "object", "format": "password"},
+    ],
+)
+def test_format_password_on_a_non_string_schema_is_rejected(
+    schema: dict[str, object], version: str
+) -> None:
+    diagnostic = only_diagnostic(format_suite(schema, version))
+
+    assert diagnostic.code == "unsupported_schema_form"
+    assert diagnostic.source_pointer is not None
+    assert diagnostic.source_pointer.endswith("/properties/v/format")
+    assert "Schema format 'password' requires the string type." == diagnostic.message
+
+
+@pytest.mark.parametrize("schema_type", ["null", ["integer", "null"], ["null"]])
+def test_format_password_on_a_non_string_openapi_31_type_is_rejected(
+    schema_type: object,
+) -> None:
+    diagnostic = only_diagnostic(format_suite({"type": schema_type, "format": "password"}, "3.1.1"))
+
+    assert diagnostic.code == "unsupported_schema_form"
+    assert "Schema format 'password' requires the string type." == diagnostic.message
+
+
+@pytest.mark.parametrize("version", ANNOTATION_VERSIONS)
+def test_format_password_must_be_a_string_value(version: str) -> None:
+    diagnostic = only_diagnostic(format_suite({"type": "string", "format": ["password"]}, version))
+
+    assert diagnostic.code == "unsupported_schema_form"
+    assert "Schema format must be a string." == diagnostic.message
+
+
+@pytest.mark.parametrize("version", ANNOTATION_VERSIONS)
+@pytest.mark.parametrize(
+    "keyword",
+    [
+        "discriminator", "$comment", "minProperties", "maxProperties", "patternProperties",
+        "contentEncoding", "contentMediaType", "XML", "externaldocs", "x", "unknownKeyword",
+    ],
+)
+def test_other_unknown_keywords_remain_rejected(keyword: str, version: str) -> None:
+    diagnostic = only_diagnostic(format_suite({"type": "string", keyword: "x"}, version))
+
+    assert diagnostic.code == "unsupported_schema_keyword"
+    assert diagnostic.source_pointer is not None
+    assert diagnostic.source_pointer.endswith(f"/properties/v/{keyword}")
+    assert f"Schema keyword '{keyword}' is outside the supported subset." == diagnostic.message
+
+
+@pytest.mark.parametrize("version", ANNOTATION_VERSIONS)
+@pytest.mark.parametrize(
+    "name", ["uri", "binary", "byte", "hostname", "ipv4", "Password", "PASSWORD", "passwords", ""]
+)
+def test_other_unsupported_formats_remain_rejected(name: str, version: str) -> None:
+    diagnostic = only_diagnostic(format_suite({"type": "string", "format": name}, version))
+
+    assert diagnostic.code == "unsupported_schema_keyword"
+    assert diagnostic.source_pointer is not None
+    assert diagnostic.source_pointer.endswith("/properties/v/format")
+    assert "Schema keyword 'format' is outside the supported subset." == diagnostic.message
+
+
+@pytest.mark.parametrize("version", ANNOTATION_VERSIONS)
+@pytest.mark.parametrize(
+    ("keyword", "value"),
+    [
+        ("xml", XML_ANNOTATION),
+        ("externalDocs", EXTERNAL_DOCS_ANNOTATION),
+        ("format", "password"),
+        ("maxLength", 2),
+    ],
+)
+def test_reference_sibling_handling_is_unchanged_for_the_new_annotations(
+    keyword: str, value: object, version: str
+) -> None:
+    schemas = {"Id": Schema(raw={"type": "string", "minLength": 2})}
+    endpoint = format_endpoint({"$ref": "#/components/schemas/Id", keyword: value})
+
+    suite = generate_test_suite(
+        make_result(endpoint, version=version, components=Components(schemas=schemas))
+    )
+
+    diagnostic = only_diagnostic(suite)
+    assert diagnostic.code == "unsupported_schema_reference_siblings"
+    assert diagnostic.source_pointer is not None
+    assert diagnostic.source_pointer.endswith(f"/properties/v/{keyword}")
+
+
+@pytest.mark.parametrize("version", ["3.0.3", "3.1.0"])
+def test_documents_with_the_annotations_pass_project_validation_and_generate_the_same_suite(
+    version: str,
+) -> None:
+    from app.services.openapi.validator import validate_openapi_document
+
+    def document(annotated: bool) -> dict[str, object]:
+        def mark(schema: dict[str, object], **extra: object) -> dict[str, object]:
+            return {**schema, **extra} if annotated else schema
+
+        return {
+            "openapi": version,
+            "info": {"title": "Annotated", "version": "1.0"},
+            "paths": {
+                "/accounts": {
+                    "post": {
+                        "requestBody": {
+                            "required": True,
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/Account"}
+                                }
+                            },
+                        },
+                        "responses": {"400": {"description": "Invalid"}},
+                    }
+                }
+            },
+            "components": {
+                "schemas": {
+                    "Account": mark(
+                        {
+                            "type": "object",
+                            "required": ["login", "secret", "tags"],
+                            "properties": {
+                                "login": mark(
+                                    {"type": "string", "minLength": 3, "maxLength": 12},
+                                    xml={"name": "user", "attribute": True},
+                                ),
+                                "secret": mark(
+                                    {"type": "string", "minLength": 8}, format="password"
+                                ),
+                                "tags": mark(
+                                    {
+                                        "type": "array",
+                                        "minItems": 1,
+                                        "items": mark(
+                                            {"type": "string", "minLength": 1},
+                                            xml={"name": "tag"},
+                                        ),
+                                    },
+                                    xml={"wrapped": True},
+                                ),
+                            },
+                        },
+                        externalDocs={"url": "https://example.com/docs"},
+                    )
+                }
+            },
+        }
+
+    suites = []
+    for annotated in (False, True):
+        validated = validate_openapi_document(document(annotated))
+        suites.append(generate_test_suite(normalize_openapi_document(validated)))
+    plain, annotated_suite = suites
+
+    assert len(plain.cases) > 5
+    assert_unsupported_codes_absent(annotated_suite)
+    assert dump_suite(annotated_suite) == dump_suite(plain)
+
+
+# --- Annotation review corrections: URIs and xml.wrapped (Step 8.43.2) ----------------
+
+from app.services.openapi.uri_references import (  # noqa: E402
+    _is_valid_absolute_uri,
+    _is_valid_uri_reference,
+)
+
+VALID_URI_REFERENCES = [
+    "https://example.com/docs",
+    "http://example.com:8080/a/b?c=d#e",
+    "docs/page.html",
+    "../up/page.html",
+    "#section",
+    "//example.com/docs",
+    "mailto:docs@example.com",
+    "urn:example:docs",
+    "https://example.com/a%20b",
+    "http://[2001:db8::1]/docs",
+    "https://example.com/list?x%5B%5D=1",
+]
+INVALID_URI_REFERENCES = [
+    "",
+    "not a url",
+    "http://a b/",
+    "ht!tp://x",
+    "1http://x",
+    ":nope",
+    "http://[bad",
+    "http://host:abc/",
+    "http://host:99999/",
+    "https://example.com/%zz",
+    "https://example.com/a%2",
+    "https://example.com/文档",
+    "http://a\nb",
+    "https://exa\tmple.com",
+    "<https://example.com>",
+    "https://example.com/list?x[]=1",
+]
+RELATIVE_URI_REFERENCES = ["docs/page.html", "../up", "#section", "//example.com/ns", "a/b:c"]
+
+
+@pytest.mark.parametrize("value", VALID_URI_REFERENCES)
+def test_uri_reference_syntax_accepts_urls_and_relative_references(value: str) -> None:
+    assert _is_valid_uri_reference(value)
+
+
+@pytest.mark.parametrize("value", INVALID_URI_REFERENCES)
+def test_uri_reference_syntax_rejects_malformed_values(value: str) -> None:
+    assert not _is_valid_uri_reference(value)
+    assert not _is_valid_absolute_uri(value)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "https://example.com/ns",
+        "http://example.com/schema/sample#",
+        "urn:example:ns",
+        "mailto:docs@example.com",
+    ],
+)
+def test_absolute_uri_syntax_accepts_values_with_a_scheme(value: str) -> None:
+    assert _is_valid_absolute_uri(value)
+
+
+@pytest.mark.parametrize("value", RELATIVE_URI_REFERENCES)
+def test_absolute_uri_syntax_rejects_relative_references(value: str) -> None:
+    assert _is_valid_uri_reference(value)
+    assert not _is_valid_absolute_uri(value)
+
+
+@pytest.mark.parametrize("version", ANNOTATION_VERSIONS)
+@pytest.mark.parametrize("namespace", ["https://example.com/schema", "urn:example:ns", "http://example.com/ns#"])
+def test_xml_namespace_that_is_an_absolute_uri_is_accepted(namespace: str, version: str) -> None:
+    base = {"type": "string", "minLength": 2, "maxLength": 6}
+    plain = format_suite(base, version)
+    annotated = format_suite({**base, "xml": {"name": "v", "namespace": namespace}}, version)
+
+    assert len(plain.cases) > 2
+    assert_unsupported_codes_absent(annotated)
+    assert dump_suite(annotated) == dump_suite(plain)
+
+
+@pytest.mark.parametrize("version", ANNOTATION_VERSIONS)
+@pytest.mark.parametrize(
+    "namespace", [*RELATIVE_URI_REFERENCES, "", "not a uri", "http://a b/", "ht!tp://x"]
+)
+def test_xml_namespace_that_is_not_an_absolute_uri_is_rejected(
+    namespace: str, version: str
+) -> None:
+    diagnostic = only_diagnostic(format_suite({"type": "string", "xml": {"namespace": namespace}}, version))
+
+    assert diagnostic.code == "unsupported_schema_form"
+    assert diagnostic.source_pointer is not None
+    assert diagnostic.source_pointer.endswith("/properties/v/xml/namespace")
+    assert "Schema xml.namespace must be an absolute URI." == diagnostic.message
+
+
+def array_schema(**extra: object) -> dict[str, object]:
+    return {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}, **extra}
+
+
+@pytest.mark.parametrize("version", ANNOTATION_VERSIONS)
+@pytest.mark.parametrize("wrapped", [True, False])
+def test_xml_wrapped_on_an_array_schema_is_accepted_and_changes_nothing(
+    wrapped: bool, version: str
+) -> None:
+    plain = format_suite(array_schema(), version)
+    annotated = format_suite(array_schema(xml={"name": "tags", "wrapped": wrapped}), version)
+
+    assert len(plain.cases) > 2
+    assert_unsupported_codes_absent(annotated)
+    assert dump_suite(annotated) == dump_suite(plain)
+
+
+def test_xml_wrapped_is_accepted_beside_an_openapi_31_array_type_list() -> None:
+    plain = format_suite(array_schema(type=["array", "null"]), "3.1.1")
+    annotated = format_suite(
+        array_schema(type=["array", "null"], xml={"wrapped": True}), "3.1.1"
+    )
+
+    assert_unsupported_codes_absent(annotated)
+    assert dump_suite(annotated) == dump_suite(plain)
+
+
+@pytest.mark.parametrize("version", ANNOTATION_VERSIONS)
+@pytest.mark.parametrize("wrapped", [True, False])
+@pytest.mark.parametrize(
+    "schema",
+    [
+        {"type": "string"},
+        {"type": "integer"},
+        {"type": "boolean"},
+        {"type": "object", "properties": {}},
+        {"enum": [1, 2]},
+        {},
+    ],
+)
+def test_xml_wrapped_on_a_non_array_schema_is_rejected(
+    schema: dict[str, object], wrapped: bool, version: str
+) -> None:
+    diagnostic = only_diagnostic(format_suite({**schema, "xml": {"wrapped": wrapped}}, version))
+
+    assert diagnostic.code == "unsupported_schema_form"
+    assert diagnostic.source_pointer is not None
+    assert diagnostic.source_pointer.endswith("/properties/v/xml/wrapped")
+    assert "Schema xml.wrapped applies only to an array schema." == diagnostic.message
+
+
+@pytest.mark.parametrize("version", ANNOTATION_VERSIONS)
+def test_xml_wrapped_inside_an_items_schema_is_not_array_wrapper_metadata(version: str) -> None:
+    items = {"type": "string", "minLength": 1, "xml": {"name": "tag", "wrapped": True}}
+
+    diagnostic = only_diagnostic(
+        format_suite(array_schema(items=items, xml={"wrapped": True}), version)
+    )
+
+    assert diagnostic.code == "unsupported_schema_form"
+    assert diagnostic.source_pointer is not None
+    assert diagnostic.source_pointer.endswith("/properties/v/items/xml/wrapped")
+    assert "Schema xml.wrapped applies only to an array schema." == diagnostic.message
+
+
+@pytest.mark.parametrize("version", ANNOTATION_VERSIONS)
+def test_xml_without_wrapped_inside_an_items_schema_is_accepted(version: str) -> None:
+    items = {"type": "string", "minLength": 1, "xml": {"name": "tag"}}
+    plain = format_suite(array_schema(), version)
+    annotated = format_suite(array_schema(items=items, xml={"wrapped": True}), version)
+
+    assert_unsupported_codes_absent(annotated)
+    assert dump_suite(annotated) == dump_suite(plain)
+
+
+def test_xml_wrapped_on_a_nested_array_schema_is_that_arrays_own_metadata() -> None:
+    inner = {"type": "array", "minItems": 1, "items": {"type": "string"}, "xml": {"wrapped": True}}
+    outer = {"type": "array", "minItems": 1, "items": inner}
+    plain_inner = {key: value for key, value in inner.items() if key != "xml"}
+
+    plain = format_suite({**outer, "items": plain_inner})
+    annotated = format_suite(outer)
+
+    assert_unsupported_codes_absent(annotated)
+    assert dump_suite(annotated) == dump_suite(plain)
+
+
+@pytest.mark.parametrize("version", ANNOTATION_VERSIONS)
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://example.com/docs",
+        "http://example.com:8080/a/b?c=d#e",
+        "docs/page.html",
+        "../up/page.html",
+        "#section",
+        "//example.com/docs",
+        "mailto:docs@example.com",
+    ],
+)
+def test_external_docs_url_that_is_a_url_or_relative_reference_is_accepted(
+    url: str, version: str
+) -> None:
+    base = {"type": "string", "minLength": 2, "maxLength": 6}
+    plain = format_suite(base, version)
+    annotated = format_suite({**base, "externalDocs": {"url": url}}, version)
+
+    assert len(plain.cases) > 2
+    assert_unsupported_codes_absent(annotated)
+    assert dump_suite(annotated) == dump_suite(plain)
+
+
+@pytest.mark.parametrize("version", ANNOTATION_VERSIONS)
+@pytest.mark.parametrize("url", INVALID_URI_REFERENCES)
+def test_external_docs_url_that_is_malformed_is_rejected(url: str, version: str) -> None:
+    diagnostic = only_diagnostic(
+        format_suite({"type": "string", "externalDocs": {"url": url}}, version)
+    )
+
+    assert diagnostic.code == "unsupported_schema_form"
+    assert diagnostic.source_pointer is not None
+    assert diagnostic.source_pointer.endswith("/properties/v/externalDocs/url")
+    assert "Schema externalDocs.url must be a URL or a relative URL reference." == diagnostic.message
+
+
+def annotation_document(version: str, schema: dict[str, object]) -> dict[str, object]:
+    return {
+        "openapi": version,
+        "info": {"title": "Annotated", "version": "1.0"},
+        "paths": {
+            "/items": {
+                "post": {
+                    "requestBody": {
+                        "required": True,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "required": ["v"],
+                                    "properties": {"v": schema},
+                                }
+                            }
+                        },
+                    },
+                    "responses": {"400": {"description": "Invalid"}},
+                }
+            }
+        },
+    }
+
+
+def require_real_validator() -> None:
+    """Fail the test when openapi-spec-validator is missing or a stub that accepts anything."""
+    from app.services.openapi.exceptions import OpenAPIValidationError
+    from app.services.openapi.validator import validate_openapi_document
+
+    try:
+        validate_openapi_document({"openapi": "3.0.3", "info": {"title": "x"}, "paths": {}})
+    except OpenAPIValidationError:
+        return
+    pytest.fail("openapi-spec-validator accepted an invalid document: it is a stub, not the real one")
+
+
+def uri_format_checkers_installed() -> bool:
+    import importlib.util
+
+    return any(importlib.util.find_spec(name) for name in ("rfc3987", "rfc3986_validator"))
+
+
+@pytest.mark.parametrize("version", ["3.0.3", "3.1.1"])
+@pytest.mark.parametrize(
+    "schema",
+    [
+        {"type": "string", "minLength": 2, "xml": {"name": "v", "namespace": "https://example.com/ns", "prefix": "ex", "attribute": False}},
+        {"type": "array", "minItems": 1, "items": {"type": "string", "xml": {"name": "tag"}}, "xml": {"name": "tags", "wrapped": True}},
+        {"type": "string", "minLength": 2, "externalDocs": {"url": "https://example.com/docs", "description": "Docs"}},
+        {"type": "string", "minLength": 2, "externalDocs": {"url": "docs/page.html"}},
+    ],
+)
+def test_real_validator_and_generator_both_accept_valid_xml_and_external_docs(
+    version: str, schema: dict[str, object]
+) -> None:
+    from app.services.openapi.validator import validate_openapi_document
+
+    require_real_validator()
+    plain = {key: value for key, value in schema.items() if key not in {"xml", "externalDocs"}}
+    if "items" in plain:
+        plain["items"] = {"type": "string"}
+
+    suites = [
+        generate_test_suite(
+            normalize_openapi_document(validate_openapi_document(annotation_document(version, item)))
+        )
+        for item in (plain, schema)
+    ]
+
+    assert len(suites[0].cases) > 2
+    assert_unsupported_codes_absent(suites[1])
+    assert dump_suite(suites[1]) == dump_suite(suites[0])
+
+
+# What the real validator lets through (see tests/test_openapi_parser.py) and the
+# generator then rejects. `uri` marks cases that depend on URI format checking.
+GENERATOR_ONLY_ANNOTATION_CHECKS: list[tuple[str, dict[str, object], str, str, bool]] = [
+    ("relative namespace", {"type": "string", "xml": {"namespace": "ns/x"}}, "/xml/namespace", "must be an absolute URI", True),
+    ("text namespace", {"type": "string", "xml": {"namespace": "not a uri"}}, "/xml/namespace", "must be an absolute URI", True),
+    ("empty namespace", {"type": "string", "xml": {"namespace": ""}}, "/xml/namespace", "must be an absolute URI", True),
+    ("text url", {"type": "string", "externalDocs": {"url": "not a url"}}, "/externalDocs/url", "must be a URL or a relative URL reference", True),
+    ("bad host url", {"type": "string", "externalDocs": {"url": "http://[bad"}}, "/externalDocs/url", "must be a URL or a relative URL reference", True),
+    ("empty url", {"type": "string", "externalDocs": {"url": ""}}, "/externalDocs/url", "must be a URL or a relative URL reference", True),
+    ("wrapped on string", {"type": "string", "xml": {"wrapped": True}}, "/xml/wrapped", "applies only to an array schema", False),
+    ("wrapped on integer", {"type": "integer", "xml": {"wrapped": True}}, "/xml/wrapped", "applies only to an array schema", False),
+    (
+        "wrapped in items",
+        {"type": "array", "minItems": 1, "items": {"type": "string", "xml": {"wrapped": True}}},
+        "/items/xml/wrapped", "applies only to an array schema", False,
+    ),
+]
+
+
+@pytest.mark.parametrize("version", ["3.0.3", "3.1.1"])
+@pytest.mark.parametrize(
+    ("label", "schema", "suffix", "message", "uri"),
+    GENERATOR_ONLY_ANNOTATION_CHECKS,
+    ids=[item[0] for item in GENERATOR_ONLY_ANNOTATION_CHECKS],
+)
+def test_generator_rejects_what_the_real_validator_accepts(
+    label: str, schema: dict[str, object], suffix: str, message: str, uri: bool, version: str
+) -> None:
+    from app.services.openapi.validator import validate_openapi_document
+
+    require_real_validator()
+    if uri and uri_format_checkers_installed():
+        pytest.skip("URI format checkers are installed, so the validator may reject this itself")
+
+    document = validate_openapi_document(annotation_document(version, schema))
+    suite = generate_test_suite(normalize_openapi_document(document))
+
+    diagnostic = only_diagnostic(suite)
+    assert diagnostic.code == "unsupported_schema_form"
+    assert diagnostic.source_pointer is not None
+    assert diagnostic.source_pointer.endswith("/properties/v" + suffix)
+    assert message in diagnostic.message
+
+
+@pytest.mark.parametrize(
+    ("schema", "suffix"),
+    [
+        ({"type": "string", "xml": {"foo": 1}}, "/xml/foo"),
+        ({"type": "string", "xml": {"attribute": "true"}}, "/xml/attribute"),
+        ({"type": "string", "xml": {"namespace": 5}}, "/xml/namespace"),
+        ({"type": "string", "externalDocs": {"description": "d"}}, "/externalDocs"),
+        ({"type": "string", "externalDocs": {"url": 5}}, "/externalDocs/url"),
+        ({"type": "string", "externalDocs": {"url": "https://e.test", "foo": 1}}, "/externalDocs/foo"),
+    ],
+)
+def test_openapi_31_documents_with_malformed_annotation_structure_reach_the_generator(
+    schema: dict[str, object], suffix: str
+) -> None:
+    from app.services.openapi.validator import validate_openapi_document
+
+    require_real_validator()
+
+    # The real validator checks these objects for OpenAPI 3.0 only (see test_openapi_parser.py).
+    document = validate_openapi_document(annotation_document("3.1.1", schema))
+    diagnostic = only_diagnostic(generate_test_suite(normalize_openapi_document(document)))
+
+    assert diagnostic.code == "unsupported_schema_form"
+    assert diagnostic.source_pointer is not None
+    assert diagnostic.source_pointer.endswith("/properties/v" + suffix)
+
+
+# --- Square brackets and ports in URI references (Step 8.43.2 URI correction) ---------
+
+BRACKET_VALID = [
+    "http://[2001:db8::1]/docs",
+    "http://[2001:db8::1]:8080/docs",
+    "http://[::1]",
+    "http://[::ffff:192.0.2.1]/x",
+    "http://user:pw@[2001:db8::1]:80/x?q=1#f",
+    "//[2001:db8::1]/docs",
+    "http://[v1.fe80::a]/x",
+    "https://example.com/%5Bok%5D",
+    "https://example.com/a?x%5B%5D=1",
+    "https://example.com/a#%5Bfrag%5D",
+]
+BRACKET_INVALID = [
+    "https://example.com/[bad]",
+    "https://example.com/a[0]",
+    "https://example.com/a?x[]=1",
+    "https://example.com/a?[x]",
+    "https://example.com/a#[frag]",
+    "https://example.com/a?q=1#a[0]",
+    "docs/[bad].html",
+    "[bad]",
+    "#[bad]",
+    "?[bad]",
+    "http://exa[mple.com/",
+    "http://[2001:db8::1",
+    "http://2001:db8::1]/",
+    "http://[2001:db8::1]x/",
+    "http://[2001:db8::1]:80x/",
+    "http://[not-ip]/",
+    "http://[12345::1]/",
+    "http://[1:2:3]/",
+    "http://[fe80::1%25eth0]/",
+    "http://[]/",
+    "http://[v1.]/",
+    "http://user[x]@host/",
+    "http://[::1][::1]/",
+    "http://a@b@host/",
+]
+
+
+@pytest.mark.parametrize("value", BRACKET_VALID)
+def test_uri_reference_accepts_brackets_only_as_ip_literals_or_percent_encoded(value: str) -> None:
+    assert _is_valid_uri_reference(value)
+
+
+@pytest.mark.parametrize("value", BRACKET_INVALID)
+def test_uri_reference_rejects_misplaced_brackets_and_bad_ip_literals(value: str) -> None:
+    assert not _is_valid_uri_reference(value)
+    assert not _is_valid_absolute_uri(value)
+
+
+def test_ipv6_authority_is_still_accepted_as_a_namespace_and_a_url() -> None:
+    for schema in (
+        {"type": "string", "xml": {"namespace": "http://[2001:db8::1]/ns"}},
+        {"type": "string", "externalDocs": {"url": "http://[2001:db8::1]/docs"}},
+    ):
+        assert_unsupported_codes_absent(format_suite(schema))
+
+
+@pytest.mark.parametrize("version", ANNOTATION_VERSIONS)
+@pytest.mark.parametrize(
+    ("schema", "suffix", "message"),
+    [
+        ({"type": "string", "externalDocs": {"url": "https://example.com/[bad]"}}, "/externalDocs/url", "Schema externalDocs.url must be a URL or a relative URL reference."),
+        ({"type": "string", "externalDocs": {"url": "https://example.com/a?x[]=1"}}, "/externalDocs/url", "Schema externalDocs.url must be a URL or a relative URL reference."),
+        ({"type": "string", "externalDocs": {"url": "https://example.com/a#[f]"}}, "/externalDocs/url", "Schema externalDocs.url must be a URL or a relative URL reference."),
+        ({"type": "string", "xml": {"namespace": "https://example.com/[ns]"}}, "/xml/namespace", "Schema xml.namespace must be an absolute URI."),
+    ],
+)
+def test_misplaced_brackets_keep_the_existing_diagnostic_code_and_pointer(
+    schema: dict[str, object], suffix: str, message: str, version: str
+) -> None:
+    diagnostic = only_diagnostic(format_suite(schema, version))
+
+    assert diagnostic.code == "unsupported_schema_form"
+    assert diagnostic.source_pointer is not None
+    assert diagnostic.source_pointer.endswith("/properties/v" + suffix)
+    assert diagnostic.message == message
+
+
+# Port decision: RFC 3986 syntax is `port = *DIGIT` with no maximum. The helper keeps
+# rejecting ports above 65535 on purpose (a port is a 16-bit number), as it did before
+# the bracket correction. These tests pin that decision so a change is never silent.
+@pytest.mark.parametrize(
+    "value",
+    [
+        "http://host:80/",
+        "http://host:/",
+        "http://host:0/",
+        "http://host:0080/",
+        "http://host:65535/",
+        "http://[::1]:65535/",
+        "http://host:65535",
+    ],
+)
+def test_ports_from_zero_to_65535_and_an_empty_port_are_accepted(value: str) -> None:
+    assert _is_valid_uri_reference(value)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "http://host:65536/",
+        "http://host:99999/",
+        "http://[::1]:65536/",
+        "http://host:99999999999999999999/",
+        "http://host:abc/",
+        "http://host:-1/",
+        "http://host:8 0/",
+        "http://host:80:80/",
+    ],
+)
+def test_ports_above_65535_and_non_digit_ports_are_rejected(value: str) -> None:
+    assert not _is_valid_uri_reference(value)
+
+
+@pytest.mark.parametrize("version", ANNOTATION_VERSIONS)
+def test_port_above_65535_is_a_form_diagnostic_for_a_url(version: str) -> None:
+    diagnostic = only_diagnostic(
+        format_suite({"type": "string", "externalDocs": {"url": "http://host:65536/"}}, version)
+    )
+
+    assert diagnostic.code == "unsupported_schema_form"
+    assert diagnostic.source_pointer is not None
+    assert diagnostic.source_pointer.endswith("/properties/v/externalDocs/url")
+
+
+# --- Port range on very long digit strings (Step 8.43.2 final URI correction) ---------
+
+LONG = 5000
+
+
+@pytest.mark.parametrize(
+    ("port", "accepted"),
+    [
+        ("", True),
+        ("0", True),
+        ("80", True),
+        ("65535", True),
+        ("065535", True),
+        ("65536", False),
+        ("99999", False),
+        ("0" * LONG, True),
+        ("0" * LONG + "80", True),
+        ("0" * LONG + "65535", True),
+        ("0" * LONG + "65536", False),
+        ("1" * LONG, False),
+        ("9" * LONG, False),
+        ("6" + "0" * LONG, False),
+    ],
+    ids=lambda value: value if isinstance(value, bool) or len(value) < 12 else f"len{len(value)}",
+)
+def test_port_range_is_checked_on_digits_without_int_conversion(port: str, accepted: bool) -> None:
+    assert _is_valid_uri_reference(f"http://host:{port}/x") is accepted
+    assert _is_valid_uri_reference(f"http://[::1]:{port}") is accepted
+
+
+def test_port_check_does_not_depend_on_the_integer_string_limit() -> None:
+    import sys
+
+    previous = sys.get_int_max_str_digits() if hasattr(sys, "get_int_max_str_digits") else None
+    if previous is None:
+        pytest.skip("this Python has no integer string conversion limit")
+    sys.set_int_max_str_digits(640)
+    try:
+        assert not _is_valid_uri_reference("http://host:" + "9" * 5000 + "/")
+        assert _is_valid_uri_reference("http://host:" + "0" * 5000 + "80/")
+    finally:
+        sys.set_int_max_str_digits(previous)
+
+
+@pytest.mark.parametrize("version", ANNOTATION_VERSIONS)
+def test_oversized_port_in_external_docs_url_is_a_form_diagnostic(version: str) -> None:
+    diagnostic = only_diagnostic(
+        format_suite(
+            {"type": "string", "externalDocs": {"url": "http://host:" + "9" * LONG + "/"}}, version
+        )
+    )
+
+    assert diagnostic.code == "unsupported_schema_form"
+    assert diagnostic.source_pointer is not None
+    assert diagnostic.source_pointer.endswith("/properties/v/externalDocs/url")
+    assert diagnostic.message == "Schema externalDocs.url must be a URL or a relative URL reference."
+
+
+@pytest.mark.parametrize("version", ANNOTATION_VERSIONS)
+def test_long_zero_padded_port_in_external_docs_url_is_accepted(version: str) -> None:
+    schema = {"type": "string", "externalDocs": {"url": "http://host:" + "0" * LONG + "80/"}}
+
+    assert_unsupported_codes_absent(format_suite(schema, version))

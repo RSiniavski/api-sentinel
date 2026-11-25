@@ -335,3 +335,139 @@ def test_openapi_31_accepts_mutual_tls_security_scheme() -> None:
     result = parse_openapi_document(security_scheme_document("3.1.1", scheme), "api.json")
 
     assert result["components"]["securitySchemes"]["scheme"] == scheme
+
+
+# --- Annotation metadata boundary: what the real validator checks (Step 8.43.2) ---------
+# These tests use the real openapi-spec-validator. They record which constraints the
+# Parser enforces; the Generator checks the rest (see tests/test_test_generation.py).
+
+import importlib.util  # noqa: E402
+
+
+def require_real_validator() -> None:
+    """Fail when openapi-spec-validator is missing or a stub that accepts anything."""
+    try:
+        parse_openapi_document(
+            json.dumps({"openapi": "3.0.3", "info": {"title": "x"}, "paths": {}}), "api.json"
+        )
+    except OpenAPIValidationError:
+        return
+    pytest.fail("openapi-spec-validator accepted an invalid document: it is a stub, not the real one")
+
+
+URI_FORMAT_CHECKERS_INSTALLED = any(
+    importlib.util.find_spec(name) for name in ("rfc3987", "rfc3986_validator")
+)
+
+
+def annotated_schema_document(version: str, schema: dict) -> dict:
+    document = openapi_document(version)
+    document["paths"]["/ping"]["post"] = {
+        "requestBody": {
+            "required": True,
+            "content": {
+                "application/json": {
+                    "schema": {"type": "object", "properties": {"v": schema}}
+                }
+            },
+        },
+        "responses": {"200": {"description": "OK"}},
+    }
+    return document
+
+
+def parse_annotated(version: str, schema: dict) -> dict:
+    return parse_openapi_document(
+        json.dumps(annotated_schema_document(version, schema)), "api.json"
+    )
+
+
+@pytest.mark.parametrize("version", ["3.0.3", "3.1.1"])
+def test_real_validator_accepts_valid_xml_and_external_docs_objects(version: str) -> None:
+    require_real_validator()
+    schemas = [
+        {"type": "string", "xml": {"name": "v", "namespace": "https://example.com/ns", "prefix": "ex", "attribute": False}},
+        {"type": "array", "items": {"type": "string", "xml": {"name": "tag"}}, "xml": {"wrapped": True}},
+        {"type": "string", "externalDocs": {"url": "https://example.com/docs", "description": "Docs"}},
+        {"type": "string", "externalDocs": {"url": "docs/page.html"}},
+    ]
+
+    for schema in schemas:
+        document = annotated_schema_document(version, schema)
+        assert parse_annotated(version, schema) == document
+
+
+@pytest.mark.skipif(
+    URI_FORMAT_CHECKERS_INSTALLED,
+    reason="rfc3987 or rfc3986_validator is installed, so the validator may check URI formats",
+)
+@pytest.mark.parametrize("version", ["3.0.3", "3.1.1"])
+@pytest.mark.parametrize(
+    "schema",
+    [
+        {"type": "string", "xml": {"namespace": "ns/relative"}},
+        {"type": "string", "xml": {"namespace": "not a uri"}},
+        {"type": "string", "xml": {"namespace": ""}},
+        {"type": "string", "externalDocs": {"url": "not a url"}},
+        {"type": "string", "externalDocs": {"url": "http://[bad"}},
+        {"type": "string", "externalDocs": {"url": ""}},
+        {"type": "string", "externalDocs": {"url": "https://example.com/[bad]"}},
+        {"type": "string", "externalDocs": {"url": "http://host:99999/"}},
+    ],
+)
+def test_real_validator_does_not_enforce_the_uri_formats_of_xml_and_external_docs(
+    version: str, schema: dict
+) -> None:
+    require_real_validator()
+
+    # The meta-schemas declare format uri and uri-reference, but without an optional
+    # URI format checker package the validator does not assert them. The Generator does.
+    assert parse_annotated(version, schema)["paths"]["/ping"]["post"]
+
+
+@pytest.mark.parametrize("version", ["3.0.3", "3.1.1"])
+@pytest.mark.parametrize(
+    "schema",
+    [
+        {"type": "string", "xml": {"wrapped": True}},
+        {"type": "integer", "xml": {"wrapped": False}},
+        {"type": "array", "items": {"type": "string", "xml": {"wrapped": True}}},
+    ],
+)
+def test_real_validator_does_not_check_where_xml_wrapped_is_used(
+    version: str, schema: dict
+) -> None:
+    require_real_validator()
+
+    assert parse_annotated(version, schema)["paths"]["/ping"]["post"]
+
+
+MALFORMED_ANNOTATION_OBJECTS = [
+    {"type": "string", "xml": {"foo": 1}},
+    {"type": "string", "xml": {"attribute": "true"}},
+    {"type": "string", "xml": {"namespace": 5}},
+    {"type": "string", "externalDocs": {"description": "d"}},
+    {"type": "string", "externalDocs": {"url": 5}},
+    {"type": "string", "externalDocs": {"url": "https://e.test", "foo": 1}},
+]
+
+
+@pytest.mark.parametrize("schema", MALFORMED_ANNOTATION_OBJECTS)
+def test_openapi_30_validator_rejects_malformed_xml_and_external_docs_objects(
+    schema: dict,
+) -> None:
+    require_real_validator()
+
+    with pytest.raises(OpenAPIValidationError):
+        parse_annotated("3.0.3", schema)
+
+
+@pytest.mark.parametrize("schema", MALFORMED_ANNOTATION_OBJECTS)
+def test_openapi_31_validator_accepts_malformed_xml_and_external_docs_objects(
+    schema: dict,
+) -> None:
+    require_real_validator()
+
+    # Recorded behavior: for OpenAPI 3.1 these Schema Object fields are not checked,
+    # so the Generator checks their form itself.
+    assert parse_annotated("3.1.1", schema)["paths"]["/ping"]["post"]
