@@ -18915,3 +18915,254 @@ def test_long_zero_padded_port_in_external_docs_url_is_accepted(version: str) ->
     schema = {"type": "string", "externalDocs": {"url": "http://host:" + "0" * LONG + "80/"}}
 
     assert_unsupported_codes_absent(format_suite(schema, version))
+
+
+# --- Per-run memo of URI checks (Step 8.43.4) --------------------------------------------
+
+URI_MEMO_CASES = [
+    # keyword, field, the check it uses, a value that passes, a value that fails
+    ("xml", "namespace", "absolute", "https://example.com/ns", "relative/ns"),
+    ("externalDocs", "url", "reference", "https://example.com/docs", "not a url"),
+]
+
+
+def count_uri_checks(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[str]]:
+    """Wrap both URI checks of the Generator and record every string they scan."""
+    calls: dict[str, list[str]] = {"absolute": [], "reference": []}
+
+    def wrap(kind: str, check: object, key: str, table: dict) -> None:
+        def counted(value: str) -> bool:
+            calls[kind].append(value)
+            return check(value)  # type: ignore[operator]
+
+        monkeypatch.setitem(table, key, (counted, table[key][1]))
+
+    wrap("absolute", generator_module._is_valid_absolute_uri, "namespace", generator_module._XML_URI_FIELDS)
+    wrap("reference", generator_module._is_valid_uri_reference, "url", generator_module._EXTERNAL_DOCS_URI_FIELDS)
+    return calls
+
+
+def count_annotated_schema_visits(monkeypatch: pytest.MonkeyPatch, keyword: str) -> list[int]:
+    visits = [0]
+    original = generator_module._check_schema
+
+    def counting_check(*args: object) -> object:
+        if isinstance(args[0], dict) and keyword in args[0]:
+            visits[0] += 1
+        return original(*args)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(generator_module, "_check_schema", counting_check)
+    return visits
+
+
+def annotated_grid(keyword: str, field: str, value: str, size: int = 12) -> dict[str, object]:
+    leaf = {"type": "integer", "minimum": 0, "maximum": 10, keyword: {field: value}}
+    item = {"type": "object", "required": ["v"], "properties": {"v": leaf}}
+    return {"type": "array", "minItems": size, "items": {"type": "array", "minItems": size, "items": item}}
+
+
+@pytest.mark.parametrize(("keyword", "field", "kind", "good", "bad"), URI_MEMO_CASES)
+def test_a_repeated_uri_value_is_scanned_once_per_generation_run(
+    monkeypatch: pytest.MonkeyPatch, keyword: str, field: str, kind: str, good: str, bad: str
+) -> None:
+    calls = count_uri_checks(monkeypatch)
+    visits = count_annotated_schema_visits(monkeypatch, keyword)
+
+    suite, budget = validation_run(monkeypatch, annotated_grid(keyword, field, good))
+
+    assert valid_edge_cases(suite)
+    assert_unsupported_codes_absent(suite)
+    # The annotated schema is checked on every visit of the valid-edge validation ...
+    assert visits[0] > 100
+    # ... but its string is scanned once, by the one check of its kind.
+    assert calls[kind] == [good]
+    assert calls["absolute" if kind == "reference" else "reference"] == []
+    assert list(budget.uri_memo.values()) == [True]
+
+
+@pytest.mark.parametrize(("keyword", "field", "kind", "good", "bad"), URI_MEMO_CASES)
+def test_a_repeated_invalid_uri_value_is_scanned_once_and_still_rejected(
+    monkeypatch: pytest.MonkeyPatch, keyword: str, field: str, kind: str, good: str, bad: str
+) -> None:
+    calls = count_uri_checks(monkeypatch)
+    schema = {
+        "type": "object",
+        "required": ["a", "b", "c"],
+        "properties": {name: {"type": "string", keyword: {field: bad}} for name in "abc"},
+    }
+
+    suite, budget = validation_run(monkeypatch, schema)
+
+    assert suite.cases == ()
+    [diagnostic] = suite.diagnostics
+    assert diagnostic.code == "unsupported_schema_form"
+    assert diagnostic.source_pointer is not None
+    assert diagnostic.source_pointer.endswith(f"/properties/a/{keyword}/{field}")
+    assert calls[kind] == [bad]
+    assert list(budget.uri_memo.values()) == [False]
+
+
+@pytest.mark.parametrize("version", ANNOTATION_VERSIONS)
+@pytest.mark.parametrize(("keyword", "field", "kind", "good", "bad"), URI_MEMO_CASES)
+def test_a_cached_invalid_result_reports_the_pointer_of_the_current_occurrence(
+    monkeypatch: pytest.MonkeyPatch, keyword: str, field: str, kind: str, good: str, bad: str,
+    version: str,
+) -> None:
+    calls = count_uri_checks(monkeypatch)
+    endpoints = [
+        post_endpoint(
+            {"type": "object", "required": [name], "properties": {name: {"type": "string", keyword: {field: bad}}}},
+            path,
+        )
+        for name, path in (("first", "/one"), ("second", "/two"), ("third", "/three"))
+    ]
+
+    suite = generate_test_suite(make_result(*endpoints, version=version))
+
+    assert suite.cases == ()
+    assert calls[kind] == [bad]  # scanned for the first endpoint only
+    seen = [(d.endpoint_path, d.code, d.source_pointer) for d in suite.diagnostics]
+    assert [(path, code) for path, code, _ in seen] == [
+        ("/one", "unsupported_schema_form"),
+        ("/two", "unsupported_schema_form"),
+        ("/three", "unsupported_schema_form"),
+    ]
+    for (_, _, pointer), name in zip(seen, ("first", "second", "third")):
+        assert pointer is not None
+        assert pointer.endswith(f"/properties/{name}/{keyword}/{field}")
+    assert len({d.message for d in suite.diagnostics}) == 1
+
+
+@pytest.mark.parametrize("namespace_first", [True, False])
+def test_absolute_uri_and_uri_reference_results_are_not_mixed_up(
+    monkeypatch: pytest.MonkeyPatch, namespace_first: bool
+) -> None:
+    relative = "docs/page.html"  # a valid reference, but not an absolute URI
+    calls = count_uri_checks(monkeypatch)
+    namespace = {"type": "string", "xml": {"namespace": relative}}
+    url = {"type": "string", "externalDocs": {"url": relative}}
+    # Required properties are checked in sorted name order, so the names set the order.
+    properties = {"a": namespace, "b": url} if namespace_first else {"a": url, "b": namespace}
+    namespace_name = "a" if namespace_first else "b"
+
+    suite, budget = validation_run(
+        monkeypatch, {"type": "object", "required": list(properties), "properties": properties}
+    )
+
+    [diagnostic] = suite.diagnostics
+    assert diagnostic.source_pointer is not None
+    assert diagnostic.source_pointer.endswith(f"/properties/{namespace_name}/xml/namespace")
+    assert diagnostic.message == "Schema xml.namespace must be an absolute URI."
+    assert calls["absolute"] == [relative]
+    if namespace_first:
+        # The endpoint is dropped at the namespace, so the URL is never reached.
+        assert calls["reference"] == []
+        assert list(budget.uri_memo.values()) == [False]
+    else:
+        # The URL was accepted first; the same string is then rejected as a namespace.
+        assert calls["reference"] == [relative]
+        assert sorted(budget.uri_memo.values()) == [False, True]
+
+
+def test_a_reference_accepted_as_a_url_is_still_checked_as_an_absolute_uri_afterwards(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    relative = "docs/page.html"
+    url_ok = {"type": "string", "externalDocs": {"url": relative}}
+    ns_bad = {"type": "string", "xml": {"namespace": relative}}
+
+    suite, budget = validation_run(
+        monkeypatch,
+        {"type": "object", "required": ["u"], "properties": {"u": url_ok}},
+        {"type": "object", "required": ["n"], "properties": {"n": ns_bad}},
+    )
+
+    assert {case.path for case in suite.cases} == {"/items0"}
+    [diagnostic] = suite.diagnostics
+    assert diagnostic.endpoint_path == "/items1"
+    assert diagnostic.source_pointer is not None
+    assert diagnostic.source_pointer.endswith("/properties/n/xml/namespace")
+    assert sorted(budget.uri_memo.values()) == [False, True]
+
+
+def test_the_uri_memo_is_not_shared_between_generation_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = {"accept": True, "calls": 0}
+
+    def controlled(value: str) -> bool:
+        state["calls"] += 1
+        return bool(state["accept"])
+
+    # The same function object is used by all three runs, so a result kept from an
+    # earlier run would be reused if anything outlived it.
+    monkeypatch.setitem(
+        generator_module._EXTERNAL_DOCS_URI_FIELDS, "url", (controlled, "a URL or a relative URL reference")
+    )
+    endpoint = format_endpoint({"type": "string", "externalDocs": {"url": "https://example.com/docs"}})
+    result = make_result(endpoint)
+
+    first = generate_test_suite(result)
+    state["accept"] = False
+    second = generate_test_suite(result)
+    state["accept"] = True
+    third = generate_test_suite(result)
+
+    assert_unsupported_codes_absent(first)
+    [diagnostic] = second.diagnostics
+    assert diagnostic.code == "unsupported_schema_form" and second.cases == ()
+    assert dump_suite(third) == dump_suite(first)
+    assert state["calls"] == 3  # once per run
+    assert generator_module._BUDGET.get() is None
+
+
+def test_the_uri_memo_lives_on_the_run_budget_and_holds_only_booleans(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    good = {"type": "string", "xml": {"namespace": "https://example.com/ns"}}
+    other = {"type": "string", "externalDocs": {"url": "docs/page.html"}}
+    shape = {"type": "object", "required": ["a", "b"], "properties": {"a": good, "b": other}}
+
+    _, budget = validation_run(monkeypatch, shape, shape)
+    _, again = validation_run(monkeypatch, shape)
+
+    assert not hasattr(generator_module, "_URI_MEMO")
+    assert sorted(
+        (check.__name__, text) for check, text in budget.uri_memo
+    ) == [
+        ("_is_valid_absolute_uri", "https://example.com/ns"),
+        ("_is_valid_uri_reference", "docs/page.html"),
+    ]
+    assert all(isinstance(result, bool) for result in budget.uri_memo.values())
+    assert again.uri_memo.keys() == budget.uri_memo.keys() and again is not budget
+
+
+@pytest.mark.parametrize("version", ANNOTATION_VERSIONS)
+@pytest.mark.parametrize("keyword", ["xml", "externalDocs"])
+@pytest.mark.parametrize(
+    "value", [*VALID_URI_REFERENCES, *INVALID_URI_REFERENCES, *BRACKET_VALID, *BRACKET_INVALID]
+)
+def test_memoized_checks_give_the_same_result_as_the_uri_helpers(
+    value: str, keyword: str, version: str
+) -> None:
+    field, check = (
+        ("namespace", _is_valid_absolute_uri) if keyword == "xml" else ("url", _is_valid_uri_reference)
+    )
+    expected = check(value)
+    schema = {
+        "type": "object",
+        "required": ["a", "b"],
+        "properties": {name: {"type": "string", keyword: {field: value}} for name in "ab"},
+    }
+
+    suite = generate_test_suite(make_result(post_endpoint(schema), version=version))
+
+    if expected:
+        assert_unsupported_codes_absent(suite)
+        assert suite.cases
+    else:
+        assert suite.cases == ()
+        [diagnostic] = suite.diagnostics
+        assert diagnostic.code == "unsupported_schema_form"
+        assert diagnostic.source_pointer is not None
+        assert diagnostic.source_pointer.endswith(f"/properties/a/{keyword}/{field}")

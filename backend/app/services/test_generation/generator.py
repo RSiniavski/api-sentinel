@@ -184,6 +184,12 @@ class _GenerationBudget:
         # run. It lives on the budget, never at module level, so charges cannot
         # depend on an earlier generation call.
         self.pattern_memo: dict[tuple[str, str], bool] = {}
+        # Outcomes of the URI checks of xml.namespace and externalDocs.url, keyed by the
+        # check function (the validation kind) and the exact string. The same schema is
+        # checked again on every visit of a valid-edge validation; this keeps a long URI
+        # from being scanned each time. Only booleans are stored, never diagnostics, and
+        # the keys are the document's own strings, so it is bounded by the document size.
+        self.uri_memo: dict[tuple[Callable[[str], bool], str], bool] = {}
         self.begin_endpoint()
 
     def begin_endpoint(self) -> None:
@@ -5050,6 +5056,18 @@ def _check_schema(
     return raw
 
 
+def _uri_rule_holds(check: Callable[[str], bool], value: str) -> bool:
+    """Run a URI check, once per distinct (check, string) in a generation run."""
+    budget = _BUDGET.get()
+    if budget is None:
+        return check(value)
+    key = (check, value)
+    result = budget.uri_memo.get(key)
+    if result is None:
+        result = budget.uri_memo[key] = check(value)
+    return result
+
+
 def _check_annotation_object(
     raw: dict[str, Any],
     key: str,
@@ -5087,7 +5105,7 @@ def _check_annotation_object(
                 "unsupported_schema_form", f"Schema {key}.{name} must be a {kind}.", field_pointer
             )
         uri_rule = uri_fields.get(name)
-        if uri_rule is not None and not uri_rule[0](value[name]):
+        if uri_rule is not None and not _uri_rule_holds(uri_rule[0], value[name]):
             raise _UnsupportedOperation(
                 "unsupported_schema_form",
                 f"Schema {key}.{name} must be {uri_rule[1]}.",
