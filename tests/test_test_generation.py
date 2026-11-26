@@ -19166,3 +19166,223 @@ def test_memoized_checks_give_the_same_result_as_the_uri_helpers(
         assert diagnostic.code == "unsupported_schema_form"
         assert diagnostic.source_pointer is not None
         assert diagnostic.source_pointer.endswith(f"/properties/a/{keyword}/{field}")
+
+
+# --- Meter wiring: $ref and additionalProperties (Step 8.43.5) ---------------------------
+# The valid-edge validation passes one meter down every recursive call. These tests pin
+# three places where the meter is handed on, so that dropping it there is noticed:
+#   1. the $ref branch of _check_schema,
+#   2. the _check_schema call for an additionalProperties schema (in _matches),
+#   3. the _matches call for an additionalProperties value.
+# _check_schema has no additionalProperties recursion of its own; points 2 and 3 are the
+# two calls inside the additionalProperties branch of _matches.
+
+REF_BODY = {
+    "type": "object",
+    "required": ["v"],
+    "properties": {"v": {"$ref": "#/components/schemas/Num"}},
+}
+REF_SCHEMAS = {"Num": {"type": "integer", "minimum": 1, "maximum": 5}}
+# `v` has an example with an undeclared property `x`, so the baseline body, and with it
+# every valid-edge candidate, reaches the additionalProperties branch of _matches.
+ADDITIONAL_BODY = {
+    "type": "object",
+    "required": ["v"],
+    "properties": {
+        "v": {
+            "type": "object",
+            "required": ["a"],
+            "properties": {"a": {"type": "integer", "minimum": 1, "maximum": 5}},
+            "additionalProperties": {"type": "integer"},
+            "example": {"a": 2, "x": 3},
+        }
+    },
+}
+# Root check: the object (1), v (1), and v's required property a (1). Each candidate
+# body: the object (1), v's schema check (1) with its required property a (1), v's
+# value (1), then a's schema check (1) and value (1), then the undeclared x: the
+# additionalProperties schema check (1) and its value (1). There are two candidates.
+ADDITIONAL_UNITS = 3 + 2 * 8
+# For REF_BODY: root check object (1), v (1), the referenced Num (1); one candidate:
+# the object (1), v and its reference target (2), v's value (1).
+REF_UNITS = 3 + 4
+
+
+def wiring_run(
+    monkeypatch: pytest.MonkeyPatch,
+    body: object,
+    schemas: dict[str, object] | None = None,
+    *,
+    endpoint_limit: int | None = None,
+) -> tuple[GeneratedTestSuite, "generator_module._GenerationBudget", list[object], list[tuple[str, str, object]]]:
+    """Generate one endpoint; return the suite, its budget, the meters and every call.
+
+    Each call is (function, pointer, meter) for _check_schema and _matches, where the
+    meter is None when the call was made without one.
+    """
+    created: list[generator_module._GenerationBudget] = []
+    meters: list[object] = []
+    calls: list[tuple[str, str, object]] = []
+
+    class RecordingBudget(generator_module._GenerationBudget):
+        def __init__(self) -> None:
+            super().__init__()
+            created.append(self)
+
+    original_meter = generator_module._validation_meter
+    original_check = generator_module._check_schema
+    original_matches = generator_module._matches
+
+    def recording_meter(pointer: str) -> object:
+        meter = original_meter(pointer)
+        meters.append(meter)
+        return meter
+
+    def recording_check(*args: object) -> object:
+        calls.append(("check", str(args[2]), args[5] if len(args) > 5 else None))
+        return original_check(*args)  # type: ignore[arg-type]
+
+    def recording_matches(*args: object) -> bool:
+        calls.append(("matches", str(args[5]) if len(args) > 5 else "", args[6] if len(args) > 6 else None))
+        return original_matches(*args)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(generator_module, "_GenerationBudget", RecordingBudget)
+    monkeypatch.setattr(generator_module, "_validation_meter", recording_meter)
+    monkeypatch.setattr(generator_module, "_check_schema", recording_check)
+    monkeypatch.setattr(generator_module, "_matches", recording_matches)
+    if endpoint_limit is not None:
+        monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_VALIDATION_UNITS", endpoint_limit)
+    components = (
+        Components(schemas={name: Schema(raw=raw) for name, raw in schemas.items()})
+        if schemas
+        else None
+    )
+    suite = generate_test_suite(make_result(post_endpoint(body), components=components))
+    [budget] = created
+    return suite, budget, meters, calls
+
+
+def metered_calls_at(
+    calls: list[tuple[str, str, object]], function: str, pointer_suffix: str
+) -> list[object]:
+    """The meters of the calls of one function, at a pointer, that carried a meter.
+
+    The other generation steps call the same functions without a meter, so a call
+    that lost its meter shows up as a missing entry here.
+    """
+    return [
+        meter
+        for name, pointer, meter in calls
+        if name == function and pointer.endswith(pointer_suffix) and meter is not None
+    ]
+
+
+def test_the_ref_branch_of_check_schema_hands_the_step_meter_to_the_target_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    suite, budget, meters, calls = wiring_run(monkeypatch, REF_BODY, REF_SCHEMAS)
+
+    assert len(valid_edge_cases(suite)) == 1
+    [meter] = meters
+    # The referenced schema is checked twice: when the root is checked and when the
+    # candidate body is validated. Both checks must carry the step's own meter.
+    target_meters = metered_calls_at(calls, "check", "/components/schemas/Num")
+    assert len(target_meters) == 2
+    assert all(item is meter for item in target_meters)
+    # Following the reference is one unit per validation, on top of the 5 units of the
+    # same body without a reference (NUMERIC_BODY).
+    assert budget.suite_validation_units == REF_UNITS == 5 + 2
+
+
+def test_a_followed_reference_counts_toward_the_validation_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with monkeypatch.context() as patch:
+        enough, _, _, _ = wiring_run(patch, REF_BODY, REF_SCHEMAS, endpoint_limit=REF_UNITS)
+    with monkeypatch.context() as patch:
+        short, budget, _, _ = wiring_run(patch, REF_BODY, REF_SCHEMAS, endpoint_limit=REF_UNITS - 1)
+
+    assert len(valid_edge_cases(enough)) == 1 and validation_diagnostics(enough) == []
+    # One unit less and the step is discarded as a whole; nothing else changes.
+    assert valid_edge_cases(short) == []
+    [diagnostic] = validation_diagnostics(short)
+    assert f"The per-endpoint limit of {REF_UNITS - 1} validation work units" in diagnostic.message
+    assert case_keys(short.cases) == case_keys(without_valid_edge_cases(enough))
+    assert budget.suite_validation_units == REF_UNITS
+
+
+def test_the_additional_properties_schema_check_uses_the_step_meter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    suite, _, meters, calls = wiring_run(monkeypatch, ADDITIONAL_BODY)
+
+    assert len(valid_edge_cases(suite)) == 2
+    [meter] = meters
+    checks = metered_calls_at(calls, "check", "/properties/v/additionalProperties")
+    # One check of the additionalProperties schema per candidate body.
+    assert len(checks) == 2
+    assert all(item is meter for item in checks)
+
+
+def test_the_additional_properties_value_match_uses_the_step_meter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    suite, _, meters, calls = wiring_run(monkeypatch, ADDITIONAL_BODY)
+
+    assert len(valid_edge_cases(suite)) == 2
+    [meter] = meters
+    matches = metered_calls_at(calls, "matches", "/properties/v/additionalProperties")
+    # One match of the undeclared value per candidate body.
+    assert len(matches) == 2
+    assert all(item is meter for item in matches)
+
+
+def test_additional_properties_work_is_charged_and_limits_the_step_as_a_whole(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with monkeypatch.context() as patch:
+        enough, budget, _, _ = wiring_run(patch, ADDITIONAL_BODY, endpoint_limit=ADDITIONAL_UNITS)
+    with monkeypatch.context() as patch:
+        short, _, _, _ = wiring_run(patch, ADDITIONAL_BODY, endpoint_limit=ADDITIONAL_UNITS - 1)
+
+    assert len(valid_edge_cases(enough)) == 2 and validation_diagnostics(enough) == []
+    assert budget.suite_validation_units == ADDITIONAL_UNITS
+    # The last unit belongs to the second candidate's additionalProperties value, so
+    # running out there discards the first candidate as well.
+    assert valid_edge_cases(short) == []
+    [diagnostic] = validation_diagnostics(short)
+    assert f"The per-endpoint limit of {ADDITIONAL_UNITS - 1} validation work units" in diagnostic.message
+    assert case_keys(short.cases) == case_keys(without_valid_edge_cases(enough))
+
+
+ADDITIONAL_SCHEMA = {"type": "object", "additionalProperties": {"type": "integer"}}
+
+
+def test_matches_charges_the_schema_check_and_the_value_of_an_additional_property() -> None:
+    token, budget = with_budget()
+    try:
+        meter = generator_module._validation_meter("/p")
+
+        assert generator_module._matches(ADDITIONAL_SCHEMA, {"x": 1}, "3.1.1", "request", 0, "/p", meter)
+
+        # The object (1), then the additionalProperties schema check (1) and value (1).
+        assert budget.endpoint_validation_units == 3
+    finally:
+        generator_module._BUDGET.reset(token)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("limit", [1, 2])
+def test_running_out_of_work_inside_the_additional_properties_branch_is_not_a_mismatch(
+    monkeypatch: pytest.MonkeyPatch, limit: int
+) -> None:
+    # An unusable additionalProperties schema only rejects a candidate, but budget
+    # exhaustion must still propagate out of the branch. Three units are needed.
+    monkeypatch.setattr(generator_module, "_MAX_ENDPOINT_VALIDATION_UNITS", limit)
+    token, _ = with_budget()
+    try:
+        meter = generator_module._validation_meter("/p")
+
+        with pytest.raises(generator_module._BudgetExhausted):
+            generator_module._matches(ADDITIONAL_SCHEMA, {"x": 1}, "3.1.1", "request", 0, "/p", meter)
+    finally:
+        generator_module._BUDGET.reset(token)  # type: ignore[arg-type]
