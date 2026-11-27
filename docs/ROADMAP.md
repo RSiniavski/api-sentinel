@@ -1,7 +1,7 @@
 # API Sentinel — Development Roadmap
 
 **Document status:** Initial proposal  
-**Last updated:** 2026-11-11
+**Last updated:** 2026-11-27
 
 ## 1. Development Strategy
 
@@ -102,15 +102,17 @@ Implemented so far:
 
 - Internal test representation: strict, frozen output models (`GeneratedTestSuite`, `GeneratedTestCase`, `GenerationDiagnostic`).
 - Positive test generation: one baseline case for each eligible operation whose positive inputs are supported (supported schema subset), plus one additional positive case without the body (`request-body-omitted`) for a supported optional request body; an unsupported optional body keeps the endpoint with a body-less baseline and the original diagnostic.
+- Valid boundary-edge test generation: positive cases after all negative cases, for numeric bounds (`minimum`, `maximum`, exclusive bounds) and string lengths (`minLength`, `maxLength`) of request body properties, with `valid_boundary_no_safe_candidate` for a numeric edge without a safe value (details in `AGENTS.md` §12).
 - Negative test generation: required parameter, request body and property omission; wrong JSON type; enum/const violation.
 - Boundary test generation: string length bounds, numeric bounds (including properties reached through nested local `$ref`), array size bounds (`minItems`, `maxItems`) and `uniqueItems` duplicate cases for request body arrays (Array Bounds Generation, implemented): arrays present in the positive body, optional arrays absent from it, arrays below absent optional parent objects (created in the negative body only), arrays inside element 0 of a present array (objects and nested arrays), and arrays below the one element created in a present empty array (array-bound phase 4).
 - Local reference resolution for parameters, request bodies and schemas, with diagnostics for unsupported, missing, invalid and cyclic references and the `$ref` sibling policy (annotations only).
-- Deterministic resource budgets for reference expansions, generated cases and diagnostics, with stable budget diagnostics.
+- Deterministic resource budgets for reference expansions, generated cases, diagnostics, pattern work and valid-edge validation work, with stable budget diagnostics (limits in `AGENTS.md` §12).
 - Referenced responses: local `#/components/responses/` references, including alias chains, resolved into `ResponseExpectation`.
 - Response metadata (Step 8.41.2): the top-level `$ref` chain of a response schema is resolved into a separate field next to the declared schema; response headers and links are kept as passive metadata, with Header and Link Object requirements enforced (Step 8.41.3). Unusable references, headers and links are diagnosed without skipping the endpoint.
 - Parser validation of Security Scheme Objects through `openapi-spec-validator`: type-specific required fields are enforced, and the supported types are accepted in OpenAPI 3.0.3 and 3.1.1 (`mutualTLS` only in 3.1). Covered by real-validator tests in `tests/test_openapi_parser.py`; the Generator does not repeat these checks.
 - Generator security scheme validation: schemes named by the effective security requirements are looked up, local `#/components/securitySchemes/` alias chains are resolved, the scheme type is checked and, for `oauth2`, every requested scope must be declared in at least one flow of the resolved scheme (`unsupported_security_scope`); all failures of an endpoint are reported together and the endpoint is skipped.
-- Schema `format` support for a closed set (`int32`, `int64`, `float`, `double`, `date`, `date-time`, `uuid`, `email`): type compatibility rules, deterministic fixed values, restricted validation profiles for `date-time`, `uuid` and `email`, and implicit numeric ranges in numeric boundary generation. Wrong-format negative cases are not generated; other request media types and `style`/`explode` remain unsupported.
+- Schema `format` support for a closed set (`int32`, `int64`, `float`, `double`, `date`, `date-time`, `uuid`, `email`): type compatibility rules, deterministic fixed values, restricted validation profiles for `date-time`, `uuid` and `email`, `format: password` accepted as a string annotation only, and implicit numeric ranges in numeric boundary generation. Wrong-format negative cases are not generated; other request media types and `style`/`explode` remain unsupported.
+- Annotation objects `xml` and `externalDocs` in request schemas: form checks only, with URI syntax checks done by the Generator; they never affect generated values (details in `AGENTS.md` §12).
 - Failure isolation: an unsupported schema in one negative step does not stop the other negative steps of the endpoint.
 - Request schema `additionalProperties` (boolean or schema object): enforced when validating example, default, enum and const candidates, which may keep undeclared properties that satisfy it; synthesized values contain declared properties only (no invented map keys). An unsupported or unresolvable `additionalProperties` schema rejects only the candidate being validated. No negative cases target additional properties, and `patternProperties`, `minProperties` and `maxProperties` remain unsupported.
 - String `pattern` (bounded subset): validates existing example, default, enum, const, fallback, boundary and array item candidates only (no synthesis, no pattern-violation cases); limits of 128 characters, 128 quantifier bounds, 128-code-point candidates, 2,000 / 20,000 evaluations and 500,000 / 4,000,000 weighted work units per endpoint / suite, with `generation_pattern_budget_exceeded`. Parser acceptance does not guarantee Generator support.
@@ -134,7 +136,7 @@ Optional request bodies (Step 8.39.1):
 
 Still planned:
 
-- Support for further schema keywords (formats beyond the closed set, patterns beyond the bounded subset) and compositions.
+- Support for further schema keywords (formats other than the eight supported value formats and the supported `password` annotation, patterns beyond the bounded subset) and compositions.
 - Request media types other than `application/json`.
 
 ## 6. Phase 5 — Test Execution Engine
