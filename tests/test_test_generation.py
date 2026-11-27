@@ -19386,3 +19386,750 @@ def test_running_out_of_work_inside_the_additional_properties_branch_is_not_a_mi
             generator_module._matches(ADDITIONAL_SCHEMA, {"x": 1}, "3.1.1", "request", 0, "/p", meter)
     finally:
         generator_module._BUDGET.reset(token)  # type: ignore[arg-type]
+
+
+# --- Step 8.44.4: golden regression for JSON-only request bodies -------------------
+# The expected values below are fixed data captured from the implementation before
+# request media type selection was changed. They must never be regenerated from the
+# code under test.
+
+GOLDEN_JSON_BODY_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "required": ["name", "age"],
+    "properties": {
+        "name": {"type": "string", "minLength": 1, "maxLength": 5},
+        "age": {"type": "integer", "minimum": 1, "maximum": 9},
+    },
+}
+
+GOLDEN_REQUIRED_JSON_CASES: tuple[tuple[str, str, str | None, object], ...] = (
+    ("case-e990e04552667f473990e99c778bdf6bd792335a52617924061620ed85b284eb", "positive", None, {'age': 1, 'name': 'senti'}),
+    ("case-1047814a1a62fc52e57b9718bc10069817aaa1e1fd4296d8c6497eb75b1a2b63", "negative", 'required_property', {'name': 'senti'}),
+    ("case-93692ce01e76b14e7386644034d86eb60d745083b165a0c9be027cf953e20499", "negative", 'required_property', {'age': 1}),
+    ("case-cf25f0252256856c0f1db798a461c9dfd458a863e4f8c2365e62bd8f34a12b4b", "negative", 'minimum', {'age': 0, 'name': 'senti'}),
+    ("case-1c976651cf456aadf677cadb2f1f0b72b7f45a6add35d71f4a766b927ac21245", "negative", 'maximum', {'age': 10, 'name': 'senti'}),
+    ("case-dbdd46b05c9956f9dfe1cb4fe6e491749bc662e9de3a7934513acde297bbcca0", "negative", 'type', {'age': 'wrong-type', 'name': 'senti'}),
+    ("case-d03cd488d51ff6211bbbf6c1129c8ee42dd451946d68235ca82f7c354867b687", "negative", 'type', {'age': 1, 'name': 0}),
+    ("case-c499ccf4d73aaa2033ac21ff2af3df18bcfac627e913181b896a8600da365509", "negative", 'minLength', {'age': 1, 'name': ''}),
+    ("case-88e510de01f5734db92a4b051aac415f6da12d98201e2c2faf05b9ae9fee61ba", "negative", 'maxLength', {'age': 1, 'name': 'xxxxxx'}),
+    ("case-8ea15ceb12173df5d6d74b996c6841bc2c982d4765bd3467239dc8c3837a6083", "negative", 'required_parameter', {'age': 1, 'name': 'senti'}),
+    ("case-805f56ea6e2d9c309edc8b0a3a8e103c55df80229c6163535c426added7f8722", "negative", 'required_request_body', None),
+    ("case-d9001a5108d4828bebacdce67798436b547a3ad88bc076bece8a9ba945d49e09", "positive", None, {'age': 9, 'name': 'senti'}),
+    ("case-8084a18ff2c38470c0208719b29ad94ee65788e5e4a0bcc77cdd2feff4aafce7", "positive", None, {'age': 1, 'name': 'x'}),
+)
+
+GOLDEN_OPTIONAL_JSON_CASES: tuple[tuple[str, str, str | None, object], ...] = (
+    ("case-e990e04552667f473990e99c778bdf6bd792335a52617924061620ed85b284eb", "positive", None, {'age': 1, 'name': 'senti'}),
+    ("case-00b1f0298733ddbe370e34c223e5b851cdc171f2063c6631269de2ab920c2372", "positive", None, None),
+    ("case-1047814a1a62fc52e57b9718bc10069817aaa1e1fd4296d8c6497eb75b1a2b63", "negative", 'required_property', {'name': 'senti'}),
+    ("case-93692ce01e76b14e7386644034d86eb60d745083b165a0c9be027cf953e20499", "negative", 'required_property', {'age': 1}),
+    ("case-cf25f0252256856c0f1db798a461c9dfd458a863e4f8c2365e62bd8f34a12b4b", "negative", 'minimum', {'age': 0, 'name': 'senti'}),
+    ("case-1c976651cf456aadf677cadb2f1f0b72b7f45a6add35d71f4a766b927ac21245", "negative", 'maximum', {'age': 10, 'name': 'senti'}),
+    ("case-dbdd46b05c9956f9dfe1cb4fe6e491749bc662e9de3a7934513acde297bbcca0", "negative", 'type', {'age': 'wrong-type', 'name': 'senti'}),
+    ("case-d03cd488d51ff6211bbbf6c1129c8ee42dd451946d68235ca82f7c354867b687", "negative", 'type', {'age': 1, 'name': 0}),
+    ("case-c499ccf4d73aaa2033ac21ff2af3df18bcfac627e913181b896a8600da365509", "negative", 'minLength', {'age': 1, 'name': ''}),
+    ("case-88e510de01f5734db92a4b051aac415f6da12d98201e2c2faf05b9ae9fee61ba", "negative", 'maxLength', {'age': 1, 'name': 'xxxxxx'}),
+    ("case-8ea15ceb12173df5d6d74b996c6841bc2c982d4765bd3467239dc8c3837a6083", "negative", 'required_parameter', {'age': 1, 'name': 'senti'}),
+    ("case-d9001a5108d4828bebacdce67798436b547a3ad88bc076bece8a9ba945d49e09", "positive", None, {'age': 9, 'name': 'senti'}),
+    ("case-8084a18ff2c38470c0208719b29ad94ee65788e5e4a0bcc77cdd2feff4aafce7", "positive", None, {'age': 1, 'name': 'x'}),
+)
+
+
+def golden_summary(suite: GeneratedTestSuite) -> tuple[tuple[str, str, str | None, object], ...]:
+    return tuple(
+        (
+            case.case_id,
+            case.category,
+            case.violated_constraint,
+            None
+            if case.request_body is None
+            else {"media_type": case.request_body.media_type, "value": case.request_body.value},
+        )
+        for case in suite.cases
+    )
+
+
+def with_json_media(rows: tuple[tuple[str, str, str | None, object], ...]):
+    return tuple(
+        (
+            case_id,
+            category,
+            constraint,
+            None if value is None else {"media_type": "application/json", "value": value},
+        )
+        for case_id, category, constraint, value in rows
+    )
+
+
+def test_golden_json_only_required_body_cases_ids_order_and_values() -> None:
+    suite = body_suite(body_of(GOLDEN_JSON_BODY_SCHEMA, required=True))
+
+    assert golden_summary(suite) == with_json_media(GOLDEN_REQUIRED_JSON_CASES)
+    assert suite.diagnostics == ()
+
+
+def test_golden_json_only_optional_body_cases_ids_order_and_values() -> None:
+    suite = body_suite(body_of(GOLDEN_JSON_BODY_SCHEMA, required=False))
+
+    assert golden_summary(suite) == with_json_media(GOLDEN_OPTIONAL_JSON_CASES)
+    assert suite.diagnostics == ()
+
+
+def test_golden_json_only_provenance_pointers() -> None:
+    suite = body_suite(body_of(GOLDEN_JSON_BODY_SCHEMA, required=True))
+    schema = "/paths/~1x/post/requestBody/content/application~1json/schema"
+
+    assert suite.cases[0].provenance == (
+        "/paths/~1x/post",
+        "/paths/~1x/post/requestBody",
+        schema,
+    )
+    assert suite.cases[3].provenance == (
+        "/paths/~1x/post",
+        "/paths/~1x/post/requestBody",
+        schema,
+        f"{schema}/properties/age",
+        f"{schema}/properties/age/minimum",
+        "violated_constraint:minimum:/age",
+    )
+
+
+def test_golden_json_only_unsupported_schema_diagnostic_is_unchanged() -> None:
+    suite = body_suite(body_of(UNSUPPORTED_BODY_SCHEMA, required=False))
+
+    assert [(case.case_id, case.category, case.request_body) for case in suite.cases] == [
+        (
+            "case-e990e04552667f473990e99c778bdf6bd792335a52617924061620ed85b284eb",
+            "positive",
+            None,
+        ),
+        (
+            "case-8ea15ceb12173df5d6d74b996c6841bc2c982d4765bd3467239dc8c3837a6083",
+            "negative",
+            None,
+        ),
+    ]
+    assert [
+        (d.code, d.source_pointer, d.endpoint_path, d.endpoint_method, d.message)
+        for d in suite.diagnostics
+    ] == [
+        (
+            "unsupported_schema_keyword",
+            "/paths/~1x/post/requestBody/content/application~1json/schema/properties/a/format",
+            "/x",
+            "post",
+            "Schema keyword 'format' is outside the supported subset.",
+        )
+    ]
+
+
+# --- Step 8.44.4: deterministic request media type selection ------------------------
+
+PLAIN_JSON = "application/json"
+CHARSET_JSON = "application/json; charset=utf-8"
+IGNORED_CODE = "request_media_type_ignored"
+CONTENT_POINTER = "/paths/~1x/post/requestBody/content"
+SCHEMA_A: dict[str, object] = {
+    "type": "object",
+    "required": ["a"],
+    "properties": {"a": {"type": "integer", "minimum": 1, "maximum": 9}},
+}
+SCHEMA_B: dict[str, object] = {
+    "type": "object",
+    "required": ["b"],
+    "properties": {"b": {"type": "string", "maxLength": 4}},
+}
+RICH_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "required": ["name", "age", "kind", "tags"],
+    "properties": {
+        "name": {"type": "string", "minLength": 1, "maxLength": 5},
+        "age": {"type": "integer", "minimum": 1, "maximum": 9},
+        "kind": {"type": "string", "enum": ["a", "b"]},
+        "tags": {"type": "array", "minItems": 1, "maxItems": 2, "items": {"type": "integer"}},
+    },
+}
+BOTH_VERSIONS = pytest.mark.parametrize("version", ["3.0.3", "3.1.1"])
+
+
+def media_body(
+    content: dict[str, object], *, required: bool, encoding: dict[str, dict[str, object]] | None = None
+) -> RequestBody:
+    entries = {
+        key: MediaType(
+            schema=None if schema is None else Schema(raw=schema),  # type: ignore[arg-type]
+            encoding=(encoding or {}).get(key, {}),
+        )
+        for key, schema in content.items()
+    }
+    return RequestBody(required=required, content=entries)
+
+
+def media_suite(
+    request_body: RequestBody | LocalReference,
+    *,
+    version: str = "3.1.1",
+    request_bodies: dict[str, RequestBody | LocalReference] | None = None,
+    schemas: dict[str, object] | None = None,
+) -> GeneratedTestSuite:
+    return generate_test_suite(
+        make_result(
+            body_endpoint(request_body),
+            version=version,
+            components=Components(
+                request_bodies=request_bodies or {},
+                schemas={name: Schema(raw=raw) for name, raw in (schemas or {}).items()},  # type: ignore[arg-type]
+                security_schemes=declared_security_schemes("apiKey").security_schemes,
+            ),
+        )
+    )
+
+
+def body_labels(suite: GeneratedTestSuite) -> set[str]:
+    return {case.request_body.media_type for case in suite.cases if case.request_body is not None}
+
+
+def diagnostic_summary(suite: GeneratedTestSuite) -> list[tuple[str, str | None]]:
+    return [(item.code, item.source_pointer) for item in suite.diagnostics]
+
+
+def ignored_pointer(key: str) -> str:
+    return f"{CONTENT_POINTER}/{key.replace('~', '~0').replace('/', '~1')}"
+
+
+def body_values(suite: GeneratedTestSuite) -> list[object]:
+    return [case.request_body.value if case.request_body else None for case in suite.cases]
+
+
+def test_json_only_required_and_optional_bodies_report_no_media_type_diagnostic() -> None:
+    for required in (True, False):
+        suite = media_suite(media_body({PLAIN_JSON: SCHEMA_A}, required=required))
+
+        assert diagnostic_summary(suite) == []
+        assert body_labels(suite) == {PLAIN_JSON}
+        assert suite.cases[0].request_body is not None
+        assert suite.cases[0].request_body.value == {"a": 1}
+
+
+@BOTH_VERSIONS
+@pytest.mark.parametrize("required", [True, False])
+@pytest.mark.parametrize(
+    "other", ["application/xml", "application/x-www-form-urlencoded", "multipart/form-data", "*/*", "text/plain"]
+)
+def test_plain_json_wins_over_unsupported_media_types_that_are_reported(
+    version: str, required: bool, other: str
+) -> None:
+    json_only = media_suite(media_body({PLAIN_JSON: SCHEMA_A}, required=required), version=version)
+    suite = media_suite(
+        media_body({PLAIN_JSON: SCHEMA_A, other: SCHEMA_B}, required=required), version=version
+    )
+
+    assert suite.cases == json_only.cases
+    assert body_labels(suite) == {PLAIN_JSON}
+    assert [
+        (d.code, d.endpoint_path, d.endpoint_method, d.source_pointer, d.reference_uri, d.message)
+        for d in suite.diagnostics
+    ] == [
+        (
+            IGNORED_CODE,
+            "/x",
+            "post",
+            ignored_pointer(other),
+            None,
+            f"Request media type {other!r} was ignored; 'application/json' is generated.",
+        )
+    ]
+    assert (suite.cases[1].case_id == build_case_id("positive", "/x", "post", OMITTED_VARIANT)) is (
+        not required
+    )
+
+
+@BOTH_VERSIONS
+@pytest.mark.parametrize("required", [True, False])
+def test_charset_variant_alone_is_selected_and_keeps_its_declared_key(
+    version: str, required: bool
+) -> None:
+    plain = media_suite(media_body({PLAIN_JSON: SCHEMA_A}, required=required), version=version)
+    suite = media_suite(media_body({CHARSET_JSON: SCHEMA_A}, required=required), version=version)
+
+    assert diagnostic_summary(suite) == []
+    assert body_labels(suite) == {CHARSET_JSON}
+    assert [case.case_id for case in suite.cases] == [case.case_id for case in plain.cases]
+    assert body_values(suite) == body_values(plain)
+    schema_pointer = f"{CONTENT_POINTER}/application~1json; charset=utf-8/schema"
+    assert suite.cases[0].provenance[-1] == schema_pointer
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "application/json;charset=utf-8",
+        "application/json ;charset=utf-8",
+        "application/json ; charset=utf-8",
+        "application/json;\tcharset=utf-8",
+        "application/json; charset = utf-8",
+        "  application/json; charset=utf-8  ",
+        "Application/JSON",
+        "APPLICATION/JSON; CHARSET=UTF-8",
+        "application/json; Charset=Utf-8",
+        'application/json; charset="utf-8"',
+        'application/json; charset="UTF-8"',
+        'application/json;charset = "utf-8" ',
+    ],
+)
+def test_supported_spellings_of_json_media_types_are_selected(key: str) -> None:
+    suite = media_suite(media_body({key: SCHEMA_A}, required=True))
+
+    assert diagnostic_summary(suite) == []
+    assert body_labels(suite) == {key}
+    assert suite.cases[0].request_body is not None
+    assert suite.cases[0].request_body.value == {"a": 1}
+    assert len(suite.cases) == len(media_suite(media_body({PLAIN_JSON: SCHEMA_A}, required=True)).cases)
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "application/json; charset=iso-8859-1",
+        "application/json; charset=utf8",
+        "application/json; charset=utf-16",
+        "application/json; charset=utf-8; boundary=x",
+        "application/json; charset=utf-8;",
+        "application/json; q=1",
+        "application/json;",
+        "application/json; charset",
+        "application/json; charset=",
+        "application/json;; charset=utf-8",
+        'application/json; charset="utf-8',
+        'application/json; charset=" utf-8"',
+        "application/json; charset='utf-8'",
+        "application/json; xcharset=utf-8",
+        "application/jsön",
+        "application/jſon",
+        "application/json; charſet=utf-8",
+        "application/problem+json",
+        "application/vnd.example+json",
+        "application/*",
+        "application/",
+        "/json",
+        "application/json/x",
+        "application json",
+        "json",
+        "",
+        " ",
+        ";",
+    ],
+)
+def test_unsupported_or_malformed_media_type_keys_keep_the_unsupported_behavior(key: str) -> None:
+    required = media_suite(media_body({key: SCHEMA_A}, required=True))
+
+    assert required.cases == ()
+    assert diagnostic_summary(required) == [("unsupported_request_media_type", CONTENT_POINTER)]
+
+    optional = media_suite(media_body({key: SCHEMA_A}, required=False))
+
+    assert [case.request_body for case in optional.cases] == [None] * len(optional.cases)
+    assert [case.case_id for case in optional.cases[:1]] == [
+        build_case_id("positive", "/x", "post", "baseline")
+    ]
+    assert diagnostic_summary(optional) == [("unsupported_request_media_type", CONTENT_POINTER)]
+
+
+def test_only_unsupported_media_types_and_empty_content_keep_the_existing_behavior() -> None:
+    for content in (
+        {"application/xml": SCHEMA_A, "text/plain": SCHEMA_B},
+        {"multipart/form-data": SCHEMA_A, "*/*": SCHEMA_B, "application/*": None},
+        {},
+    ):
+        required = media_suite(media_body(content, required=True))
+        optional = media_suite(media_body(content, required=False))
+
+        assert required.cases == ()
+        assert diagnostic_summary(required) == [("unsupported_request_media_type", CONTENT_POINTER)]
+        assert all(case.request_body is None for case in optional.cases)
+        assert diagnostic_summary(optional) == [("unsupported_request_media_type", CONTENT_POINTER)]
+        assert [case.case_id for case in optional.cases[:1]] == [
+            build_case_id("positive", "/x", "post", "baseline")
+        ]
+        assert len(optional.cases) == 2
+
+
+@BOTH_VERSIONS
+def test_plain_json_wins_over_a_charset_variant_with_a_different_schema(version: str) -> None:
+    suite = media_suite(
+        media_body({PLAIN_JSON: SCHEMA_A, CHARSET_JSON: SCHEMA_B}, required=True), version=version
+    )
+
+    assert body_labels(suite) == {PLAIN_JSON}
+    assert all(
+        case.request_body is None or "b" not in case.request_body.value  # type: ignore[operator]
+        for case in suite.cases
+    )
+    assert suite.cases[0].request_body is not None
+    assert suite.cases[0].request_body.value == {"a": 1}
+    assert [(d.code, d.source_pointer) for d in suite.diagnostics] == [
+        (IGNORED_CODE, ignored_pointer(CHARSET_JSON))
+    ]
+    assert suite.diagnostics[0].message == (
+        "Request media type 'application/json; charset=utf-8' was ignored; "
+        "'application/json' is generated."
+    )
+
+
+def test_a_selected_charset_variant_also_reports_every_other_declaration_in_sorted_order() -> None:
+    suite = media_suite(
+        media_body(
+            {"text/plain": SCHEMA_B, CHARSET_JSON: SCHEMA_A, "*/*": SCHEMA_B, "application/xml": SCHEMA_B},
+            required=False,
+        )
+    )
+
+    assert body_labels(suite) == {CHARSET_JSON}
+    assert diagnostic_summary(suite) == [
+        (IGNORED_CODE, ignored_pointer("*/*")),
+        (IGNORED_CODE, ignored_pointer("application/xml")),
+        (IGNORED_CODE, ignored_pointer("text/plain")),
+    ]
+    assert suite.cases[0].request_body is not None
+    assert suite.cases[0].request_body.value == {"a": 1}
+
+
+@pytest.mark.parametrize("required", [True, False])
+@pytest.mark.parametrize(
+    "keys",
+    [
+        (PLAIN_JSON, "Application/JSON"),
+        (PLAIN_JSON, "application/json "),
+        (CHARSET_JSON, "application/json;charset=UTF-8"),
+        (CHARSET_JSON, 'application/json; charset="utf-8"'),
+        (PLAIN_JSON, "APPLICATION/JSON", CHARSET_JSON),
+    ],
+)
+def test_several_candidates_of_the_winning_priority_are_ambiguous(
+    required: bool, keys: tuple[str, ...]
+) -> None:
+    schemas = (SCHEMA_A, SCHEMA_B, SCHEMA_A)
+    content = {key: schemas[index] for index, key in enumerate(keys)}
+    suite = media_suite(media_body(content, required=required))
+
+    assert diagnostic_summary(suite) == [("ambiguous_request_media_type", CONTENT_POINTER)]
+    message = suite.diagnostics[0].message
+    assert all(repr(key) in message for key in keys[:2])
+    assert all(repr(key) not in message for key in keys[2:])
+    assert all(case.request_body is None for case in suite.cases)
+    if required:
+        assert suite.cases == ()
+    else:
+        assert [case.case_id for case in suite.cases[:1]] == [
+            build_case_id("positive", "/x", "post", "baseline")
+        ]
+        assert len(suite.cases) == 2
+
+
+def test_ambiguity_is_decided_at_the_winning_priority_only() -> None:
+    one_plain = media_suite(
+        media_body(
+            {PLAIN_JSON: SCHEMA_A, CHARSET_JSON: SCHEMA_B, "application/json;charset=UTF-8": SCHEMA_B},
+            required=True,
+        )
+    )
+
+    assert body_labels(one_plain) == {PLAIN_JSON}
+    assert diagnostic_summary(one_plain) == [
+        (IGNORED_CODE, ignored_pointer(CHARSET_JSON)),
+        (IGNORED_CODE, ignored_pointer("application/json;charset=UTF-8")),
+    ]
+
+    two_plain = media_suite(
+        media_body({PLAIN_JSON: SCHEMA_A, "Application/Json": SCHEMA_B, CHARSET_JSON: SCHEMA_B}, required=True)
+    )
+
+    assert two_plain.cases == ()
+    assert diagnostic_summary(two_plain) == [("ambiguous_request_media_type", CONTENT_POINTER)]
+
+
+@BOTH_VERSIONS
+def test_each_selected_media_type_resolves_its_own_schema_reference(version: str) -> None:
+    schemas = {"Alpha": SCHEMA_A, "Beta": SCHEMA_B}
+    content = {
+        PLAIN_JSON: {"$ref": "#/components/schemas/Alpha"},
+        CHARSET_JSON: {"$ref": "#/components/schemas/Beta"},
+    }
+    plain = media_suite(media_body(content, required=True), version=version, schemas=schemas)
+
+    assert plain.cases[0].request_body is not None
+    assert plain.cases[0].request_body.value == {"a": 1}
+    assert "/components/schemas/Alpha" in " ".join(plain.cases[0].provenance)
+    assert "/components/schemas/Beta" not in " ".join(plain.cases[0].provenance)
+
+    without_plain = media_suite(
+        media_body({CHARSET_JSON: content[CHARSET_JSON], "application/xml": content[PLAIN_JSON]}, required=True),
+        version=version,
+        schemas=schemas,
+    )
+
+    assert without_plain.cases[0].request_body is not None
+    assert set(without_plain.cases[0].request_body.value) == {"b"}  # type: ignore[arg-type]
+    assert "/components/schemas/Beta" in " ".join(without_plain.cases[0].provenance)
+    assert "/components/schemas/Alpha" not in " ".join(without_plain.cases[0].provenance)
+
+
+def test_a_referenced_request_body_selects_among_its_own_content() -> None:
+    suite = media_suite(
+        request_body_reference("Shared"),
+        request_bodies={
+            "Shared": media_body({PLAIN_JSON: SCHEMA_A, "application/xml": SCHEMA_B}, required=True)
+        },
+    )
+
+    assert body_labels(suite) == {PLAIN_JSON}
+    assert diagnostic_summary(suite) == [
+        (IGNORED_CODE, "/components/requestBodies/Shared/content/application~1xml")
+    ]
+
+
+@pytest.mark.parametrize("required", [True, False])
+def test_encoding_on_a_non_selected_declaration_is_not_reported(required: bool) -> None:
+    suite = media_suite(
+        media_body(
+            {PLAIN_JSON: SCHEMA_A, "multipart/form-data": SCHEMA_B},
+            required=required,
+            encoding={"multipart/form-data": {"b": {"contentType": "text/plain"}}},
+        )
+    )
+
+    assert diagnostic_summary(suite) == [(IGNORED_CODE, ignored_pointer("multipart/form-data"))]
+    assert body_labels(suite) == {PLAIN_JSON}
+
+
+def test_encoding_on_the_selected_declaration_is_still_unsupported() -> None:
+    suite = media_suite(
+        media_body(
+            {CHARSET_JSON: SCHEMA_A, "application/xml": SCHEMA_B},
+            required=False,
+            encoding={CHARSET_JSON: {"a": {}}},
+        )
+    )
+
+    assert diagnostic_summary(suite) == [
+        (IGNORED_CODE, ignored_pointer("application/xml")),
+        ("unsupported_request_encoding", f"{CONTENT_POINTER}/application~1json; charset=utf-8/encoding"),
+    ]
+    assert all(case.request_body is None for case in suite.cases)
+
+
+@BOTH_VERSIONS
+@pytest.mark.parametrize("required", [True, False])
+def test_every_generation_step_uses_the_selected_media_type_and_schema(
+    version: str, required: bool
+) -> None:
+    plain = media_suite(media_body({PLAIN_JSON: RICH_SCHEMA}, required=required), version=version)
+    selected = media_suite(
+        media_body({CHARSET_JSON: RICH_SCHEMA, "application/xml": SCHEMA_B}, required=required),
+        version=version,
+    )
+
+    constraints = {case.violated_constraint for case in plain.cases}
+    assert {
+        "required_property",
+        "minimum",
+        "maximum",
+        "type",
+        "enum",
+        "minLength",
+        "maxLength",
+        "minItems",
+        "maxItems",
+    } <= constraints
+    valid_edges = [c for c in plain.cases if c.category == "positive" and c.request_body]
+    assert len(valid_edges) >= 3
+
+    assert [case.case_id for case in selected.cases] == [case.case_id for case in plain.cases]
+    assert [case.category for case in selected.cases] == [case.category for case in plain.cases]
+    assert [case.violated_constraint for case in selected.cases] == [
+        case.violated_constraint for case in plain.cases
+    ]
+    assert body_values(selected) == body_values(plain)
+    assert body_labels(selected) == {CHARSET_JSON}
+    assert all(
+        "b" not in case.request_body.value  # type: ignore[operator]
+        for case in selected.cases
+        if case.request_body is not None
+    )
+    assert diagnostic_summary(selected) == [(IGNORED_CODE, ignored_pointer("application/xml"))]
+    # Every pointer of every step names the selected declaration: with the declared
+    # key swapped back, the provenance equals the plain JSON suite's, case by case.
+    assert [
+        tuple(item.replace("application~1json; charset=utf-8", "application~1json") for item in case.provenance)
+        for case in selected.cases
+    ] == [case.provenance for case in plain.cases]
+    assert any(
+        len(case.provenance) > 3 and "application~1json; charset=utf-8/schema/" in case.provenance[-2]
+        for case in selected.cases
+    )
+    for case in selected.cases:
+        assert not any("application~1json/" in item or "application~1xml" in item for item in case.provenance)
+
+
+def test_the_selected_schema_is_the_one_that_drives_every_case_when_schemas_differ() -> None:
+    suite = media_suite(
+        media_body({PLAIN_JSON: RICH_SCHEMA, CHARSET_JSON: SCHEMA_A, "application/xml": SCHEMA_B}, required=True)
+    )
+
+    assert body_labels(suite) == {PLAIN_JSON}
+    assert all(
+        set(case.request_body.value) <= {"name", "age", "kind", "tags"}  # type: ignore[arg-type]
+        for case in suite.cases
+        if case.request_body is not None
+    )
+    assert {case.violated_constraint for case in suite.cases} >= {"minLength", "minItems", "enum"}
+
+
+@pytest.mark.parametrize("required", [True, False])
+def test_selection_and_diagnostics_do_not_depend_on_declaration_order(required: bool) -> None:
+    declared = {
+        "text/plain": SCHEMA_B,
+        CHARSET_JSON: SCHEMA_B,
+        "application/xml": SCHEMA_B,
+        PLAIN_JSON: SCHEMA_A,
+        "*/*": None,
+    }
+    forward = media_suite(media_body(declared, required=required))
+    backward = media_suite(media_body(dict(reversed(list(declared.items()))), required=required))
+    shuffled = media_suite(media_body({k: declared[k] for k in sorted(declared, key=len)}, required=required))
+
+    assert forward.model_dump_json() == backward.model_dump_json() == shuffled.model_dump_json()
+    assert [d.source_pointer for d in forward.diagnostics] == [
+        ignored_pointer(key) for key in sorted(declared) if key != PLAIN_JSON
+    ]
+    assert generate_test_suite(
+        make_result(body_endpoint(media_body(declared, required=required)))
+    ).model_dump_json() == generate_test_suite(
+        make_result(body_endpoint(media_body(declared, required=required)))
+    ).model_dump_json()
+
+
+def test_ambiguity_is_independent_of_declaration_order() -> None:
+    first = media_suite(media_body({PLAIN_JSON: SCHEMA_A, "Application/JSON": SCHEMA_B}, required=False))
+    second = media_suite(media_body({"Application/JSON": SCHEMA_B, PLAIN_JSON: SCHEMA_A}, required=False))
+
+    assert first.model_dump_json() == second.model_dump_json()
+    assert first.diagnostics[0].message == (
+        "Several supported request media types have the same priority and none is selected: "
+        "'Application/JSON', 'application/json'."
+    )
+
+
+def test_ignored_media_types_are_reported_before_a_selected_body_failure() -> None:
+    suite = media_suite(
+        media_body({PLAIN_JSON: UNSUPPORTED_BODY_SCHEMA, "application/xml": SCHEMA_B}, required=False)
+    )
+
+    assert diagnostic_summary(suite) == [
+        (IGNORED_CODE, ignored_pointer("application/xml")),
+        (
+            "unsupported_schema_keyword",
+            f"{CONTENT_POINTER}/application~1json/schema/properties/a/format",
+        ),
+    ]
+    assert all(case.request_body is None for case in suite.cases)
+
+
+FAILING_SELECTED_BODY_SCENARIOS = {
+    "schema": (
+        {PLAIN_JSON: UNSUPPORTED_BODY_SCHEMA},
+        {},
+        (
+            "unsupported_schema_keyword",
+            f"{CONTENT_POINTER}/application~1json/schema/properties/a/format",
+        ),
+    ),
+    "encoding": (
+        {PLAIN_JSON: SCHEMA_A},
+        {PLAIN_JSON: {"a": {}}},
+        ("unsupported_request_encoding", f"{CONTENT_POINTER}/application~1json/encoding"),
+    ),
+}
+
+
+@pytest.mark.parametrize("scenario", sorted(FAILING_SELECTED_BODY_SCENARIOS))
+def test_a_required_selected_body_failure_keeps_the_ignored_media_types_in_order(
+    scenario: str,
+) -> None:
+    selected, encoding, failure = FAILING_SELECTED_BODY_SCENARIOS[scenario]
+    content = {**selected, "text/plain": SCHEMA_B, "application/xml": SCHEMA_B}
+    suite = media_suite(media_body(content, required=True, encoding=encoding))
+
+    assert suite.cases == ()
+    assert diagnostic_summary(suite) == [
+        (IGNORED_CODE, ignored_pointer("application/xml")),
+        (IGNORED_CODE, ignored_pointer("text/plain")),
+        failure,
+    ]
+    assert [d.endpoint_path for d in suite.diagnostics] == ["/x"] * 3
+    assert [d.endpoint_method for d in suite.diagnostics] == ["post"] * 3
+    assert suite.diagnostics[0].message == (
+        "Request media type 'application/xml' was ignored; 'application/json' is generated."
+    )
+    reversed_content = dict(reversed(list(content.items())))
+    assert (
+        media_suite(media_body(reversed_content, required=True, encoding=encoding)).model_dump_json()
+        == suite.model_dump_json()
+    )
+
+
+@pytest.mark.parametrize("scenario", sorted(FAILING_SELECTED_BODY_SCENARIOS))
+def test_an_optional_selected_body_failure_keeps_the_body_less_baseline_and_both_diagnostics(
+    scenario: str,
+) -> None:
+    selected, encoding, failure = FAILING_SELECTED_BODY_SCENARIOS[scenario]
+    content = {**selected, "text/plain": SCHEMA_B, "application/xml": SCHEMA_B}
+    suite = media_suite(media_body(content, required=False, encoding=encoding))
+
+    assert [case.case_id for case in suite.cases[:1]] == [
+        build_case_id("positive", "/x", "post", "baseline")
+    ]
+    assert len(suite.cases) == 2
+    assert all(case.request_body is None for case in suite.cases)
+    assert diagnostic_summary(suite) == [
+        (IGNORED_CODE, ignored_pointer("application/xml")),
+        (IGNORED_CODE, ignored_pointer("text/plain")),
+        failure,
+    ]
+
+
+def test_a_required_failure_before_a_media_type_is_selected_reports_no_ignored_diagnostic() -> None:
+    for content in ({"application/xml": SCHEMA_A}, {PLAIN_JSON: SCHEMA_A, "Application/JSON": SCHEMA_B}):
+        suite = media_suite(media_body(content, required=True))
+
+        assert suite.cases == ()
+        assert len(suite.diagnostics) == 1
+        assert suite.diagnostics[0].code != IGNORED_CODE
+
+
+def test_a_required_referenced_body_failure_keeps_the_ignored_media_types() -> None:
+    suite = media_suite(
+        request_body_reference("Shared"),
+        request_bodies={
+            "Shared": media_body(
+                {CHARSET_JSON: UNSUPPORTED_BODY_SCHEMA, "application/xml": SCHEMA_B}, required=True
+            )
+        },
+    )
+    declaration = "/components/requestBodies/Shared/content"
+
+    assert suite.cases == ()
+    assert diagnostic_summary(suite) == [
+        (IGNORED_CODE, f"{declaration}/application~1xml"),
+        (
+            "unsupported_schema_keyword",
+            f"{declaration}/application~1json; charset=utf-8/schema/properties/a/format",
+        ),
+    ]
+
+
+def test_a_media_type_without_a_schema_is_selected_like_before() -> None:
+    suite = media_suite(media_body({CHARSET_JSON: None, "application/xml": SCHEMA_B}, required=True))
+
+    assert body_labels(suite) == {CHARSET_JSON}
+    assert diagnostic_summary(suite) == [(IGNORED_CODE, ignored_pointer("application/xml"))]

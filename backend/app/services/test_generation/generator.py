@@ -12,7 +12,7 @@ from decimal import Decimal, InvalidOperation, localcontext
 from functools import lru_cache
 from hashlib import sha256
 from types import MappingProxyType
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import unquote
 
 from pydantic import ValidationError
@@ -365,6 +365,8 @@ class _UnsupportedOperation(Exception):
         self.code = code
         self.pointer = pointer
         self.reference_uri = reference_uri
+        # Diagnostics to report before this one when the endpoint is skipped.
+        self.preceding: tuple[GenerationDiagnostic, ...] = ()
 
 
 class _SecurityIssues(_UnsupportedOperation):
@@ -495,10 +497,13 @@ def _generate_suite(result: NormalizationResult, budget: _GenerationBudget) -> G
             diagnostics.extend(
                 budget.admit(
                     [
-                        _unsupported_diagnostic(item, endpoint)
-                        for item in (
-                            issue.issues if isinstance(issue, _SecurityIssues) else (issue,)
-                        )
+                        *issue.preceding,
+                        *(
+                            _unsupported_diagnostic(item, endpoint)
+                            for item in (
+                                issue.issues if isinstance(issue, _SecurityIssues) else (issue,)
+                            )
+                        ),
                     ]
                 )
             )
@@ -756,16 +761,17 @@ def _required_property_negative_cases(
     if resolved is None:
         return (), ()
     request_body, body_pointer = resolved
-    if set(request_body.content) != {"application/json"}:
+    selection = _select_request_media_type(request_body, body_pointer)
+    if selection.media is None:
         return (), ()
-    media = request_body.content["application/json"]
+    media = selection.media
     if media.schema is None or not isinstance(media.schema.raw, dict):
         return (), ()
     if positive.request_body is None:
         return (), ()
 
     raw_schema = media.schema.raw
-    schema_pointer = _child(body_pointer, "content", "application/json", "schema")
+    schema_pointer = _child(selection.pointer, "schema")
     property_paths, undeclared_required = _required_writable_property_paths(
         raw_schema, positive.request_body.value, schema_pointer=schema_pointer
     )
@@ -822,7 +828,7 @@ def _required_property_negative_cases(
                 method=positive.method,
                 parameters=positive.parameters,
                 request_body=GeneratedBody(
-                    media_type="application/json", value=body_value
+                    media_type=selection.key, value=body_value
                 ),
                 security=deepcopy(positive.security),
                 response_expectations=deepcopy(positive.response_expectations),
@@ -883,13 +889,14 @@ def _wrong_type_negative_cases(
     if resolved is None or positive.request_body is None:
         return (), ()
     request_body, body_pointer = resolved
-    if set(request_body.content) != {"application/json"}:
+    selection = _select_request_media_type(request_body, body_pointer)
+    if selection.media is None:
         return (), ()
-    media = request_body.content["application/json"]
+    media = selection.media
     if media.schema is None or not isinstance(media.schema.raw, dict):
         return (), ()
 
-    root_pointer = _child(body_pointer, "content", "application/json", "schema")
+    root_pointer = _child(selection.pointer, "schema")
     raw_schema = media.schema.raw
     body_value = positive.request_body.value
     targets: list[tuple[tuple[str, ...], tuple[str, ...], Any, str, _Lineage]] = []
@@ -1023,7 +1030,7 @@ def _wrong_type_negative_cases(
                 method=positive.method,
                 parameters=deepcopy(positive.parameters),
                 request_body=GeneratedBody(
-                    media_type="application/json", value=generated_value
+                    media_type=selection.key, value=generated_value
                 ),
                 security=deepcopy(positive.security),
                 response_expectations=deepcopy(positive.response_expectations),
@@ -1051,13 +1058,14 @@ def _enum_const_negative_cases(
     if resolved is None or positive.request_body is None:
         return (), ()
     request_body, body_pointer = resolved
-    if set(request_body.content) != {"application/json"}:
+    selection = _select_request_media_type(request_body, body_pointer)
+    if selection.media is None:
         return (), ()
-    media = request_body.content["application/json"]
+    media = selection.media
     if media.schema is None or not isinstance(media.schema.raw, dict):
         return (), ()
 
-    body_schema_pointer = _child(body_pointer, "content", "application/json", "schema")
+    body_schema_pointer = _child(selection.pointer, "schema")
     body_value = positive.request_body.value
     targets: list[tuple[tuple[str, ...], str, str, Any, _Lineage]] = []
     diagnostics: list[GenerationDiagnostic] = []
@@ -1208,7 +1216,7 @@ def _enum_const_negative_cases(
                 method=positive.method,
                 parameters=deepcopy(positive.parameters),
                 request_body=GeneratedBody(
-                    media_type=positive.request_body.media_type,
+                    media_type=selection.key,
                     value=generated_value,
                 ),
                 security=deepcopy(positive.security),
@@ -1321,13 +1329,14 @@ def _string_boundary_negative_cases(
     if resolved is None or positive.request_body is None:
         return (), ()
     request_body, body_pointer = resolved
-    if set(request_body.content) != {"application/json"}:
+    selection = _select_request_media_type(request_body, body_pointer)
+    if selection.media is None:
         return (), ()
-    media = request_body.content["application/json"]
+    media = selection.media
     if media.schema is None or not isinstance(media.schema.raw, dict):
         return (), ()
 
-    root_pointer = _child(body_pointer, "content", "application/json", "schema")
+    root_pointer = _child(selection.pointer, "schema")
     targets: list[tuple[tuple[str, ...], str, str, str, _Lineage]] = []
     diagnostics: list[GenerationDiagnostic] = []
 
@@ -1476,7 +1485,7 @@ def _string_boundary_negative_cases(
                 method=positive.method,
                 parameters=deepcopy(positive.parameters),
                 request_body=GeneratedBody(
-                    media_type="application/json", value=generated_value
+                    media_type=selection.key, value=generated_value
                 ),
                 security=deepcopy(positive.security),
                 response_expectations=deepcopy(positive.response_expectations),
@@ -1592,13 +1601,14 @@ def _array_bound_negative_cases(
     if resolved is None or positive.request_body is None:
         return (), ()
     request_body, body_pointer = resolved
-    if set(request_body.content) != {"application/json"}:
+    selection = _select_request_media_type(request_body, body_pointer)
+    if selection.media is None:
         return (), ()
-    media = request_body.content["application/json"]
+    media = selection.media
     if media.schema is None or not isinstance(media.schema.raw, dict):
         return (), ()
 
-    root_pointer = _child(body_pointer, "content", "application/json", "schema")
+    root_pointer = _child(selection.pointer, "schema")
     # (path, constraint, candidate, schema pointer, parents created for it)
     targets: list[tuple[tuple[str, ...], str, list[Any], str, _Insertions]] = []
     diagnostics: list[GenerationDiagnostic] = []
@@ -1955,7 +1965,7 @@ def _array_bound_negative_cases(
             method=positive.method,
             parameters=deepcopy(positive.parameters),
             request_body=GeneratedBody(
-                media_type="application/json", value=generated_value
+                media_type=selection.key, value=generated_value
             ),
             security=deepcopy(positive.security),
             response_expectations=deepcopy(positive.response_expectations),
@@ -2423,14 +2433,15 @@ def _numeric_boundary_negative_cases(
     if resolved is None or positive.request_body is None:
         return (), ()
     request_body, body_pointer = resolved
-    if set(request_body.content) != {"application/json"}:
+    selection = _select_request_media_type(request_body, body_pointer)
+    if selection.media is None:
         return (), ()
-    media = request_body.content["application/json"]
+    media = selection.media
     if media.schema is None or not isinstance(media.schema.raw, (dict, bool)):
         return (), ()
 
     schema = media.schema.raw
-    root_pointer = _child(body_pointer, "content", "application/json", "schema")
+    root_pointer = _child(selection.pointer, "schema")
     body_value = positive.request_body.value
     targets: list[tuple[tuple[str, ...], dict[str, Any], str, str, _Lineage]] = []
     issues: list[_UnsupportedOperation] = []
@@ -2588,7 +2599,7 @@ def _numeric_boundary_negative_cases(
                 method=positive.method,
                 parameters=deepcopy(positive.parameters),
                 request_body=GeneratedBody(
-                    media_type="application/json", value=generated_value
+                    media_type=selection.key, value=generated_value
                 ),
                 security=deepcopy(positive.security),
                 response_expectations=deepcopy(positive.response_expectations),
@@ -3073,13 +3084,14 @@ def _numeric_valid_edge_cases(
     if resolved is None or positive.request_body is None:
         return (), ()
     request_body, body_pointer = resolved
-    if set(request_body.content) != {"application/json"}:
+    selection = _select_request_media_type(request_body, body_pointer)
+    if selection.media is None:
         return (), ()
-    media = request_body.content["application/json"]
+    media = selection.media
     if media.schema is None or not isinstance(media.schema.raw, (dict, bool)):
         return (), ()
 
-    root_pointer = _child(body_pointer, "content", "application/json", "schema")
+    root_pointer = _child(selection.pointer, "schema")
     baseline_value = positive.request_body.value
     targets: list[tuple[tuple[str, ...], dict[str, Any], str, str]] = []
     _collect_valid_edge_targets(media.schema.raw, baseline_value, (), root_pointer, targets)
@@ -3177,7 +3189,7 @@ def _numeric_valid_edge_cases(
                 method=positive.method,
                 parameters=tuple(deepcopy(item) for item in positive.parameters),
                 request_body=GeneratedBody(
-                    media_type="application/json", value=generated_value
+                    media_type=selection.key, value=generated_value
                 ),
                 security=deepcopy(positive.security),
                 response_expectations=deepcopy(positive.response_expectations),
@@ -3254,13 +3266,14 @@ def _string_valid_edge_cases(
     if resolved is None or positive.request_body is None:
         return (), ()
     request_body, body_pointer = resolved
-    if set(request_body.content) != {"application/json"}:
+    selection = _select_request_media_type(request_body, body_pointer)
+    if selection.media is None:
         return (), ()
-    media = request_body.content["application/json"]
+    media = selection.media
     if media.schema is None or not isinstance(media.schema.raw, (dict, bool)):
         return (), ()
 
-    root_pointer = _child(body_pointer, "content", "application/json", "schema")
+    root_pointer = _child(selection.pointer, "schema")
     baseline_value = positive.request_body.value
     targets: list[tuple[tuple[str, ...], dict[str, Any], str, str]] = []
     _collect_string_edge_targets(media.schema.raw, baseline_value, (), root_pointer, targets)
@@ -3330,7 +3343,7 @@ def _string_valid_edge_cases(
                 method=positive.method,
                 parameters=tuple(deepcopy(item) for item in positive.parameters),
                 request_body=GeneratedBody(
-                    media_type="application/json", value=generated_value
+                    media_type=selection.key, value=generated_value
                 ),
                 security=deepcopy(positive.security),
                 response_expectations=deepcopy(positive.response_expectations),
@@ -3787,16 +3800,23 @@ def _generate_endpoint(
     _check_path_placeholders(endpoint.path, path_names, _child(root, "parameters"))
     body: GeneratedBody | None = None
     body_provenance: tuple[str, ...] = ()
+    ignored_media_types: list[GenerationDiagnostic] = []
     try:
-        body, body_provenance = _generate_body(endpoint, api, root)
+        body, body_provenance = _generate_body(endpoint, api, root, ignored_media_types)
     except _UnsupportedOperation as issue:
         # An optional (or not known to be required) body that this stage cannot
         # generate is reported, and the baseline simply has no body. Only this
         # exception is caught: an exhausted budget still propagates, and charges
         # already made are not refunded.
         if _request_body_is_required(endpoint, api):
+            # The skip diagnostic is built from the exception alone, so the ignored
+            # media types travel with it and are reported just before it.
+            issue.preceding = tuple(ignored_media_types)
             raise
+        parameter_diagnostics.extend(ignored_media_types)
         parameter_diagnostics.append(_unsupported_diagnostic(issue, endpoint))
+    else:
+        parameter_diagnostics.extend(ignored_media_types)
     expectations, response_diagnostics = _response_expectations(endpoint, root, api)
     parameter_diagnostics.extend(response_diagnostics)
     security = endpoint.security if endpoint.security is not None else api.security
@@ -3869,9 +3889,89 @@ def _resolve_request_body(
     return current, declaration, tuple(followed)
 
 
+_PLAIN_JSON_MEDIA_TYPE = "application/json"
+_CHARSET_JSON_MEDIA_TYPE = "application/json; charset=utf-8"
+
+
+class _RequestMediaSelection(NamedTuple):
+    """The outcome of choosing the request media type of one request body.
+
+    `media` is None when nothing is selected: `ambiguous` then lists the equally
+    ranked candidates, and it is empty when no supported type is declared.
+    """
+
+    key: str | None
+    media: MediaType | None
+    pointer: str
+    content_pointer: str
+    ignored: tuple[str, ...]
+    ambiguous: tuple[str, ...]
+
+
+def _json_media_type_rank(key: str) -> int | None:
+    """0 for plain `application/json`, 1 for `application/json; charset=utf-8`.
+
+    Type, parameter name and value are case-insensitive, spaces and tabs around
+    `;` and `=` are ignored and the value may be quoted. Any other parameter,
+    charset, suffix type, wildcard, or malformed key is not supported (None).
+    """
+    essence, *parameters = key.split(";")
+    if essence.strip(" \t").lower() != _PLAIN_JSON_MEDIA_TYPE:
+        return None
+    if not parameters:
+        return 0
+    if len(parameters) != 1:
+        return None
+    name, separator, value = parameters[0].partition("=")
+    if not separator or name.strip(" \t").lower() != "charset":
+        return None
+    value = value.strip(" \t")
+    if len(value) >= 2 and value[0] == value[-1] == '"':
+        value = value[1:-1]
+    return 1 if value.lower() == "utf-8" else None
+
+
+def _select_request_media_type(
+    request_body: RequestBody, body_pointer: str
+) -> _RequestMediaSelection:
+    """Select the one request media type every generation step works on.
+
+    A single plain `application/json` declaration wins; otherwise a single
+    `application/json; charset=utf-8` one. Several candidates of the winning
+    priority are ambiguous and nothing is selected. The result depends only on
+    the declared keys, never on their order.
+    """
+    content_pointer = _child(body_pointer, "content")
+    keys = sorted(request_body.content)
+    ranked: dict[int, list[str]] = {0: [], 1: []}
+    for key in keys:
+        rank = _json_media_type_rank(key)
+        if rank is not None:
+            ranked[rank].append(key)
+    candidates = ranked[0] or ranked[1]
+    if len(candidates) != 1:
+        return _RequestMediaSelection(
+            None, None, content_pointer, content_pointer, (), tuple(candidates)
+        )
+    key = candidates[0]
+    return _RequestMediaSelection(
+        key,
+        request_body.content[key],
+        _child(content_pointer, key),
+        content_pointer,
+        tuple(other for other in keys if other != key),
+        (),
+    )
+
+
 def _generate_body(
-    endpoint: Endpoint, api: ApiModel, endpoint_pointer: str
+    endpoint: Endpoint,
+    api: ApiModel,
+    endpoint_pointer: str,
+    ignored: list[GenerationDiagnostic],
 ) -> tuple[GeneratedBody | None, tuple[str, ...]]:
+    """Generate the baseline body; declarations that were not selected are
+    appended to `ignored` as soon as the selection is made."""
     version = api.openapi_version
     endpoint_entry = endpoint.request_body
     if endpoint_entry is None:
@@ -3884,15 +3984,38 @@ def _generate_body(
     entry, pointer, followed = _resolve_request_body(
         endpoint_entry, api, endpoint_body_pointer
     )
-    if set(entry.content) != {"application/json"}:
+    selection = _select_request_media_type(entry, pointer)
+    if selection.media is None:
+        if selection.ambiguous:
+            raise _UnsupportedOperation(
+                "ambiguous_request_media_type",
+                "Several supported request media types have the same priority and none "
+                f"is selected: {', '.join(repr(key) for key in selection.ambiguous)}.",
+                selection.content_pointer,
+            )
         raise _UnsupportedOperation(
             "unsupported_request_media_type",
-            "This stage requires application/json as the only request media type.",
-            _child(pointer, "content"),
+            "No supported request media type is declared; this stage supports "
+            f"{_PLAIN_JSON_MEDIA_TYPE!r} and {_CHARSET_JSON_MEDIA_TYPE!r}.",
+            selection.content_pointer,
+        )
+    for ignored_key in selection.ignored:
+        ignored.append(
+            GenerationDiagnostic(
+                code="request_media_type_ignored",
+                message=(
+                    f"Request media type {ignored_key!r} was ignored; "
+                    f"{selection.key!r} is generated."
+                ),
+                endpoint_path=endpoint.path,
+                endpoint_method=endpoint.method,
+                source_pointer=_child(selection.content_pointer, ignored_key),
+                reference_uri=None,
+            )
         )
 
-    media = entry.content["application/json"]
-    media_pointer = _child(pointer, "content", "application/json")
+    media = selection.media
+    media_pointer = selection.pointer
     if media.encoding:
         raise _UnsupportedOperation(
             "unsupported_request_encoding",
@@ -3912,7 +4035,7 @@ def _generate_body(
         unusable=unusable_examples,
     )
     return (
-        GeneratedBody(media_type="application/json", value=deepcopy(value)),
+        GeneratedBody(media_type=selection.key, value=deepcopy(value)),
         tuple(
             dict.fromkeys(
                 (

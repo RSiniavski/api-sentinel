@@ -102,6 +102,7 @@ Implemented so far:
 
 - Internal test representation: strict, frozen output models (`GeneratedTestSuite`, `GeneratedTestCase`, `GenerationDiagnostic`).
 - Positive test generation: one baseline case for each eligible operation whose positive inputs are supported (supported schema subset), plus one additional positive case without the body (`request-body-omitted`) for a supported optional request body; an unsupported optional body keeps the endpoint with a body-less baseline and the original diagnostic.
+- Deterministic request media type selection: `application/json` and `application/json; charset=utf-8` (case-insensitive), one selected declaration per body, other declarations reported with `request_media_type_ignored`, `ambiguous_request_media_type` for equally ranked candidates (details in `AGENTS.md` §12).
 - Valid boundary-edge test generation: positive cases after all negative cases, for numeric bounds (`minimum`, `maximum`, exclusive bounds) and string lengths (`minLength`, `maxLength`) of request body properties, with `valid_boundary_no_safe_candidate` for a numeric edge without a safe value (details in `AGENTS.md` §12).
 - Negative test generation: required parameter, request body and property omission; wrong JSON type; enum/const violation.
 - Boundary test generation: string length bounds, numeric bounds (including properties reached through nested local `$ref`), array size bounds (`minItems`, `maxItems`) and `uniqueItems` duplicate cases for request body arrays (Array Bounds Generation, implemented): arrays present in the positive body, optional arrays absent from it, arrays below absent optional parent objects (created in the negative body only), arrays inside element 0 of a present array (objects and nested arrays), and arrays below the one element created in a present empty array (array-bound phase 4).
@@ -137,7 +138,7 @@ Optional request bodies (Step 8.39.1):
 Still planned:
 
 - Support for further schema keywords (formats other than the eight supported value formats and the supported `password` annotation, patterns beyond the bounded subset) and compositions.
-- Request media types other than `application/json`.
+- Request media types other than `application/json` and `application/json; charset=utf-8` (including `+json`, XML, form and multipart), and cases per media type.
 
 ## 6. Phase 5 — Test Execution Engine
 
